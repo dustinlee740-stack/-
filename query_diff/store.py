@@ -23,6 +23,10 @@ class ComparisonStore:
     def list_all(self) -> list[ComparisonRequest]:
         return list(self._data.values())
 
+    def clear(self) -> None:
+        """저장소 초기화 (테스트용)"""
+        self._data.clear()
+
 
 # 싱글턴 인스턴스
 store = ComparisonStore()

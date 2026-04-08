@@ -30,6 +30,14 @@ _DIALECT_FALLBACKS: list[Dialect] = [
     Dialect.POSTGRES,
 ]
 
+# 방언 계열 매핑 (Hive SQL에 Oracle 제안 방지)
+_DIALECT_FAMILY: dict[Dialect, set[Dialect]] = {
+    Dialect.ORACLE: {Dialect.MYSQL, Dialect.POSTGRES},
+    Dialect.HIVE: set(),
+    Dialect.MYSQL: {Dialect.ORACLE, Dialect.POSTGRES},
+    Dialect.POSTGRES: {Dialect.ORACLE, Dialect.MYSQL},
+}
+
 # --- SQL 전처리 ---
 
 # 템플릿 변수 패턴: ${name=default} 또는 ${name}
@@ -144,12 +152,6 @@ def validate_sql(sql: str, dialect: Dialect) -> ValidationResult:
         error_msg = str(e)
 
         # 2차: 같은 계열 방언만 제안 (Hive SQL에 Oracle 제안 방지)
-        _DIALECT_FAMILY: dict[Dialect, set[Dialect]] = {
-            Dialect.ORACLE: {Dialect.MYSQL, Dialect.POSTGRES},
-            Dialect.HIVE: set(),
-            Dialect.MYSQL: {Dialect.ORACLE, Dialect.POSTGRES},
-            Dialect.POSTGRES: {Dialect.ORACLE, Dialect.MYSQL},
-        }
         candidates = _DIALECT_FAMILY.get(dialect, set())
 
         for fallback in candidates:

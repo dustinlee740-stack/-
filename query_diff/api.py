@@ -24,6 +24,7 @@ from query_diff.wiki_service import extract_sql_blocks_from_html, extract_sql_fr
 
 app = FastAPI(title="Query Diff Module", version="0.1.0")
 
+# TODO: 배포 전 allow_origins를 특정 도메인으로 제한 (예: ["https://internal.example.com"])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,28 +69,32 @@ def list_comparisons():
 
 # --- 쿼리 입력 ---
 
+def _apply_query_update(query: "QueryInput", body: QueryInputUpdate) -> None:
+    """A/B 쿼리 공통 업데이트 로직"""
+    if body.source_type is not None:
+        query.source_type = body.source_type
+    if body.sql_raw is not None:
+        query.sql_raw = body.sql_raw
+    if body.dialect is not None:
+        query.dialect = body.dialect
+    if body.file_name is not None:
+        query.file_name = body.file_name
+    if body.wiki_url is not None:
+        query.wiki_url = body.wiki_url
+
+    query.is_valid = None
+    query.validation_error = None
+    query.structure = None
+
+
 @app.put("/api/comparisons/{req_id}/query-a", response_model=ComparisonRequest)
 def update_query_a(req_id: str, body: QueryInputUpdate):
     req = store.get(req_id)
     if not req:
         raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
 
-    if body.source_type is not None:
-        req.query_a.source_type = body.source_type
-    if body.sql_raw is not None:
-        req.query_a.sql_raw = body.sql_raw
-    if body.dialect is not None:
-        req.query_a.dialect = body.dialect
-    if body.file_name is not None:
-        req.query_a.file_name = body.file_name
-    if body.wiki_url is not None:
-        req.query_a.wiki_url = body.wiki_url
-
-    req.query_a.is_valid = None
-    req.query_a.validation_error = None
-    req.query_a.structure = None
+    _apply_query_update(req.query_a, body)
     req.status = ComparisonStatus.DRAFT
-
     return store.update(req)
 
 
@@ -99,22 +104,8 @@ def update_query_b(req_id: str, body: QueryInputUpdate):
     if not req:
         raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
 
-    if body.source_type is not None:
-        req.query_b.source_type = body.source_type
-    if body.sql_raw is not None:
-        req.query_b.sql_raw = body.sql_raw
-    if body.dialect is not None:
-        req.query_b.dialect = body.dialect
-    if body.file_name is not None:
-        req.query_b.file_name = body.file_name
-    if body.wiki_url is not None:
-        req.query_b.wiki_url = body.wiki_url
-
-    req.query_b.is_valid = None
-    req.query_b.validation_error = None
-    req.query_b.structure = None
+    _apply_query_update(req.query_b, body)
     req.status = ComparisonStatus.DRAFT
-
     return store.update(req)
 
 
