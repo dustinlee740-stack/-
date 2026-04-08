@@ -24,10 +24,23 @@ from query_diff.wiki_service import extract_sql_blocks_from_html, extract_sql_fr
 
 app = FastAPI(title="Query Diff Module", version="0.1.0")
 
-# TODO: 배포 전 allow_origins를 특정 도메인으로 제한 (예: ["https://internal.example.com"])
+# CORS 설정 — 환경변수로 허용 origin 제어
+# 배포 시 ALLOWED_ORIGINS 환경변수를 설정하지 않으면 서버 기동이 차단됨
+_allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
+if os.environ.get("QUERY_DIFF_ENV", "dev") == "prod" and not _allowed_origins_env:
+    raise RuntimeError(
+        "ALLOWED_ORIGINS 환경변수가 설정되지 않았습니다. "
+        "prod 환경에서는 ALLOWED_ORIGINS=https://internal.example.com 형식으로 설정해주세요."
+    )
+_allowed_origins = (
+    [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+    if _allowed_origins_env
+    else ["*"]  # dev 환경에서만 허용
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

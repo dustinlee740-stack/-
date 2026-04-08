@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -10,6 +12,45 @@ import requests
 from bs4 import BeautifulSoup
 
 from query_diff.models import WikiBlock
+
+
+# --- SSRF 방어 ---
+
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _validate_url_not_internal(url: str) -> None:
+    """사용자 입력 URL이 내부 네트워크를 가리키지 않는지 검증 (SSRF 방어)"""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"유효하지 않은 URL입니다: {url}")
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"허용되지 않는 스키마입니다: {parsed.scheme}")
+
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        raise ValueError(f"호스트를 해석할 수 없습니다: {hostname}")
+
+    for family, _, _, _, sockaddr in resolved:
+        ip = ipaddress.ip_address(sockaddr[0])
+        for network in _BLOCKED_NETWORKS:
+            if ip in network:
+                raise ValueError(
+                    f"내부 네트워크 주소로의 요청은 차단됩니다: {hostname} -> {ip}"
+                )
 
 
 @dataclass
@@ -68,15 +109,15 @@ def _looks_like_sql(code: str) -> bool:
     return bool(sql_keywords.search(code))
 
 
-def extract_sql_blocks_from_html(html: str) -> list[WikiBlock]:
-    """HTML에서 SQL 블록을 추출하여 WikiBlock 목록 반환"""
-    raw_blocks = _extract_sql_from_html(html)
+_SQL_LANGUAGES = ("sql", "plsql", "hive", "oracle")
 
-    results: list[WikiBlock] = []
+
+def _filter_sql_blocks(raw_blocks: list[_RawBlock]) -> list[tuple[WikiBlock, str]]:
+    """_RawBlock 목록을 SQL 필터링 + WikiBlock 변환 (공통 헬퍼)"""
+    results: list[tuple[WikiBlock, str]] = []
     idx = 0
     for block in raw_blocks:
-        # SQL 관련 블록만 필터링
-        if block.language not in ("sql", "plsql", "hive", "oracle") and not _looks_like_sql(block.code):
+        if block.language not in _SQL_LANGUAGES and not _looks_like_sql(block.code):
             continue
 
         lines = block.code.count("\n") + 1
@@ -84,19 +125,28 @@ def extract_sql_blocks_from_html(html: str) -> list[WikiBlock]:
         if len(block.code) > 80:
             preview += "..."
 
-        results.append(WikiBlock(
+        wb = WikiBlock(
             index=idx,
             preview=preview,
             lines=lines,
             language=block.language if block.language != "" else "sql",
-        ))
+        )
+        results.append((wb, block.code))
         idx += 1
 
     return results
 
 
+def extract_sql_blocks_from_html(html: str) -> list[WikiBlock]:
+    """HTML에서 SQL 블록을 추출하여 WikiBlock 목록 반환"""
+    raw_blocks = _extract_sql_from_html(html)
+    return [wb for wb, _ in _filter_sql_blocks(raw_blocks)]
+
+
 def fetch_confluence_page(url: str, token: str | None = None) -> str:
     """Confluence URL에서 HTML 본문을 가져옴"""
+    _validate_url_not_internal(url)
+
     parsed = urlparse(url)
     # /wiki/spaces/SPACE/pages/PAGEID 형식에서 page_id 추출
     page_id_match = re.search(r"/pages/(\d+)", parsed.path)
@@ -125,22 +175,7 @@ def extract_sql_from_url(url: str, token: str | None = None) -> tuple[list[WikiB
     """
     html = fetch_confluence_page(url, token)
     raw_blocks = _extract_sql_from_html(html)
-
-    wiki_blocks: list[WikiBlock] = []
-    full_sqls: list[str] = []
-    idx = 0
-
-    for block in raw_blocks:
-        if block.language not in ("sql", "plsql", "hive", "oracle") and not _looks_like_sql(block.code):
-            continue
-
-        lines = block.code.count("\n") + 1
-        preview = block.code[:80].replace("\n", " ")
-        if len(block.code) > 80:
-            preview += "..."
-
-        wiki_blocks.append(WikiBlock(index=idx, preview=preview, lines=lines, language=block.language))
-        full_sqls.append(block.code)
-        idx += 1
-
+    pairs = _filter_sql_blocks(raw_blocks)
+    wiki_blocks = [wb for wb, _ in pairs]
+    full_sqls = [code for _, code in pairs]
     return wiki_blocks, full_sqls

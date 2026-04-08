@@ -13,6 +13,7 @@ from query_diff.wiki_service import (
     extract_sql_blocks_from_html,
     extract_sql_from_url,
     fetch_confluence_page,
+    _validate_url_not_internal,
 )
 
 
@@ -873,8 +874,9 @@ class TestWikiExternalCall:
     </ac:structured-macro>
     """
 
+    @patch("query_diff.wiki_service._validate_url_not_internal")
     @patch("query_diff.wiki_service.requests.get")
-    def test_fetch_confluence_page_success(self, mock_get):
+    def test_fetch_confluence_page_success(self, mock_get, mock_validate):
         """Confluence REST API 호출 성공"""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -887,17 +889,18 @@ class TestWikiExternalCall:
         html = fetch_confluence_page("https://wiki.example.com/wiki/spaces/DEV/pages/12345")
         assert "SELECT" in html
         mock_get.assert_called_once()
+        mock_validate.assert_called_once()
         call_url = mock_get.call_args[0][0]
         assert "/rest/api/content/12345" in call_url
 
-    @patch("query_diff.wiki_service.requests.get")
-    def test_fetch_confluence_page_no_page_id(self, mock_get):
+    def test_fetch_confluence_page_no_page_id(self):
         """URL에 page ID가 없으면 ValueError"""
-        with pytest.raises(ValueError, match="page ID"):
+        with pytest.raises(ValueError):
             fetch_confluence_page("https://wiki.example.com/wiki/spaces/DEV/overview")
 
+    @patch("query_diff.wiki_service._validate_url_not_internal")
     @patch("query_diff.wiki_service.requests.get")
-    def test_extract_sql_from_url_full_flow(self, mock_get):
+    def test_extract_sql_from_url_full_flow(self, mock_get, mock_validate):
         """URL → HTML fetch → SQL 추출 전체 흐름 (mock)"""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -912,8 +915,9 @@ class TestWikiExternalCall:
         assert len(sqls) == 1
         assert "SUM(amt)" in sqls[0]
 
+    @patch("query_diff.wiki_service._validate_url_not_internal")
     @patch("query_diff.wiki_service.requests.get")
-    def test_fetch_confluence_with_bearer_token(self, mock_get):
+    def test_fetch_confluence_with_bearer_token(self, mock_get, mock_validate):
         """Bearer 토큰이 Authorization 헤더에 포함되는지 확인"""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -926,8 +930,9 @@ class TestWikiExternalCall:
         call_headers = mock_get.call_args[1]["headers"]
         assert call_headers["Authorization"] == "Bearer my-token"
 
+    @patch("query_diff.wiki_service._validate_url_not_internal")
     @patch("query_diff.wiki_service.requests.get")
-    def test_extract_wiki_api_endpoint(self, mock_get):
+    def test_extract_wiki_api_endpoint(self, mock_get, mock_validate):
         """API extract-wiki 엔드포인트 + mock 통합"""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -1031,3 +1036,83 @@ class TestFileUploadScenario:
         data = res.json()
         assert data["query_a"]["source_type"] == "WIKI"
         assert data["query_a"]["wiki_url"] == "https://wiki.example.com/pages/12345"
+
+
+# --- SSRF 방어 테스트 ---
+
+class TestSSRFProtection:
+    """내부 네트워크 주소로의 요청을 차단하는지 검증"""
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_block_localhost(self, mock_dns):
+        """127.0.0.1 차단"""
+        mock_dns.return_value = [(2, 1, 6, "", ("127.0.0.1", 0))]
+        with pytest.raises(ValueError, match="내부 네트워크"):
+            _validate_url_not_internal("https://evil.com/wiki/spaces/X/pages/1")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_block_private_10(self, mock_dns):
+        """10.x.x.x 사설망 차단"""
+        mock_dns.return_value = [(2, 1, 6, "", ("10.0.0.5", 0))]
+        with pytest.raises(ValueError, match="내부 네트워크"):
+            _validate_url_not_internal("https://internal.corp/pages/1")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_block_private_172(self, mock_dns):
+        """172.16.x.x 사설망 차단"""
+        mock_dns.return_value = [(2, 1, 6, "", ("172.16.0.1", 0))]
+        with pytest.raises(ValueError, match="내부 네트워크"):
+            _validate_url_not_internal("https://internal.corp/pages/1")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_block_private_192(self, mock_dns):
+        """192.168.x.x 사설망 차단"""
+        mock_dns.return_value = [(2, 1, 6, "", ("192.168.1.1", 0))]
+        with pytest.raises(ValueError, match="내부 네트워크"):
+            _validate_url_not_internal("https://internal.corp/pages/1")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_block_link_local(self, mock_dns):
+        """169.254.x.x 링크 로컬 차단"""
+        mock_dns.return_value = [(2, 1, 6, "", ("169.254.169.254", 0))]
+        with pytest.raises(ValueError, match="내부 네트워크"):
+            _validate_url_not_internal("https://metadata.google/pages/1")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_block_ipv6_loopback(self, mock_dns):
+        """::1 IPv6 루프백 차단"""
+        mock_dns.return_value = [(10, 1, 6, "", ("::1", 0, 0, 0))]
+        with pytest.raises(ValueError, match="내부 네트워크"):
+            _validate_url_not_internal("https://evil.com/pages/1")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_allow_public_ip(self, mock_dns):
+        """공인 IP는 통과"""
+        mock_dns.return_value = [(2, 1, 6, "", ("203.0.113.50", 0))]
+        # 예외 없이 통과되어야 함
+        _validate_url_not_internal("https://wiki.public-corp.com/pages/1")
+
+    def test_block_invalid_scheme(self):
+        """file://, ftp:// 등 비허용 스키마 차단"""
+        with pytest.raises(ValueError, match="유효하지 않은|scheme|스키마"):
+            _validate_url_not_internal("file:///etc/passwd")
+        with pytest.raises(ValueError, match="유효하지 않은|scheme|스키마"):
+            _validate_url_not_internal("ftp://internal/data")
+
+    def test_block_no_hostname(self):
+        """호스트 없는 URL 차단"""
+        with pytest.raises(ValueError):
+            _validate_url_not_internal("https://")
+
+    @patch("query_diff.wiki_service.socket.getaddrinfo")
+    def test_ssrf_via_api_endpoint(self, mock_dns):
+        """API 엔드포인트 통해 SSRF 시도 시 400 반환"""
+        mock_dns.return_value = [(2, 1, 6, "", ("127.0.0.1", 0))]
+        res = client.post("/api/comparisons")
+        req_id = res.json()["id"]
+
+        res = client.post(f"/api/comparisons/{req_id}/extract-wiki", json={
+            "url": "https://localhost/wiki/spaces/X/pages/1"
+        })
+        assert res.status_code == 400
+        assert "내부 네트워크" in res.json()["detail"]

@@ -1,4 +1,9 @@
-"""인메모리 비교 요청 저장소"""
+"""인메모리 비교 요청 저장소
+
+제약사항:
+  - 싱글톤 dict 기반이므로 단일 워커(uvicorn --workers 1)에서만 동작합니다.
+  - 멀티 워커 환경에서는 프로세스 간 상태가 격리되므로 DB(Redis/PostgreSQL)로 교체해야 합니다.
+"""
 
 from __future__ import annotations
 
