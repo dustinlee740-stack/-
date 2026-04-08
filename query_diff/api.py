@@ -98,6 +98,7 @@ def _apply_query_update(query: "QueryInput", body: QueryInputUpdate) -> None:
     query.is_valid = None
     query.validation_error = None
     query.structure = None
+    query.sql_normalized = None
 
 
 @app.put("/api/comparisons/{req_id}/query-a", response_model=ComparisonRequest)
