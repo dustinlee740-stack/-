@@ -98,6 +98,27 @@ class TestValidation:
         assert _preprocess_sql("'${aspId=ABC123}'") == "'ABC123'"
         assert _preprocess_sql("${noDefault}") == "'__PLACEHOLDER__'"
 
+    def test_en_dash_comment_auto_fix(self):
+        """Word/Confluence에서 '--'가 en-dash '–'로 자동교정된 주석도 파싱되어야 함"""
+        sql = """SELECT 1 FROM t
+        WHERE x = 1
+        – 등록일시 기준 조회
+        AND y = 2"""
+        result = validate_sql(sql, Dialect.HIVE)
+        assert result.is_valid is True
+
+    def test_em_dash_comment_auto_fix(self):
+        """em-dash '—'도 동일하게 복구"""
+        sql = "SELECT 1 FROM t WHERE x = 1 — 주석\nAND y = 2"
+        result = validate_sql(sql, Dialect.HIVE)
+        assert result.is_valid is True
+
+    def test_broken_oracle_hint_stripped(self):
+        """깨진 Oracle 힌트 '/+full(it)/'도 파싱되어야 함"""
+        sql = "SELECT /+full(it)/ * FROM ias.ias_transaction it"
+        result = validate_sql(sql, Dialect.ORACLE)
+        assert result.is_valid is True
+
     def test_hive_korean_alias(self):
         """한글 alias를 따옴표 없이 사용한 HiveQL 파싱"""
         sql = """select

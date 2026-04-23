@@ -9,16 +9,22 @@ from fastapi.responses import FileResponse
 import os
 
 from query_diff.models import (
+    AcknowledgeRequest,
     ComparisonRequest,
     ComparisonStatus,
     DiffSummary,
     QueryInputUpdate,
+    SemanticDiff,
+    StructureDiff,
     SummaryUpdate,
     ValidateResponse,
     WikiExtractRequest,
     WikiExtractResponse,
 )
+from query_diff.semantic_diff import compare_semantic
 from query_diff.store import store
+from query_diff.structure_diff import compare_structures
+from query_diff.structure_diff.comparator import recompute_state
 from query_diff.validation_service import validate_query_input
 from query_diff.wiki_service import extract_sql_blocks_from_html, extract_sql_from_url
 
@@ -191,8 +197,134 @@ def execute_comparison(req_id: str):
         raise HTTPException(status_code=400, detail="차이 요약을 최소 1개 입력해주세요.")
 
     req.status = ComparisonStatus.COMPARING
-    # TODO: Phase 1 쿼리 구조 비교 실행 연동
+    try:
+        req.structure_diff = compare_structures(req.query_a, req.query_b)
+    except Exception as e:
+        req.status = ComparisonStatus.ERROR
+        store.update(req)
+        raise HTTPException(status_code=500, detail=f"구조 비교 실패: {e}")
+
+    # 의미 비교는 구문 비교와 병존. 의미 비교 실패는 전체 실행을 막지 않고
+    # SemanticDiff.error 에 사유를 담아 반환한다.
+    try:
+        req.semantic_diff = compare_semantic(
+            req.query_a.sql_raw,
+            req.query_a.dialect,
+            req.query_b.sql_raw,
+            req.query_b.dialect,
+        )
+    except Exception as e:
+        from query_diff.models import SemanticVerdict
+        req.semantic_diff = SemanticDiff(
+            verdict=SemanticVerdict.LIMITED,
+            reason="의미 비교 중 예기치 못한 오류가 발생했습니다.",
+            error=str(e),
+        )
+
+    # Critical 1건 이상이면 fast-path 종결, 아니면 Row diff 단계로 진행해야 하지만
+    # No.5 Row diff가 아직 구현되지 않았으므로 현재는 DONE으로 종료.
     req.status = ComparisonStatus.DONE
     store.update(req)
 
     return req
+
+
+# --- 구조 비교 독립 엔드포인트 ---
+
+@app.post("/api/comparisons/{req_id}/structure-diff", response_model=StructureDiff)
+def run_structure_diff(req_id: str):
+    """AST 기반 쿼리 구조 비교만 단독 실행. 검증 완료 상태에서 호출 가능.
+
+    execute와 달리 summary 입력을 요구하지 않고 구조 차이 결과만 반환한다.
+    """
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+
+    if not (req.query_a.is_valid and req.query_b.is_valid):
+        raise HTTPException(
+            status_code=400,
+            detail="두 쿼리 모두 검증(validate)이 성공한 상태여야 합니다.",
+        )
+
+    try:
+        diff = compare_structures(req.query_a, req.query_b)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"구조 비교 실패: {e}")
+
+    req.structure_diff = diff
+    store.update(req)
+    return diff
+
+
+@app.get("/api/comparisons/{req_id}/structure-diff", response_model=StructureDiff)
+def get_structure_diff(req_id: str):
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+    if req.structure_diff is None:
+        raise HTTPException(status_code=404, detail="아직 구조 비교가 실행되지 않았습니다.")
+    return req.structure_diff
+
+
+@app.patch(
+    "/api/comparisons/{req_id}/structure-diff/findings/{index}",
+    response_model=StructureDiff,
+)
+def acknowledge_finding(req_id: str, index: int, body: AcknowledgeRequest):
+    """특정 finding을 사용자가 '동일하다고 판단'으로 마킹/해제.
+
+    모든 Critical이 acknowledged 되면 fast_path_terminate가 False로 전환되어
+    다음 단계(Row diff)로 진행 가능한 상태가 된다.
+    """
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+    if req.structure_diff is None:
+        raise HTTPException(status_code=404, detail="아직 구조 비교가 실행되지 않았습니다.")
+    if not (0 <= index < len(req.structure_diff.findings)):
+        raise HTTPException(status_code=404, detail="해당 finding이 존재하지 않습니다.")
+
+    req.structure_diff.findings[index].user_acknowledged = body.acknowledged
+    recompute_state(req.structure_diff)
+    store.update(req)
+    return req.structure_diff
+
+
+# --- 의미 비교 독립 엔드포인트 ---
+
+@app.post("/api/comparisons/{req_id}/semantic-diff", response_model=SemanticDiff)
+def run_semantic_diff(req_id: str):
+    """sqlglot 옵티마이저 기반 의미 동치성 비교.
+
+    구문(FROM-조인 vs WITH-CTE)이 달라도 같은 데이터를 반환하는지 판정한다.
+    """
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+
+    if not (req.query_a.is_valid and req.query_b.is_valid):
+        raise HTTPException(
+            status_code=400,
+            detail="두 쿼리 모두 검증(validate)이 성공한 상태여야 합니다.",
+        )
+
+    diff = compare_semantic(
+        req.query_a.sql_raw,
+        req.query_a.dialect,
+        req.query_b.sql_raw,
+        req.query_b.dialect,
+    )
+    req.semantic_diff = diff
+    store.update(req)
+    return diff
+
+
+@app.get("/api/comparisons/{req_id}/semantic-diff", response_model=SemanticDiff)
+def get_semantic_diff(req_id: str):
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+    if req.semantic_diff is None:
+        raise HTTPException(status_code=404, detail="아직 의미 비교가 실행되지 않았습니다.")
+    return req.semantic_diff

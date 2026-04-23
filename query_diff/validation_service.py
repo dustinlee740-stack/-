@@ -43,9 +43,25 @@ _DIALECT_FAMILY: dict[Dialect, set[Dialect]] = {
 # 템플릿 변수 패턴: ${name=default} 또는 ${name}
 _TEMPLATE_VAR_RE = re.compile(r"\$\{(\w+)(?:=([^}]*))?\}")
 
+# en-dash/em-dash가 주석 마커로 잘못 쓰인 경우 (Word/Confluence 자동교정으로 '--'이 '–'로 변환됨)
+# 공백으로 시작하거나 뒤에 공백이 오는 패턴만 수정 (문자열 내부 등 오탐 방지)
+_WRONG_DASH_COMMENT_RE = re.compile(r"(^|\s)[–—](\s)", re.MULTILINE)
+
+# 깨진 Oracle 힌트 (Word 등에서 '*'이 제거된 경우): /+full(it)/
+_BROKEN_HINT_RE = re.compile(r"/\+[^/\n]*/")
+
 
 def _preprocess_sql(sql: str) -> str:
-    """sqlglot 파싱 전 전처리: 템플릿 변수를 기본값 또는 플레이스홀더로 치환"""
+    """sqlglot 파싱 전 전처리:
+    1) en-dash/em-dash 주석 마커를 표준 '--'로 복구
+    2) 깨진 Oracle 힌트 제거
+    3) 템플릿 변수를 기본값 또는 플레이스홀더로 치환
+    """
+    # 1) 잘못된 대시 주석 복구
+    sql = _WRONG_DASH_COMMENT_RE.sub(r"\1--\2", sql)
+
+    # 2) 깨진 힌트 제거 (힌트는 optimizer 지시어라 구조 비교에 영향 없음)
+    sql = _BROKEN_HINT_RE.sub(" ", sql)
 
     def _replace_var(m: re.Match) -> str:
         default = m.group(2)
