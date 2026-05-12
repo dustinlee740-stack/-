@@ -78,8 +78,11 @@ pip install pandas openpyxl
 - "## 검토 메모(선택)": 분류는 도출됐으나 영향 없음으로 판정한 컴포넌트의 누락 사유
 
 `impact_log.jsonl` (Claude Code가 한 줄 append):
+- 라인 종류는 `entry_type` 키로 명시한다. 허용값: `new`(신규, impacted 단일 키), `new_split`(신규, impacted_primary/secondary 분리), `correction`(정정), `reverification`(재검증).
+- 정정·재검증 라인은 `correction_of`/`reverification_of`(이전 라인 ts) + 카운트 키(`impacted_total_count` 또는 `impacted_primary_count`/`impacted_secondary_count`) 중 하나 이상을 포함한다.
+- 기존 라인(entry_type 도입 전)은 검증기가 키셋으로 fallback 추론하므로 마이그레이션 불필요. 신규 라인부터 `entry_type` 사용.
 ```json
-{"ts":"<ISO>","requirement_file":"<absolute path>","derived_categories":["대>중>소", ...],"impacted":[{"name":"IAS","reason":"..."}],"summary":"<1~2문장 요약>"}
+{"ts":"<ISO>","entry_type":"new","requirement_file":"<absolute path>","derived_categories":["대>중>소", ...],"impacted":[{"name":"IAS","reason":"..."}],"summary":"<1~2문장 요약>"}
 ```
 
 ### 도구

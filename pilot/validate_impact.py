@@ -8,8 +8,11 @@ Checks (no LLM, no scoring):
   3) Cross-artifact count consistency — header "영향 가능 컴포넌트 N개" matches
      unique anchor count in body "## 영향 컴포넌트" section; "flat 인덱스 행 N행"
      matches data-row count in flat-index table(s)
-  4) impact_log.jsonl — every line valid JSON, required keys, ISO ts; continuation
-     lines (correction/reverification) must declare at least one impacted count
+  4) impact_log.jsonl — every line valid JSON, required keys, ISO ts; entry_type
+     ∈ {new, new_split, correction, reverification} when present is the source of
+     truth, otherwise falls back to key-set inference (pre-entry_type lines).
+     Continuation lines (correction/reverification) must declare at least one
+     impacted count.
   5) Consistency keyword warnings — outdated catalog phrases; quoted/code-cited
      uses are exempt via negative-lookaround
 
@@ -53,6 +56,7 @@ CONTINUATION_COUNT_KEYS = (
     "impacted_primary_count",
     "impacted_secondary_count",
 )
+ENTRY_TYPES = {"new", "new_split", "correction", "reverification"}
 
 # Quoted/code-cited contexts are exempt: ` " ' 「 」 『 』 ' ' " "
 _QUOTE_CHARS = r"`\"'‘’“”「」『』"
@@ -195,18 +199,46 @@ def check_log() -> list[str]:
         if missing:
             errors.append(f"{LOG.name}:line{i}: 필수 키 누락 {missing}")
         keys = set(obj.keys())
-        is_new = any(needed.issubset(keys) for needed in NEW_ENTRY_KEYS)
-        is_continuation = any(k in keys for k in CONTINUATION_KEYS)
-        if not (is_new or is_continuation):
-            errors.append(
-                f"{LOG.name}:line{i}: 신규 항목 키 세트(derived_categories+impacted[_primary/_secondary]) 또는 정정·재검증 키(correction_of/reverification_of/revision_type) 중 하나 필요"
-            )
-        if is_continuation and not is_new:
-            has_count = any(k in keys for k in CONTINUATION_COUNT_KEYS)
-            if not has_count:
+
+        entry_type = obj.get("entry_type")
+        if entry_type is not None:
+            if entry_type not in ENTRY_TYPES:
                 errors.append(
-                    f"{LOG.name}:line{i}: 정정·재검증 라인에 카운트 키({'/'.join(CONTINUATION_COUNT_KEYS)}) 중 하나 이상 필요 — IMPACT-INDEX 누적 검색 부담 회피"
+                    f"{LOG.name}:line{i}: 알 수 없는 entry_type {entry_type!r} (허용: {sorted(ENTRY_TYPES)})"
                 )
+            elif entry_type == "new":
+                if not {"derived_categories", "impacted"}.issubset(keys):
+                    errors.append(
+                        f"{LOG.name}:line{i}: entry_type=new는 derived_categories+impacted 필요"
+                    )
+            elif entry_type == "new_split":
+                if not {"derived_categories", "impacted_primary", "impacted_secondary"}.issubset(keys):
+                    errors.append(
+                        f"{LOG.name}:line{i}: entry_type=new_split는 derived_categories+impacted_primary+impacted_secondary 필요"
+                    )
+            else:
+                ref_key = "correction_of" if entry_type == "correction" else "reverification_of"
+                if ref_key not in keys:
+                    errors.append(
+                        f"{LOG.name}:line{i}: entry_type={entry_type}는 {ref_key} 필요"
+                    )
+                if not any(k in keys for k in CONTINUATION_COUNT_KEYS):
+                    errors.append(
+                        f"{LOG.name}:line{i}: entry_type={entry_type}는 카운트 키({'/'.join(CONTINUATION_COUNT_KEYS)}) 중 하나 이상 필요 — IMPACT-INDEX 누적 검색 부담 회피"
+                    )
+        else:
+            is_new = any(needed.issubset(keys) for needed in NEW_ENTRY_KEYS)
+            is_continuation = any(k in keys for k in CONTINUATION_KEYS)
+            if not (is_new or is_continuation):
+                errors.append(
+                    f"{LOG.name}:line{i}: 신규 항목 키 세트(derived_categories+impacted[_primary/_secondary]) 또는 정정·재검증 키(correction_of/reverification_of/revision_type) 중 하나 필요 — 신규 라인은 entry_type 사용 권장"
+                )
+            if is_continuation and not is_new:
+                has_count = any(k in keys for k in CONTINUATION_COUNT_KEYS)
+                if not has_count:
+                    errors.append(
+                        f"{LOG.name}:line{i}: 정정·재검증 라인에 카운트 키({'/'.join(CONTINUATION_COUNT_KEYS)}) 중 하나 이상 필요 — IMPACT-INDEX 누적 검색 부담 회피"
+                    )
         ts = obj.get("ts", "")
         if not ISO_RE.match(ts):
             errors.append(f"{LOG.name}:line{i}: ts ISO 형식 아님 ({ts})")
