@@ -16,10 +16,9 @@ Checks (no LLM, no scoring):
 Exit code 0 on pass, 1 on any non-warning error.
 
 Usage:
-    python validate_impact.py [--dir D:\\da\\pilot]
+    python validate_impact.py
 """
 
-import argparse
 import json
 import re
 import sys
@@ -215,15 +214,17 @@ def check_log() -> list[str]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Validate impact-analysis artifacts in D:/da/pilot.")
-    ap.add_argument("--dir", type=Path, default=ROOT)
-    args = ap.parse_args()
-    root: Path = args.dir
+    if len(sys.argv) > 1:
+        print(
+            f"usage: python validate_impact.py (no arguments; got {sys.argv[1:]})",
+            file=sys.stderr,
+        )
+        return 2
 
     df = pd.read_excel(XLSX).dropna(subset=["Name"]).reset_index(drop=True)
     slug_to_name = _build_slug_map(df)
 
-    md_files = sorted(p for p in root.glob("impact_*.md") if p.name != "impact_context.md")
+    md_files = sorted(p for p in ROOT.glob("impact_*.md") if p.name != "impact_context.md")
 
     findings: list[str] = []
     for md in md_files:
