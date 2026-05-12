@@ -8,10 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-이 워크스페이스는 코나카드(Konacard) 컴포넌트 카탈로그(`components.xlsx`, 208개)를 다루는 두 가지 도구를 제공한다.
+이 워크스페이스는 코나카드(Konacard) 컴포넌트 카탈로그(`components.xlsx`, 208개)를 다루는 세 가지 도구를 제공한다.
 
 1. **변환 (xlsx → md)** — 카탈로그를 사람이 읽기 좋은 `components.md`로 변환.
 2. **영향 범위 체크 (요건 → 후보 컴포넌트)** — 새 요건이 들어왔을 때, 그 요건을 구현·수정하려면 손대야 할 컴포넌트 후보를 추천.
+3. **워크숍 자료 빌더 (보조)** — `docs/make_pilot_overview.py`로 도구 개요 PPT(`docs/pilot_overview.pptx`)를 결정론적으로 생성.
 
 ## Common commands
 
@@ -71,6 +72,7 @@ pip install pandas openpyxl
 
 `impact_<basename>.md` (Claude Code가 작성):
 - 헤더: 요건 파일 경로, 분석 시각(ISO), 도출된 분류 수, 영향 컴포넌트 수
+- (선택) 요건 ID 기준 **flat 인덱스** 표 — `요건ID | 요건 이름 | Name | Full Name | 영향 사유 | components.md 링크`. 본문 분류별 표의 축약본으로 한 눈 스캔용. 본문(분류별 표)이 진실의 원천. E-XX 행에는 #10 추론 가이드라인의 작업 유형(A 검증/B 에러처리/C 로직검토/D 신규룰)을 사유에 명시.
 - "## 도출된 분류": 대>중>소 트리 형태로, 각 분류별 도출 사유 1줄
 - "## 영향 컴포넌트": 분류별 그룹. 그룹 안에 표 — `Name | Full Name | 영향 사유 | components.md 링크`
 - "## 검토 메모(선택)": 분류는 도출됐으나 영향 없음으로 판정한 컴포넌트의 누락 사유
@@ -164,7 +166,7 @@ pip install pandas openpyxl
 
 ## 경로 하드코딩
 
-`xlsx_to_md.py`의 `XLSX`/`OUT` 상수(xlsx_to_md.py:16-17), `impact.py`의 `XLSX`/`OUT` 상수가 `D:\da\pilot\` 절대 경로로 하드코딩되어 있다. 워크스페이스 위치를 옮기면 두 파일의 상수를 함께 갱신해야 한다.
+`xlsx_to_md.py`의 `XLSX`/`OUT` 상수(xlsx_to_md.py:16-17), `impact.py`의 `XLSX`/`OUT` 상수, `docs/make_pilot_overview.py`의 `OUT` 상수가 모두 `D:\da\pilot\` 절대 경로로 하드코딩되어 있다. 워크스페이스 위치를 옮기면 세 파일의 상수를 함께 갱신해야 한다. `validate_impact.py`의 `ROOT` 상수도 같은 경로를 가리키므로 함께 갱신.
 
 ## 도메인 메모
 

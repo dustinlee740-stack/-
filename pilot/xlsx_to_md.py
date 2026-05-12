@@ -2,6 +2,10 @@
 Convert D:/da/pilot/components.xlsx to D:/da/pilot/components.md.
 Keeps the .xlsx untouched. Re-runnable.
 
+Input columns required:
+  - Name, Full Name, Korean Description, English Description (exact, English headers)
+  - 대분류 / 중분류 / 소분류 (Korean or English headers, resolved via pick())
+
 Output structure:
   - Header + summary
   - TOC grouped by 대분류 > 중분류 (links to component sections)
@@ -50,7 +54,11 @@ def main():
     cmajor = pick(df, COL_MAJOR)
     cmid = pick(df, COL_MID)
     cminor = pick(df, COL_MINOR)
-    # Sort case-insensitively
+    for c in ("Name", "Full Name", "Korean Description", "English Description"):
+        if c not in df.columns:
+            raise KeyError(f"Required column missing: {c!r} (got {df.columns.tolist()})")
+    df = df.dropna(subset=["Name"]).reset_index(drop=True)
+    # Case-insensitive sort for English component names (Hangul unaffected by upper()).
     df = df.sort_values(by="Name", key=lambda s: s.str.upper(), kind="stable").reset_index(drop=True)
 
     # Group by major > mid (preserve a stable ordering by first appearance)

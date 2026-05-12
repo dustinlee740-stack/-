@@ -44,6 +44,8 @@ def main() -> None:
     cmajor = pick(df, COL_MAJOR)
     cmid = pick(df, COL_MID)
     cminor = pick(df, COL_MINOR)
+    df = df.dropna(subset=["Name"]).reset_index(drop=True)
+    # Case-insensitive sort for English component names (Hangul unaffected by upper()).
     df = df.sort_values(by="Name", key=lambda s: s.str.upper(), kind="stable").reset_index(drop=True)
 
     grouped: "OrderedDict[str, OrderedDict[str, OrderedDict[str, list]]]" = OrderedDict()
@@ -53,14 +55,14 @@ def main() -> None:
         minor = str(r[cminor]) if pd.notna(r[cminor]) else "(미분류)"
         grouped.setdefault(major, OrderedDict()).setdefault(mid, OrderedDict()).setdefault(minor, []).append(r)
 
-    ts = dt.datetime.now().isoformat(timespec="seconds")
+    ts = dt.datetime.fromtimestamp(XLSX.stat().st_mtime).isoformat(timespec="seconds")
     lines: list[str] = []
     lines.append("# 영향 분석 추론 머티리얼 (impact_context)")
     lines.append("")
-    lines.append(f"- 생성 시각: {ts}")
+    lines.append(f"- 출처 갱신 시각: {ts}")
     lines.append(f"- 출처: `{XLSX}` (총 {len(df)}개 컴포넌트)")
     lines.append(f"- 대분류 {df[cmajor].nunique()} · 중분류 {df[cmid].nunique()} · 소분류 {df[cminor].nunique()}")
-    lines.append("- 용도: Claude Code가 영향 분석 워크플로우의 1단계(분류 도출) · 2단계(비교·추론)에서 참조하는 압축 카탈로그")
+    lines.append("- 용도: 영향 분석 워크플로우의 1단계(분류 도출) · 2단계(비교·추론) 단계에서 AI 추론 도구가 참조하는 압축 카탈로그")
     lines.append("- 컴포넌트 전문 설명은 `components.md`에서 확인")
     lines.append("")
     lines.append("---")

@@ -7,6 +7,9 @@
 
 xlsx_to_md.py / impact.py 와 동일하게 절대경로 하드코딩 + 결정론적 생성기 패턴.
 재실행 시 동일 결과.
+
+폰트 의존: Pretendard 9 weights가 시스템에 설치되어 있어야 함.
+미설치 시 PPT 폰트는 시스템 기본 한글 폰트로 fallback되며 가독성·심미성이 떨어진다.
 """
 
 from pptx import Presentation
