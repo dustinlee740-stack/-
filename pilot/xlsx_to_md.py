@@ -16,9 +16,11 @@ import re
 import pandas as pd
 import unicodedata
 from collections import OrderedDict
+from pathlib import Path
 
-XLSX = r"D:\da\pilot\components.xlsx"
-OUT = r"D:\da\pilot\components.md"
+_HERE = Path(__file__).parent
+XLSX = _HERE / "components.xlsx"
+OUT = _HERE / "components.md"
 
 # Column names tolerant to either Korean or English headers
 COL_MAJOR = ("Major Categories", "대분류")

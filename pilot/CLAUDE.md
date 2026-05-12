@@ -166,7 +166,7 @@ pip install pandas openpyxl
 
 ## 경로 하드코딩
 
-`xlsx_to_md.py`의 `XLSX`/`OUT` 상수(xlsx_to_md.py:16-17), `impact.py`의 `XLSX`/`OUT` 상수, `docs/make_pilot_overview.py`의 `OUT` 상수가 모두 `D:\da\pilot\` 절대 경로로 하드코딩되어 있다. 워크스페이스 위치를 옮기면 세 파일의 상수를 함께 갱신해야 한다. `validate_impact.py`의 `ROOT` 상수도 같은 경로를 가리키므로 함께 갱신.
+`xlsx_to_md.py`의 `XLSX`/`OUT`, `impact.py`의 `XLSX`/`OUT`, `validate_impact.py`의 `ROOT`/`XLSX`/`LOG`, `docs/make_pilot_overview.py`의 `OUT`은 모두 **스크립트 위치 기반(`Path(__file__).parent`)으로 자동 도출**된다. 워크스페이스를 다른 경로로 이동·복제해도 상수 갱신 없이 그대로 동작한다. `D:\da\pilot` 절대 경로를 직접 박아넣지 말 것 — 새 산출물이나 새 도구를 추가할 때도 같은 방식(`Path(__file__).parent` 기반)을 따른다.
 
 ## 도메인 메모
 

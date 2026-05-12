@@ -5,7 +5,7 @@
 입력 없음 (본문은 모두 사용자 작성 원문이 이 파일에 내장됨)
 출력 D:\\da\\pilot\\docs\\pilot_overview.pptx (27 slides, 16:9)
 
-xlsx_to_md.py / impact.py 와 동일하게 절대경로 하드코딩 + 결정론적 생성기 패턴.
+xlsx_to_md.py / impact.py 와 동일하게 스크립트 위치 기반 경로 + 결정론적 생성기 패턴.
 재실행 시 동일 결과.
 
 폰트 의존: Pretendard 9 weights가 시스템에 설치되어 있어야 함.
@@ -20,8 +20,9 @@ from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.oxml.ns import qn
 from copy import deepcopy
 from lxml import etree
+from pathlib import Path
 
-OUT = r"D:\da\pilot\docs\pilot_overview.pptx"
+OUT = Path(__file__).parent / "pilot_overview.pptx"
 
 # ── 색상 (미니멀: 네이비/그레이/액센트 1색) ─────────────────────────────
 NAVY    = RGBColor(0x1F, 0x2A, 0x44)

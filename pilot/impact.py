@@ -23,8 +23,8 @@ import pandas as pd
 
 from xlsx_to_md import COL_MAJOR, COL_MID, COL_MINOR, pick
 
-XLSX = Path(r"D:\da\pilot\components.xlsx")
-OUT = Path(r"D:\da\pilot\impact_context.md")
+XLSX = Path(__file__).parent / "components.xlsx"
+OUT = Path(__file__).parent / "impact_context.md"
 
 SUMMARY_MAX_CHARS = 100
 

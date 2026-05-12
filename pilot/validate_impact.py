@@ -31,7 +31,7 @@ from xlsx_to_md import slugify
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT = Path(r"D:\da\pilot")
+ROOT = Path(__file__).parent
 XLSX = ROOT / "components.xlsx"
 LOG = ROOT / "impact_log.jsonl"
 
