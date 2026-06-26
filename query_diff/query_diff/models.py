@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -9,6 +10,9 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field, computed_field
+
+# ON 조건 문자열에서 `table.col` 의 테이블 한정자 추출용
+_TABLE_REF_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_]")
 
 
 class SourceType(str, Enum):
@@ -148,16 +152,29 @@ class JoinEdge(BaseModel):
     on_predicates: list[str] = Field(default_factory=list)
 
     def canonical_key(self) -> str:
-        """동일성 비교를 위한 canonical key. left/right 순서 무관 처리."""
-        l, r = sorted([self.left_table, self.right_table])
+        """동일성 비교를 위한 canonical key.
+
+        **앵커-독립:** FROM 앵커(left_table)가 아니라 **ON 조건이 참조하는 테이블 집합**으로
+        조인을 식별한다. A(FROM 직접 조인)는 모든 조인을 FROM 테이블에 매달고, B(WITH CTE)는
+        CTE 내부 테이블에 매달아 left_table 이 달라지는데, 실제 조인 의미는 ON 조건의 테이블·
+        컬럼에 있으므로 이를 기준으로 비교해야 같은 조인이 매칭된다.
+        """
+        tables: set[str] = set()
+        for p in self.on_predicates:
+            tables.update(_TABLE_REF_RE.findall(p))
+        if len(tables) < 2:  # ON 이 빈약하면(CROSS 등) 앵커로 보강
+            tables.update(t for t in (self.left_table, self.right_table) if t)
+        tbl = ",".join(sorted(t for t in tables if t))
         preds = "|".join(sorted(self.on_predicates))
-        return f"{l}<->{r}::{self.join_type}::{preds}"
+        return f"{tbl}::{self.join_type}::{preds}"
 
 
 class LogicalPlan(BaseModel):
     base_tables: list[str] = Field(default_factory=list)           # sorted lower-case names
     join_edges: list[JoinEdge] = Field(default_factory=list)
-    all_predicates: list[str] = Field(default_factory=list)        # sorted canonical
+    all_predicates: list[str] = Field(default_factory=list)        # sorted canonical (WHERE ∪ HAVING)
+    where_predicates: list[str] = Field(default_factory=list)      # sorted canonical (WHERE만)
+    having_predicates: list[str] = Field(default_factory=list)     # sorted canonical (HAVING만)
     group_keys: list[str] = Field(default_factory=list)
     aggregates: list[tuple[str, str]] = Field(default_factory=list)  # (func, arg)
     projections: list[str] = Field(default_factory=list)           # non-aggregate

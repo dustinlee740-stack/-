@@ -25,8 +25,26 @@ from query_diff.semantic_diff import compare_semantic
 from query_diff.store import store
 from query_diff.structure_diff import compare_structures
 from query_diff.structure_diff.comparator import recompute_state
+from query_diff.structure_diff.schema_mapping import OpAnMap, load_op_an_map
 from query_diff.validation_service import validate_query_input
 from query_diff.wiki_service import extract_sql_blocks_from_html, extract_sql_from_url
+
+import logging
+
+_log = logging.getLogger("query_diff.api")
+
+
+def _op_an_map() -> OpAnMap | None:
+    """운영→분석 매핑 아티팩트를 1회 로드(캐싱). 로드 실패 시 None(매핑 미적용 fallback).
+
+    경로는 환경변수 OP_AN_MAP_PATH 로 재정의 가능(기본: query_diff/data/op_an_map.json).
+    """
+    try:
+        return load_op_an_map(os.environ.get("OP_AN_MAP_PATH"))
+    except Exception as e:  # 아티팩트 부재/손상 시 매핑 없이 진행
+        _log.warning("op_an_map 로드 실패 — 스키마 매핑 미적용으로 진행: %s", e)
+        return None
+
 
 app = FastAPI(title="Query Diff Module", version="0.1.0")
 
@@ -193,12 +211,12 @@ def execute_comparison(req_id: str):
     if req.status not in (ComparisonStatus.READY, ComparisonStatus.DONE):
         raise HTTPException(status_code=400, detail="검증 완료 상태에서만 실행할 수 있습니다.")
 
-    if not req.summary.metrics:
-        raise HTTPException(status_code=400, detail="차이 요약을 최소 1개 입력해주세요.")
+    # 차이 요약(metrics)은 선택 입력. 비어 있어도 비교 실행을 막지 않는다.
 
+    op_an = _op_an_map()
     req.status = ComparisonStatus.COMPARING
     try:
-        req.structure_diff = compare_structures(req.query_a, req.query_b)
+        req.structure_diff = compare_structures(req.query_a, req.query_b, op_an=op_an)
     except Exception as e:
         req.status = ComparisonStatus.ERROR
         store.update(req)
@@ -212,6 +230,7 @@ def execute_comparison(req_id: str):
             req.query_a.dialect,
             req.query_b.sql_raw,
             req.query_b.dialect,
+            op_an=op_an,
         )
     except Exception as e:
         from query_diff.models import SemanticVerdict
@@ -248,7 +267,7 @@ def run_structure_diff(req_id: str):
         )
 
     try:
-        diff = compare_structures(req.query_a, req.query_b)
+        diff = compare_structures(req.query_a, req.query_b, op_an=_op_an_map())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"구조 비교 실패: {e}")
 
@@ -314,6 +333,7 @@ def run_semantic_diff(req_id: str):
         req.query_a.dialect,
         req.query_b.sql_raw,
         req.query_b.dialect,
+        op_an=_op_an_map(),
     )
     req.semantic_diff = diff
     store.update(req)

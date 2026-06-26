@@ -242,7 +242,7 @@
 <!-- 차이 요약 -->
 <div class="summary-section">
   <div class="section-head">
-    <h2>차이 요약 (Summary)</h2>
+    <h2>차이 요약 (Summary, 선택)</h2>
     <button class="btn btn-sm" id="btnAddMetric">+ 지표 추가</button>
   </div>
   <table class="metrics-table">
@@ -616,8 +616,7 @@ function showValidationResult(data) {
       html += `<div style="font-size:11px;color:#d09050;margin-top:4px;">ⓘ ${totalRows}개 행 중 ${metrics.length}개만 유효합니다. 지표명/A/B 칸이 모두 채워진 행만 집계됩니다.</div>`;
     }
   } else {
-    allValid = false;
-    html += `<div class="status-err">❌ 차이 요약: 지표를 최소 1개 입력해주세요</div>`;
+    html += `<div class="status-ok" style="color:#9090b0;">ⓘ 차이 요약: 입력 없음 (선택 항목)</div>`;
   }
   html += `</div>`;
 

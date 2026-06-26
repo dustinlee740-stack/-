@@ -9,11 +9,16 @@ Oracle/Hive 방언 차이를 흡수하여 절 단위로 비교 가능한 canonic
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import exp
 
+# 순수 숫자 문자열(Oracle 의 따옴표 붙은 숫자) 판정 — 분석계 숫자 리터럴과 동치 흡수용
+_NUM_STR_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+from query_diff.structure_diff.schema_mapping import OpAnMap, translate_op_to_an
 from query_diff.validation_service import _preprocess_sql
 
 # 함수 동의어 — Oracle ↔ Hive/ANSI 표준으로 정규화
@@ -33,6 +38,10 @@ _FUNCTION_ALIASES: dict[str, str] = {
     "CURRENT_DATE": "CURRENT_DATE",
     "CURRENT_TIMESTAMP": "CURRENT_TIMESTAMP",
 }
+
+# 타입 강제 코어션 함수 — 조인/비교에선 운영(to_char) vs 분석(무캐스트) 차이를 흡수하기 위해
+# 내부 인자로 언랩한다(예: to_char(id) ≡ id).
+_CAST_COERCIONS = {"CAST_STR", "CAST_DATE", "CAST_NUM"}
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,10 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
 
     if isinstance(node, exp.Literal):
         if node.is_string:
+            # 운영(Oracle)은 숫자에 따옴표 허용('99'), 분석(Hive/Impala)은 불가(99) — 같은 값.
+            # 순수 숫자 문자열은 따옴표를 떼 숫자 리터럴과 동일 표기로 흡수.
+            if _NUM_STR_RE.match(node.this):
+                return node.this
             return f"'{node.this}'"
         return str(node.this)
 
@@ -132,9 +145,18 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
         return f"CAST({inner} AS {to})"
 
     if isinstance(node, (exp.EQ, exp.NEQ)):
-        op = "=" if isinstance(node, exp.EQ) else "<>"
         left = _canonical_expr(node.left, alias_map)
         right = _canonical_expr(node.right, alias_map)
+        # NULL ≡ '' : 운영계(NULL) vs 분석계(빈문자열) 저장 엔진 차이를 동치로 흡수.
+        # `col = ''` → `col IS NULL`, `col <> ''` → `col IS NOT NULL`.
+        if left == "''" or right == "''":
+            other = right if left == "''" else left
+            return (
+                f"{other} IS NULL"
+                if isinstance(node, exp.EQ)
+                else f"{other} IS NOT NULL"
+            )
+        op = "=" if isinstance(node, exp.EQ) else "<>"
         a, b = sorted([left, right])
         return f"{a} {op} {b}"
 
@@ -174,6 +196,10 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
         return "(" + " OR ".join(parts) + ")"
 
     if isinstance(node, exp.Not):
+        inner = node.this
+        # `col IS NOT NULL` (= NOT col IS NULL) 표준형
+        if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
+            return f"{_canonical_expr(inner.this, alias_map)} IS NOT NULL"
         return f"NOT {_canonical_expr(node.this, alias_map)}"
 
     if isinstance(node, exp.Paren):
@@ -181,6 +207,11 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
 
     if isinstance(node, exp.Func):
         fname = _normalize_function_name(node.sql_name() or type(node).__name__)
+        # 타입 코어션(to_char 등)은 조인/비교에서 무시 — 내부 인자로 언랩
+        if fname in _CAST_COERCIONS:
+            inner = node.args.get("this")
+            if isinstance(inner, exp.Expression):
+                return _canonical_expr(inner, alias_map)
         args = [_canonical_expr(a, alias_map) for a in node.args.values() if isinstance(a, exp.Expression)]
         # 가변 인자 (expressions 리스트)
         if "expressions" in node.args and isinstance(node.args["expressions"], list):
@@ -348,13 +379,26 @@ def _extract_joins(
 
 
 def _split_and(node: exp.Expression) -> list[exp.Expression]:
-    """AND로 연결된 predicate를 개별 expression으로 분해"""
+    """AND로 연결된 predicate를 개별 expression으로 분해.
+
+    `x BETWEEN low AND high` 는 `x >= low` + `x <= high` 로 확장해, 작성 스타일이
+    BETWEEN이든 부등호든 같은 형태로 비교되게 한다.
+    """
     if isinstance(node, exp.And):
         left = _split_and(node.left)
         right = _split_and(node.right)
         return left + right
     if isinstance(node, exp.Paren):
         return _split_and(node.this)
+    if isinstance(node, exp.Between):
+        this = node.this
+        low = node.args.get("low")
+        high = node.args.get("high")
+        if this is not None and low is not None and high is not None:
+            return [
+                exp.GTE(this=this.copy(), expression=low.copy()),
+                exp.LTE(this=this.copy(), expression=high.copy()),
+            ]
     return [node]
 
 
@@ -387,17 +431,25 @@ def _extract_having(
     return sorted([_canonical_expr(p, alias_map) for p in _split_and(having.this)])
 
 
-def extract_canonical(sql: str, dialect: str) -> CanonicalQuery:
+def extract_canonical(
+    sql: str, dialect: str, op_an: OpAnMap | None = None
+) -> CanonicalQuery:
     """SQL 문자열을 파싱하여 CanonicalQuery로 변환.
 
     validation과 동일한 `_preprocess_sql`을 적용하여 템플릿 변수(`${...}`) 등으로
     인한 파싱 불일치를 방지한다.
+
+    op_an 가 주어지면(운영 쿼리 측) 파싱 직후 운영→분석 식별자 번역을 적용해
+    분석 네임스페이스로 정규화한다.
     """
     preprocessed = _preprocess_sql(sql.rstrip().rstrip(";"))
     parsed = sqlglot.parse(preprocessed, dialect=dialect)
     if not parsed or parsed[0] is None:
         raise ValueError("파싱 결과가 비어 있습니다.")
     tree = parsed[0]
+
+    if op_an is not None:
+        tree, _rename = translate_op_to_an(tree, op_an)
 
     # 최상위 SELECT 찾기
     top_select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
