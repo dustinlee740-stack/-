@@ -175,19 +175,192 @@ def _extract_group_keys(
     return sorted([_canonical_expr(e, alias_map) for e in group.expressions])
 
 
+# --- 위치 기반(최신 1건) 집계 인식 — Oracle KEEP(DENSE_RANK FIRST/LAST) ↔ AGG(CASE WHEN rank()=k …) ---
+_RANK_FUNCS = {"DENSE_RANK", "RANK", "ROW_NUMBER"}
+
+# 위치 기반 집계 func 토큰 마커(소프트 동치 신호 탐지용)
+POSITIONAL_AGG_MARK = "⟨KEEP_"
+
+
+def _order_canonical(order: exp.Expression | None, alias_map: dict[str, str]) -> str:
+    """ORDER BY 절을 `col DIR[, col DIR]` canonical 문자열로."""
+    if order is None:
+        return ""
+    parts = []
+    for o in order.expressions:
+        col = _canonical_expr(o.this, alias_map)
+        direction = "DESC" if o.args.get("desc") else "ASC"
+        parts.append(f"{col} {direction}")
+    return ", ".join(parts)
+
+
+def _rank_class(fname: str) -> str:
+    """랭크 함수 → 동률 의미 클래스. dense_rank·rank(동률 모두 1=SET) / row_number(1행=ONE).
+
+    SET 끼리는 `=1` 이 같은 행 집합을 고르므로 동치, ONE 은 임의 1행이라 동률 시 결과가 다르다.
+    """
+    return "ONE" if _normalize_function_name(fname) == "ROW_NUMBER" else "SET"
+
+
+def _group_canonical(select: exp.Select, alias_map: dict[str, str]) -> str:
+    """GROUP BY 키 집합 canonical(정렬). 위치 집계의 '암묵 파티션' 비교용."""
+    g = select.args.get("group")
+    if g is None:
+        return ""
+    return ", ".join(sorted(_canonical_expr(e, alias_map) for e in g.expressions))
+
+
+def _positional_agg_token(
+    agg_func: str, rankclass: str, order_canon: str, partition_canon: str
+) -> str:
+    """위치 기반 집계의 func 토큰(동치 비교 키 + 관용구 마커).
+
+    예: `MIN⟨KEEP_SET:recharge_deposit.dpsi_dttm DESC|P:recharge_deposit.rc_id⟩`.
+    집계·랭크클래스·정렬키·**파티션**이 모두 같아야 A(KEEP)와 B(윈도우-CASE)가 동일 토큰으로
+    수렴해 매칭된다. 파티션/랭크가 다르면 토큰이 갈려 하드 차이로 남는다.
+    """
+    return (
+        f"{agg_func}{POSITIONAL_AGG_MARK}{rankclass}:{order_canon}"
+        f"|P:{partition_canon}⟩"
+    )
+
+
+def _build_rank_windows(tree: exp.Expression) -> dict[str, tuple[str, str, str]]:
+    """트리 전역 `랭크 윈도우 출력 alias(소문자) → (ORDER BY, PARTITION BY, rankclass)` 맵.
+
+    `dense_rank() over (partition by p order by y desc) as rn` 같은 출력을 모아, 다른
+    스코프의 `CASE WHEN rn = 1` 이 가리키는 윈도우의 정렬·파티션·랭크종류를 역참조한다.
+    """
+    rw: dict[str, tuple[str, str, str]] = {}
+    for sel in tree.find_all(exp.Select):
+        am = _build_alias_map(sel)
+        for proj in sel.expressions:
+            if not isinstance(proj, exp.Alias) or not isinstance(proj.this, exp.Window):
+                continue
+            w = proj.this
+            fn = w.this
+            if fn is None:
+                continue
+            fname = _normalize_function_name(fn.sql_name() or type(fn).__name__)
+            if fname not in _RANK_FUNCS:
+                continue
+            order_c = _order_canonical(w.args.get("order"), am)
+            part_c = ", ".join(
+                sorted(_canonical_expr(p, am) for p in (w.args.get("partition_by") or []))
+            )
+            rw[_norm_ident(proj.alias)] = (order_c, part_c, _rank_class(fname))
+    return rw
+
+
+def _recognize_positional_agg(
+    base: exp.Expression,
+    select: exp.Select,
+    alias_map: dict[str, str],
+    rank_windows: dict[str, tuple[str, str, str]],
+) -> tuple[str, str] | None:
+    """위치 기반(최신 1건) 집계면 (func 토큰, 인자 canonical) 반환, 아니면 None.
+
+    패턴 A: `AGG(x) KEEP(DENSE_RANK FIRST ORDER BY y)` (exp.Window, over==KEEP) — 암묵 파티션은
+      소속 SELECT 의 GROUP BY.
+    패턴 B: `AGG(CASE WHEN <rankcol> = 1 THEN x END)` (ELSE 없음). <rankcol> 의 윈도우
+      PARTITION BY 가 **소속 SELECT 의 GROUP BY 와 같을 때만** '그룹별 최신' 으로 인식.
+    토큰에 집계·랭크클래스·정렬키·파티션(GROUP BY)을 모두 담아, 파티션·랭크가 다르면 하드 차이.
+    """
+    group_canon = _group_canonical(select, alias_map)
+
+    # 패턴 A — Oracle KEEP
+    for w in base.find_all(exp.Window):
+        if str(w.args.get("over") or "").upper() != "KEEP":
+            continue
+        agg = w.this
+        if not isinstance(agg, exp.Func):
+            continue
+        aggname = _normalize_function_name(agg.sql_name() or type(agg).__name__)
+        if aggname not in _AGG_FUNCTIONS:
+            continue
+        if not w.args.get("first"):
+            continue  # FIRST(최신/선두)만 — LAST 는 별도 의미
+        arg = (
+            _canonical_expr(agg.this, alias_map)
+            if isinstance(agg.this, exp.Expression)
+            else ""
+        )
+        alias_node = w.args.get("alias")
+        rank_name = getattr(alias_node, "name", "") if alias_node is not None else ""
+        rankclass = _rank_class(rank_name)
+        order_canon = _order_canonical(w.args.get("order"), alias_map)
+        return (
+            _positional_agg_token(aggname, rankclass, order_canon, group_canon),
+            arg,
+        )
+
+    # 패턴 B — AGG(CASE WHEN rankcol = 1 THEN x END), ELSE 없음
+    for f in base.find_all(exp.Func):
+        aggname = _normalize_function_name(f.sql_name() or type(f).__name__)
+        if aggname not in _AGG_FUNCTIONS:
+            continue
+        case = f.this if isinstance(f.this, exp.Case) else None
+        if case is None:
+            continue
+        default = case.args.get("default")
+        if default is not None and not isinstance(default, exp.Null):
+            continue  # ELSE 가 있으면(예: SUM(CASE … ELSE 0)) 위치 집계 아님
+        ifs = case.args.get("ifs") or []
+        if len(ifs) != 1:
+            continue
+        cond = ifs[0].this
+        if not isinstance(cond, exp.EQ):
+            continue
+        win = None
+        for side, other in ((cond.left, cond.right), (cond.right, cond.left)):
+            if (
+                isinstance(side, exp.Column)
+                and isinstance(other, exp.Literal)
+                and other.name == "1"  # rn = 1 → 최신/선두
+            ):
+                win = rank_windows.get(_norm_ident(side.name))
+                if win is not None:
+                    break
+        if win is None:
+            continue
+        order_canon, part_canon, rankclass = win
+        # 윈도우 PARTITION BY 가 GROUP BY 와 같을 때만 '그룹별 최신' = A 의 KEEP 과 동형
+        if part_canon != group_canon:
+            continue
+        arg = (
+            _canonical_expr(ifs[0].args.get("true"), alias_map)
+            if isinstance(ifs[0].args.get("true"), exp.Expression)
+            else ""
+        )
+        return (
+            _positional_agg_token(aggname, rankclass, order_canon, group_canon),
+            arg,
+        )
+    return None
+
+
 def _extract_aggregates_and_projections(
-    select: exp.Select, alias_map: dict[str, str]
+    select: exp.Select,
+    alias_map: dict[str, str],
+    rank_windows: dict[str, str] | None = None,
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """SELECT 절에서 집계식과 비집계 출력을 분리.
 
-    - aggregates: (함수명, 인자 canonical) 튜플 집합 (정렬)
+    - aggregates: (함수명, 인자 canonical) 튜플 집합 (정렬). 위치 기반(최신 1건) 집계는
+      함수명에 `⟨KEEP_…⟩` 마커를 단 토큰으로 표현(KEEP↔윈도우 관용구 동치 + 소프트 노트용).
     - projections: 비집계 출력 canonical 문자열 집합 (정렬)
     """
+    rank_windows = rank_windows or {}
     aggregates: list[tuple[str, str]] = []
     projections: list[str] = []
 
     for proj in select.expressions:
         base = proj.this if isinstance(proj, exp.Alias) else proj
+
+        positional = _recognize_positional_agg(base, select, alias_map, rank_windows)
+        if positional is not None:
+            aggregates.append(positional)
+            continue
 
         found_agg = False
         for func in base.find_all(exp.Func):
@@ -251,41 +424,132 @@ def _passthrough_outputs(
     return out
 
 
-def resolve_cte_passthrough(tree: exp.Expression) -> exp.Expression:
-    """집계 CTE(WITH)로 만든 main spine 을 꿰뚫는다.
+def _derived_selects(tree: exp.Expression) -> list[tuple[str, exp.Select]]:
+    """파생 테이블(별칭 있는 CTE + 인라인 서브쿼리)의 (별칭, SELECT) 목록.
 
-    `txn.stlm_mc_id` 같은 **CTE pass-through 컬럼**을 원천 베이스 컬럼
-    (`ias_transaction.stlm_mc_id`)으로 치환해, WITH 로 먼저 푼 B 와 JOIN 으로 직접 푼 A 가
-    같은 조인으로 식별되게 한다. 집계 출력(`txn.원결제금액`, `grp.grp_nm`)은 통과가 아니라
-    그대로 둔다. CTE 가 없으면 무동작.
+    CTE(`WITH txn AS (...)`)뿐 아니라 `FROM/JOIN (SELECT ...) c` 형태의 인라인
+    서브쿼리도 포함한다. 둘 다 바깥에서 `별칭.컬럼` 으로 참조되는 파생 테이블이므로
+    동일하게 pass-through 해소 대상이다.
     """
-    ctes = [c for c in tree.find_all(exp.CTE) if c.alias]
-    if not ctes:
+    out: list[tuple[str, exp.Select]] = []
+    for cte in tree.find_all(exp.CTE):
+        if cte.alias:
+            sel = cte.this if isinstance(cte.this, exp.Select) else cte.this.find(exp.Select)
+            if sel is not None:
+                out.append((_norm_ident(cte.alias), sel))
+    for sq in tree.find_all(exp.Subquery):
+        alias = sq.alias
+        if alias:
+            sel = sq.this if isinstance(sq.this, exp.Select) else sq.find(exp.Select)
+            if sel is not None:
+                out.append((_norm_ident(alias), sel))
+    return out
+
+
+def resolve_derived_passthrough(tree: exp.Expression) -> exp.Expression:
+    """파생 테이블(CTE + 인라인 서브쿼리)의 단순 컬럼 통과를 원천 베이스 컬럼으로 해소.
+
+    `txn.stlm_mc_id`(WITH CTE)뿐 아니라 `c.player_id`처럼 **인라인 서브쿼리**
+    (`FROM/JOIN (SELECT ...) c`)의 출력 컬럼도 원천 베이스 컬럼
+    (`recharge_deposit.player_id`)으로 치환한다. 이로써 WITH/서브쿼리로 먼저 푼 쪽과
+    JOIN 으로 직접 푼 쪽이 같은 베이스 조인으로 식별된다. 집계·표현식 출력
+    (`txn.원결제금액`, `grp.grp_nm`)은 통과가 아니라 그대로 둔다(조인키 아님).
+    파생 테이블이 없으면 무동작.
+
+    중첩 파생 테이블(서브쿼리 위의 서브쿼리)은 변화가 없을 때까지 반복(fixpoint)한다.
+    베이스 테이블명은 파생 별칭이 아니므로 재매칭되지 않아 수렴이 보장되며,
+    상한(6회)은 병리적 입력 대비 안전장치다.
+    """
+    if not _derived_selects(tree):
         return tree
     tree = tree.copy()
-    ctes = [c for c in tree.find_all(exp.CTE) if c.alias]
 
-    pmap: dict[str, dict[str, tuple[str, str]]] = {}
-    for c in ctes:
-        sel = c.this if isinstance(c.this, exp.Select) else c.this.find(exp.Select)
-        if sel is None:
-            continue
-        pmap[_norm_ident(c.alias)] = _passthrough_outputs(sel, _build_alias_map(sel))
+    for _ in range(6):
+        pmap: dict[str, dict[str, tuple[str, str]]] = {}
+        for alias, sel in _derived_selects(tree):
+            pmap[alias] = _passthrough_outputs(sel, _build_alias_map(sel))
+        if not pmap:
+            break
 
-    if not pmap:
-        return tree
-
-    global_alias = _build_alias_map(tree)  # 외부 별칭(t→txn, g→grp) 해소용
-    for col in tree.find_all(exp.Column):
-        if not col.table:
-            continue
-        scope = global_alias.get(_norm_ident(col.table), _norm_ident(col.table))
-        if scope in pmap:
+        global_alias = _build_alias_map(tree)  # 외부 별칭(t→txn, g→grp, c→서브쿼리) 해소용
+        changed = False
+        for col in tree.find_all(exp.Column):
+            if not col.table:
+                continue
+            scope = global_alias.get(_norm_ident(col.table), _norm_ident(col.table))
+            if scope not in pmap:
+                continue
             res = pmap[scope].get(_norm_ident(col.name))
-            if res:
-                base_tbl, base_col = res
+            if not res:
+                continue
+            base_tbl, base_col = res
+            if _norm_ident(col.table) != base_tbl or _norm_ident(col.name) != base_col:
                 col.set("table", exp.to_identifier(base_tbl))
                 col.set("this", exp.to_identifier(base_col))
+                changed = True
+        if not changed:
+            break
+    return tree
+
+
+# 하위호환: 기존 import 명(resolve_cte_passthrough) 유지 — 의미는 CTE+서브쿼리로 확장됨.
+resolve_cte_passthrough = resolve_derived_passthrough
+
+
+def recover_column_qualifiers(tree: exp.Expression) -> exp.Expression:
+    """미한정 컬럼의 테이블 한정을 회복한다(옵티마이저 폴백 보정).
+
+    sqlglot 옵티마이저(qualify)는 스키마 없이 해소 불가한 컬럼이 있으면 **전체 폴백**한다
+    (예: A의 `decode(b.RCGR_TYPE, …, RCGR_TYPE)` 미한정 기본값 → OptimizeError → raw AST).
+    폴백 시 한쪽(B)은 한정, 다른쪽(A)은 미한정으로 남아 **같은 컬럼이 다르게 보인다**.
+    두 전략으로 보정하되, 결정 못 하면 보존(=identity, 안전):
+
+    1. **단일 테이블 스코프**: 소속 SELECT 의 직접 소스가 베이스 테이블 1개뿐(파생/다중 아님)
+       이면 그 테이블로 한정.
+    2. **동명 한정 형제**: 그 외에는, 같은 SELECT 스코프 안에 같은 이름의 컬럼이 **유일한
+       테이블로 한정**돼 있으면 그 테이블로 한정(`decode(b.RCGR_TYPE, …, RCGR_TYPE)` 의 bare
+       기본값을 형제 `b.RCGR_TYPE` 로 해소).
+
+    직접 FROM/JOIN 소스·같은 스코프 형제만 본다(서브쿼리 내부로 내려가지 않음).
+    """
+    tree = tree.copy()
+    for col in tree.find_all(exp.Column):
+        if col.table:
+            continue
+        sel = col.find_ancestor(exp.Select)
+        if sel is None:
+            continue
+
+        # 전략 1: 단일 베이스 테이블 스코프
+        from_ = sel.args.get("from_") or sel.args.get("from")
+        sources = ([from_.this] if from_ is not None else []) + [
+            j.this for j in (sel.args.get("joins") or [])
+        ]
+        tbls: set[str] = set()
+        derived = False
+        for s in sources:
+            if isinstance(s, exp.Table):
+                tbls.add(_norm_ident(s.name))
+            else:
+                derived = True  # 서브쿼리 등 파생 소스 — 모호
+        if not derived and len(tbls) == 1:
+            col.set("table", exp.to_identifier(next(iter(tbls))))
+            continue
+
+        # 전략 2: 같은 스코프의 동명 한정 형제가 유일 테이블이면 그 테이블로
+        amap = _build_alias_map(sel)
+        name = _norm_ident(col.name)
+        cand: set[str] = set()
+        for other in sel.find_all(exp.Column):
+            if (
+                other.table
+                and _norm_ident(other.name) == name
+                and other.find_ancestor(exp.Select) is sel
+            ):
+                tref = _norm_ident(other.table)
+                cand.add(amap.get(tref, tref))
+        if len(cand) == 1:
+            col.set("table", exp.to_identifier(next(iter(cand))))
     return tree
 
 
@@ -305,6 +569,7 @@ def build_logical_plan(
         return LogicalPlan(limitations=limitations + ["SELECT 문을 찾을 수 없습니다."])
 
     cte_names = _cte_names(tree)
+    rank_windows = _build_rank_windows(tree)  # 교차 스코프 랭크 윈도우 역참조용
 
     base: set[str] = set()
     where_preds: set[str] = set()
@@ -342,7 +607,7 @@ def build_logical_plan(
                 seen_edge_keys.add(key)
                 edges.append(e)
 
-        a, _pr = _extract_aggregates_and_projections(sel, amap)
+        a, _pr = _extract_aggregates_and_projections(sel, amap, rank_windows)
         for fn, arg in a:
             if not _arg_refs_cte(arg, cte_names):
                 aggs.add((fn, arg))
@@ -353,7 +618,7 @@ def build_logical_plan(
     top_amap = _build_alias_map(top) if top is not None else {}
     group_keys = _extract_group_keys(top, top_amap) if top is not None else []
     _, projections = (
-        _extract_aggregates_and_projections(top, top_amap)
+        _extract_aggregates_and_projections(top, top_amap, rank_windows)
         if top is not None
         else ([], [])
     )

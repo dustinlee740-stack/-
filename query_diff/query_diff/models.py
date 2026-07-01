@@ -14,6 +14,31 @@ from pydantic import BaseModel, Field, computed_field
 # ON 조건 문자열에서 `table.col` 의 테이블 한정자 추출용
 _TABLE_REF_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_]")
 
+# 두 단순 피연산자의 등치(조인 키) 판정 — 양변이 공백 없는 토큰(컬럼/리터럴)일 때만.
+# `t.channel = CASE WHEN u.x ... END` 같은 필터성 조건은 매칭되지 않는다(값 표현식에 공백/괄호).
+_EQUI_JOIN_RE = re.compile(r"""^[\w.'"]+ = [\w.'"]+$""")
+
+
+def _edge_table_set(
+    on_predicates: list[str], left_table: str = "", right_table: str = ""
+) -> set[str]:
+    """조인 엣지의 테이블 집합(앵커 무관). 조인 그래프는 **등치 조인 키**로 정의한다.
+
+    `t.channel = CASE WHEN u.x ... END` 처럼 값 표현식(CASE·함수) 안에서만 참조되는 테이블(u)
+    은 조인 대상으로 끌어오지 않는다 — 그러면 같은 조인이 한쪽에서만 테이블집합이 부풀어
+    페어링이 깨진다(예: 채널 CASE 가 ias_transaction 을 끌어와 2-테이블 조인이 3-테이블로).
+    등치 키로 2개 미만이면(CROSS·복합조건 등) 전체 참조 + left/right 로 보강.
+    """
+    ts: set[str] = set()
+    for p in on_predicates:
+        if _EQUI_JOIN_RE.match(p):
+            ts.update(_TABLE_REF_RE.findall(p))
+    if len(ts) < 2:
+        for p in on_predicates:
+            ts.update(_TABLE_REF_RE.findall(p))
+        ts.update(t for t in (left_table, right_table) if t)
+    return ts
+
 
 class SourceType(str, Enum):
     FILE = "FILE"
@@ -159,11 +184,7 @@ class JoinEdge(BaseModel):
         CTE 내부 테이블에 매달아 left_table 이 달라지는데, 실제 조인 의미는 ON 조건의 테이블·
         컬럼에 있으므로 이를 기준으로 비교해야 같은 조인이 매칭된다.
         """
-        tables: set[str] = set()
-        for p in self.on_predicates:
-            tables.update(_TABLE_REF_RE.findall(p))
-        if len(tables) < 2:  # ON 이 빈약하면(CROSS 등) 앵커로 보강
-            tables.update(t for t in (self.left_table, self.right_table) if t)
+        tables = _edge_table_set(self.on_predicates, self.left_table, self.right_table)
         tbl = ",".join(sorted(t for t in tables if t))
         preds = "|".join(sorted(self.on_predicates))
         return f"{tbl}::{self.join_type}::{preds}"
@@ -184,15 +205,18 @@ class LogicalPlan(BaseModel):
 class DimensionResult(BaseModel):
     dimension: DimensionName
     matched: bool
+    limited: bool = False            # 통과지만 '제한적 판정'(소프트 동치 등 — 확인 권장)
     only_in_a: list[str] = Field(default_factory=list)
     only_in_b: list[str] = Field(default_factory=list)
     shared: list[str] = Field(default_factory=list)
-    explanation: str = ""            # 해당 차원이 같은 이유 / 다른 이유 자연어 설명
+    explanation: str = ""            # 간결 헤드라인 (한 줄)
+    caveat: str = ""                 # 제한/주의 상세 (여러 줄, \n 구분 — 구조화 블록 렌더)
 
 
 class SemanticDiff(BaseModel):
     verdict: SemanticVerdict
-    reason: str = ""                 # 최종 판정 요약 (자연어)
+    reason: str = ""                 # 판정 요약 헤드라인 (한 줄)
+    issues: list[str] = Field(default_factory=list)  # 전 차원 문제 총합(✗ 차이 / ⚠ 제한·주의)
     plan_a: Optional[LogicalPlan] = None
     plan_b: Optional[LogicalPlan] = None
     dimensions: list[DimensionResult] = Field(default_factory=list)

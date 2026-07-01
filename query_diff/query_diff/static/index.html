@@ -20,7 +20,11 @@
     --radius: 8px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  /* html 배경 — body 가 뷰포트보다 짧을 때 아래 여백 흰 틈 방지 */
+  html { background: var(--bg); }
+  /* 전체 1.15× 확대(zoom). ⚠ min-height:100vh 는 zoom 하에서 뷰포트의 ~115%가 돼 인공 세로 스크롤을
+     만들므로 제거 — 내용이 실제로 뷰포트를 넘을 때만 스크롤. */
+  body { font-family: 'Segoe UI', -apple-system, sans-serif; background: var(--bg); color: var(--text); zoom: 1.15; }
 
   /* 헤더 */
   .header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--border); }
@@ -54,7 +58,7 @@
 
   /* SQL 에디터 */
   .editor-wrap { padding: 0 16px 12px; }
-  .editor-wrap textarea { width: 100%; min-height: 200px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; line-height: 1.6; resize: vertical; tab-size: 2; }
+  .editor-wrap textarea { width: 100%; min-height: 380px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; line-height: 1.6; resize: vertical; tab-size: 2; }
   .editor-wrap textarea:focus { outline: none; border-color: var(--accent); }
 
   /* 파일 업로드 */
@@ -82,21 +86,6 @@
   .structure-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
   .structure-tags span { padding: 2px 8px; background: var(--surface2); border-radius: 10px; font-size: 11px; color: var(--text-dim); }
 
-  /* 차이 요약 섹션 */
-  .summary-section { padding: 0 24px 16px; }
-  .summary-section .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-  .summary-section h2 { font-size: 15px; font-weight: 600; }
-  .metrics-table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; }
-  .metrics-table th, .metrics-table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
-  .metrics-table th { background: var(--surface2); color: var(--text-dim); font-weight: 500; font-size: 12px; }
-  .metrics-table input { width: 100%; padding: 6px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: 13px; text-align: right; }
-  .metrics-table input[type="text"] { text-align: left; }
-  .metrics-table .computed { color: var(--accent); font-weight: 600; text-align: right; }
-  .metrics-table .negative { color: var(--red); }
-  .metrics-table .positive { color: var(--green); }
-  .metrics-table .remove-row { cursor: pointer; color: var(--text-dim); font-size: 16px; }
-  .metrics-table .remove-row:hover { color: var(--red); }
-
   /* 하단 버튼 */
   .bottom-bar { display: flex; justify-content: center; gap: 12px; padding: 16px 24px 32px; }
 
@@ -118,6 +107,11 @@
   .modal .result-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
   .modal .result-item:last-child { border-bottom: none; }
   .modal .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; flex-shrink: 0; }
+
+  /* 결과 모달 2단 가로 레이아웃 (요약 | 상세) — 세로 스크롤 최소화 */
+  .result-cols { display: grid; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .result-detail-col { max-height: 70vh; overflow-y: auto; padding-right: 4px; }
+  @media (max-width: 820px) { .result-cols { grid-template-columns: 1fr; } .result-detail-col { max-height: none; } }
 </style>
 </head>
 <body>
@@ -239,36 +233,6 @@
   </div>
 </div>
 
-<!-- 차이 요약 -->
-<div class="summary-section">
-  <div class="section-head">
-    <h2>차이 요약 (Summary, 선택)</h2>
-    <button class="btn btn-sm" id="btnAddMetric">+ 지표 추가</button>
-  </div>
-  <table class="metrics-table">
-    <thead>
-      <tr>
-        <th style="width:22%">지표명</th>
-        <th style="width:20%">A (운영계)</th>
-        <th style="width:20%">B (분석계)</th>
-        <th style="width:15%">차이</th>
-        <th style="width:15%">차이율</th>
-        <th style="width:8%"></th>
-      </tr>
-    </thead>
-    <tbody id="metricsBody">
-      <tr>
-        <td><input type="text" class="metric-name" placeholder="매출합계"></td>
-        <td><input type="number" class="metric-a" placeholder="0" step="any"></td>
-        <td><input type="number" class="metric-b" placeholder="0" step="any"></td>
-        <td class="computed diff-value">-</td>
-        <td class="computed diff-pct">-</td>
-        <td class="remove-row" title="삭제">✕</td>
-      </tr>
-    </tbody>
-  </table>
-</div>
-
 <!-- 하단 버튼 -->
 <div class="bottom-bar">
   <button class="btn" id="btnValidate">검증</button>
@@ -289,7 +253,7 @@
 
 <!-- 구조 비교 결과 모달 -->
 <div class="modal-overlay hidden" id="resultModal">
-  <div class="modal" style="max-width:900px;">
+  <div class="modal" style="width:1180px;max-width:94vw;">
     <h3>구조 비교 결과 (Phase 1)</h3>
     <div id="resultContent"></div>
     <div class="modal-actions">
@@ -366,6 +330,14 @@ function formatNumber(n) {
   return Number(n).toLocaleString('ko-KR', { maximumFractionDigits: 2 });
 }
 
+// --- 입력/방언/탭 변경 시 재검증 강제 ---
+// 쿼리 소스가 바뀌면 [비교 실행]을 잠그고 재검증을 유도(이전 검증 결과로 실행되는 stale 방지).
+function invalidateValidation(panel) {
+  document.getElementById('btnExecute').disabled = true;
+  const s = panel?.querySelector('.validation-status');
+  if (s) s.innerHTML = `<span class="status-suggestion">🔄 변경됨 — [검증]을 다시 눌러주세요</span>`;
+}
+
 // --- 탭 전환 ---
 document.querySelectorAll('.panel').forEach(panel => {
   panel.querySelectorAll('.tabs button').forEach(btn => {
@@ -375,8 +347,12 @@ document.querySelectorAll('.panel').forEach(panel => {
       const tab = btn.dataset.tab;
       panel.querySelectorAll('.tab-content').forEach(tc => tc.style.display = 'none');
       panel.querySelector(`.${tab}-tab`).style.display = '';
+      invalidateValidation(panel);   // 탭 전환 = 소스 변경
     });
   });
+  // 텍스트 입력·방언 변경도 재검증 필요
+  panel.querySelector('.sql-editor')?.addEventListener('input', () => invalidateValidation(panel));
+  panel.querySelector('.dialect-select')?.addEventListener('change', () => invalidateValidation(panel));
 });
 
 // --- 파일 업로드 ---
@@ -402,6 +378,7 @@ document.querySelectorAll('.panel').forEach(panel => {
   panel.querySelector('.file-info .remove')?.addEventListener('click', () => {
     fileInfo.style.display = 'none';
     panel.querySelector('.sql-editor').value = '';
+    invalidateValidation(panel);
   });
 });
 
@@ -418,52 +395,10 @@ function handleFile(panel, file) {
   const reader = new FileReader();
   reader.onload = e => {
     panel.querySelector('.sql-editor').value = e.target.result;
+    invalidateValidation(panel);   // 파일 로드 = 소스 변경(.value 프로그램 설정은 input 미발생)
   };
   reader.readAsText(file);
 }
-
-// --- 지표 관리 ---
-const metricsBody = document.getElementById('metricsBody');
-
-document.getElementById('btnAddMetric').addEventListener('click', () => {
-  const row = document.createElement('tr');
-  row.innerHTML = `
-    <td><input type="text" class="metric-name" placeholder="지표명"></td>
-    <td><input type="number" class="metric-a" placeholder="0" step="any"></td>
-    <td><input type="number" class="metric-b" placeholder="0" step="any"></td>
-    <td class="computed diff-value">-</td>
-    <td class="computed diff-pct">-</td>
-    <td class="remove-row" title="삭제">✕</td>
-  `;
-  metricsBody.appendChild(row);
-  bindMetricRow(row);
-});
-
-function bindMetricRow(row) {
-  const inA = row.querySelector('.metric-a');
-  const inB = row.querySelector('.metric-b');
-  const diffVal = row.querySelector('.diff-value');
-  const diffPct = row.querySelector('.diff-pct');
-  const removeBtn = row.querySelector('.remove-row');
-
-  function calc() {
-    const a = parseFloat(inA.value);
-    const b = parseFloat(inB.value);
-    if (isNaN(a) || isNaN(b)) { diffVal.textContent = '-'; diffPct.textContent = '-'; diffVal.className = 'computed diff-value'; return; }
-    const diff = a - b;
-    const pct = a !== 0 ? (diff / a * 100) : 0;
-    diffVal.textContent = formatNumber(diff);
-    diffPct.textContent = pct.toFixed(2) + '%';
-    diffVal.className = 'computed diff-value ' + (diff > 0 ? 'positive' : diff < 0 ? 'negative' : '');
-    diffPct.className = 'computed diff-pct ' + (diff > 0 ? 'positive' : diff < 0 ? 'negative' : '');
-  }
-  inA.addEventListener('input', calc);
-  inB.addEventListener('input', calc);
-  removeBtn.addEventListener('click', () => {
-    if (metricsBody.children.length > 1) row.remove();
-  });
-}
-metricsBody.querySelectorAll('tr').forEach(bindMetricRow);
 
 // --- API 통신 ---
 async function ensureComparison() {
@@ -490,20 +425,6 @@ function getQueryData(panelId) {
   };
 }
 
-function getMetrics() {
-  const rows = metricsBody.querySelectorAll('tr');
-  const metrics = [];
-  rows.forEach(row => {
-    const name = row.querySelector('.metric-name')?.value?.trim();
-    const a = row.querySelector('.metric-a')?.value;
-    const b = row.querySelector('.metric-b')?.value;
-    if (name && a !== '' && b !== '') {
-      metrics.push({ metric_name: name, value_a: parseFloat(a), value_b: parseFloat(b) });
-    }
-  });
-  return metrics;
-}
-
 // --- 임시저장 ---
 document.getElementById('btnSave').addEventListener('click', async () => {
   await ensureComparison();
@@ -516,9 +437,6 @@ document.getElementById('btnSave').addEventListener('click', async () => {
     }),
     fetch(`${API}/api/comparisons/${comparisonId}/query-b`, {
       method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(queryB)
-    }),
-    fetch(`${API}/api/comparisons/${comparisonId}/summary`, {
-      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ metrics: getMetrics() })
     }),
   ]);
   showToast('임시저장 완료', { kind: 'success' });
@@ -599,27 +517,6 @@ function showValidationResult(data) {
     }
   });
 
-  // 지표 검증
-  const metrics = getMetrics();
-  html += `<div class="result-item">`;
-  if (metrics.length > 0) {
-    html += `<div class="status-ok">✅ 차이 요약: ${metrics.length}개 지표</div>`;
-    html += `<ul style="margin:6px 0 0 18px;padding:0;font-size:12px;color:#9090b0;">`;
-    metrics.forEach(m => {
-      const diff = m.value_a - m.value_b;
-      html += `<li><b>${m.metric_name}</b> — A=${formatNumber(m.value_a)}, B=${formatNumber(m.value_b)}, 차이=${formatNumber(diff)}</li>`;
-    });
-    html += `</ul>`;
-    // 입력 행 수와 불일치하면 안내
-    const totalRows = metricsBody.querySelectorAll('tr').length;
-    if (totalRows > metrics.length) {
-      html += `<div style="font-size:11px;color:#d09050;margin-top:4px;">ⓘ ${totalRows}개 행 중 ${metrics.length}개만 유효합니다. 지표명/A/B 칸이 모두 채워진 행만 집계됩니다.</div>`;
-    }
-  } else {
-    html += `<div class="status-ok" style="color:#9090b0;">ⓘ 차이 요약: 입력 없음 (선택 항목)</div>`;
-  }
-  html += `</div>`;
-
   results.innerHTML = html;
   ignoreBtn.style.display = allValid ? 'none' : '';
   document.getElementById('btnExecute').disabled = !allValid;
@@ -637,20 +534,6 @@ document.getElementById('btnIgnoreError').addEventListener('click', () => {
 // --- 비교 실행 ---
 document.getElementById('btnExecute').addEventListener('click', async () => {
   if (!comparisonId) { showToast('먼저 검증을 실행해주세요.', { kind: 'info' }); return; }
-
-  // 지표 저장
-  const sumRes = await fetch(`${API}/api/comparisons/${comparisonId}/summary`, {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ metrics: getMetrics() })
-  });
-
-  // 서버 store가 초기화됐을 때 (404) — 세션을 새로 만들고 재검증 요청
-  if (sumRes.status === 404) {
-    comparisonId = null;
-    showToast('서버 세션이 만료되었습니다. "검증" 버튼을 다시 눌러주세요.', { kind: 'info' });
-    document.getElementById('btnExecute').disabled = true;
-    return;
-  }
 
   const res = await fetch(`${API}/api/comparisons/${comparisonId}/execute`, { method: 'POST' });
   if (res.ok) {
@@ -675,6 +558,30 @@ const SEVERITY_STYLE = {
 function escapeHtml(s) {
   if (s == null) return '';
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// "문제 요약" 항목을 헤더/내용 줄바꿈 + 항목 간 빈 줄로 표기.
+// 백엔드가 일관 사용하는 " — "(em-dash) 구분자로 분할 → 첫 조각=헤더, 이후=내용 줄.
+function formatIssueHtml(it) {
+  it = String(it);
+  let head, rest;
+  if (it.includes(' — ')) {                    // ⚠ 제한적/정규화: "헤더 — 내용 — 내용"
+    const parts = it.split(' — ');
+    head = parts[0];
+    rest = parts.slice(1);
+  } else {                                      // ✗ 불일치: "{라벨}: A에만 X / B에만 Y"
+    const ci = it.indexOf(': ');
+    if (ci !== -1) {
+      head = it.slice(0, ci + 1);              // 콜론까지 헤더
+      rest = it.slice(ci + 2).split(' / ');    // A에만/B에만 각 줄
+    } else {
+      head = it;
+      rest = [];
+    }
+  }
+  const headHtml = `<div style="font-weight:600;color:#e8e2d2;">${escapeHtml(head)}</div>`;
+  const restHtml = rest.map(p => `<div style="color:#c8c4b8;">${escapeHtml(p)}</div>`).join('');
+  return `<div style="margin-bottom:12px;">${headHtml}${restHtml}</div>`;
 }
 
 const VERDICT_STYLE = {
@@ -753,38 +660,48 @@ function renderSemanticInto(body, sem) {
   }
 
   const vstyle = VERDICT_STYLE[sem.verdict] || VERDICT_STYLE.LIMITED;
-  let html = `<div style="padding:14px;background:${vstyle.bg};border-left:4px solid ${vstyle.border};border-radius:6px;margin-bottom:14px;">
+  // 좌측: 요약(판정 + reason + 문제 요약 + 오류)
+  let summaryHtml = `<div style="padding:14px;background:${vstyle.bg};border-left:4px solid ${vstyle.border};border-radius:6px;">
     <div style="font-size:15px;font-weight:600;color:${vstyle.fg};">판정: ${vstyle.label}</div>
-    <div style="font-size:12px;color:#c0c0d0;margin-top:6px;line-height:1.6;">${escapeHtml(sem.reason || '')}</div>
+    <div style="font-size:12px;margin-top:6px;line-height:1.6;">${sem.reason ? formatIssueHtml(sem.reason) : ''}</div>
+    ${(sem.issues && sem.issues.length) ? `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.12);">
+        <div style="font-size:11px;font-weight:600;color:${vstyle.fg};margin-bottom:6px;">문제 요약 (${sem.issues.length})</div>
+        <div style="font-size:12px;line-height:1.8;color:#d8d4c8;">
+          ${sem.issues.map(formatIssueHtml).join('')}
+        </div>
+      </div>
+    ` : ''}
   </div>`;
 
   if (sem.error) {
-    html += `<div style="padding:10px;background:#3a1a1a;border-left:3px solid #f05060;border-radius:4px;margin-bottom:12px;font-size:12px;color:#ffb0b0;">⚠ ${escapeHtml(sem.error)}</div>`;
+    summaryHtml += `<div style="padding:10px;background:#3a1a1a;border-left:3px solid #f05060;border-radius:4px;margin-top:12px;font-size:12px;color:#ffb0b0;">⚠ ${escapeHtml(sem.error)}</div>`;
   }
+  // 정규화 제한사항은 위 "문제 요약" 롤업(sem.issues)에 흡수됨 — 별도 패널 제거(중복 방지)
 
-  if (sem.limitations && sem.limitations.length) {
-    html += `<div style="padding:10px;background:#3a3520;border-left:3px solid #d09030;border-radius:4px;margin-bottom:14px;">
-      <div style="font-size:12px;font-weight:600;color:#ffd060;margin-bottom:4px;">정규화 제한사항</div>
-      <ul style="margin:0;padding-left:18px;font-size:12px;color:#d0c090;line-height:1.6;">
-        ${sem.limitations.map(l => `<li>${escapeHtml(l)}</li>`).join('')}
-      </ul>
-    </div>`;
-  }
-
-  // 차원별 결과
+  // 우측: 차원별 결과
+  let detailHtml = '';
   if (sem.dimensions && sem.dimensions.length) {
-    html += `<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c0c0e0;">차원별 비교</div>`;
-    html += `<div style="display:flex;flex-direction:column;gap:8px;">`;
+    detailHtml += `<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c0c0e0;">차원별 비교</div>`;
+    detailHtml += `<div style="display:flex;flex-direction:column;gap:8px;">`;
     sem.dimensions.forEach(d => {
-      const icon = d.matched ? '✓' : '✗';
-      const color = d.matched ? '#40c070' : '#f05060';
-      const bg = d.matched ? '#1a2a20' : '#2a1a20';
-      html += `<div style="padding:10px 12px;background:${bg};border-left:3px solid ${color};border-radius:4px;">
+      // 3상태: 제한적 판정(limited, 앰버) / 통과(matched) / 불일치
+      const icon = d.limited ? '⚠' : (d.matched ? '✓' : '✗');
+      const color = d.limited ? '#ffd060' : (d.matched ? '#40c070' : '#f05060');
+      const bg = d.limited ? '#2a2410' : (d.matched ? '#1a2a20' : '#2a1a20');
+      const badge = d.limited
+        ? `<span style="margin-left:auto;padding:2px 8px;background:#5a4a1a;color:#ffd060;border-radius:10px;font-size:11px;font-weight:600;">제한적 판정</span>`
+        : '';
+      detailHtml += `<div style="padding:10px 12px;background:${bg};border-left:3px solid ${color};border-radius:4px;">
         <div style="display:flex;gap:10px;align-items:center;font-size:13px;">
           <span style="color:${color};font-weight:700;font-size:14px;">${icon}</span>
           <span style="color:#d0d0e0;font-weight:600;">${escapeHtml(DIM_LABEL[d.dimension] || d.dimension)}</span>
+          ${badge}
         </div>
-        <div style="font-size:12px;color:#a0a0b8;margin-top:6px;line-height:1.5;">${escapeHtml(d.explanation || '')}</div>
+        <div style="font-size:12px;color:#a0a0b8;margin-top:6px;line-height:1.6;white-space:pre-line;">${escapeHtml(d.explanation || '')}</div>
+        ${d.caveat ? `
+          <div style="margin-top:8px;padding:8px 10px;background:#2a2410;border-left:2px solid #ffd060;border-radius:4px;font-size:12px;color:#ffd9a0;line-height:1.7;white-space:pre-line;">${escapeHtml(d.caveat)}</div>
+        ` : ''}
         ${(d.only_in_a?.length || d.only_in_b?.length) ? `
           <div style="display:grid;grid-template-columns:60px 1fr;gap:6px;font-family:monospace;font-size:11px;margin-top:8px;">
             ${d.only_in_a?.length ? `<div style="color:#80a0c0;">A만:</div><div style="color:#c0d0e0;">${d.only_in_a.map(escapeHtml).join(', ')}</div>` : ''}
@@ -793,10 +710,14 @@ function renderSemanticInto(body, sem) {
         ` : ''}
       </div>`;
     });
-    html += `</div>`;
+    detailHtml += `</div>`;
   }
 
-  body.innerHTML = html;
+  // 가로 2단: 좌=요약 / 우=차원별 비교
+  body.innerHTML = `<div class="result-cols">
+    <div>${summaryHtml}</div>
+    <div class="result-detail-col">${detailHtml}</div>
+  </div>`;
 }
 
 function renderStructureInto(body, diff) {
@@ -808,16 +729,15 @@ function renderStructureInto(body, diff) {
   const criticalTotal = (diff.findings || []).filter(f => f.severity === 'CRITICAL').length;
   const unresolved = diff.unresolved_critical_count ?? criticalTotal;
 
-  let html = '';
-
-  // 요약 배지
+  // 좌측: 요약 배지
+  let summaryHtml = '';
   if (!diff.has_difference) {
-    html += `<div style="padding:14px;background:#1a4a2a;border-left:4px solid #40c070;border-radius:6px;margin-bottom:14px;">
+    summaryHtml += `<div style="padding:14px;background:#1a4a2a;border-left:4px solid #40c070;border-radius:6px;">
       <div style="font-size:15px;font-weight:600;color:#a0e0b0;">✅ 쿼리 구조 동일</div>
       <div style="font-size:12px;color:#80a890;margin-top:4px;">두 쿼리의 구조적 차이가 감지되지 않았습니다. 합계 차이는 원천 데이터 차이에 기인할 가능성이 높습니다. (다음 단계: Row diff)</div>
     </div>`;
   } else if (diff.fast_path_terminate) {
-    html += `<div style="padding:14px;background:#5a1a1a;border-left:4px solid #f05060;border-radius:6px;margin-bottom:14px;">
+    summaryHtml += `<div style="padding:14px;background:#5a1a1a;border-left:4px solid #f05060;border-radius:6px;">
       <div style="font-size:15px;font-weight:600;color:#ff9090;">⚠️ 구조 차이 발견 — Fast-path 종결</div>
       <div style="font-size:12px;color:#c09090;margin-top:4px;">
         미확인 Critical: <b>${unresolved}건</b> / 총 ${criticalTotal}건 · 주요 차이 절: <b>${escapeHtml(diff.dominant_clause || '-')}</b>
@@ -826,21 +746,22 @@ function renderStructureInto(body, diff) {
     </div>`;
   } else if (criticalTotal > 0) {
     // Critical은 있으나 모두 사용자 확인됨
-    html += `<div style="padding:14px;background:#1a4a2a;border-left:4px solid #40c070;border-radius:6px;margin-bottom:14px;">
+    summaryHtml += `<div style="padding:14px;background:#1a4a2a;border-left:4px solid #40c070;border-radius:6px;">
       <div style="font-size:15px;font-weight:600;color:#a0e0b0;">✅ 모든 Critical 차이 검토 완료</div>
       <div style="font-size:12px;color:#80a890;margin-top:4px;">사용자가 모든 Critical 항목을 동일로 판단했습니다. 다음 단계(Row diff)로 진행 가능합니다.</div>
     </div>`;
   } else {
-    html += `<div style="padding:14px;background:#5a4a1a;border-left:4px solid #d09030;border-radius:6px;margin-bottom:14px;">
+    summaryHtml += `<div style="padding:14px;background:#5a4a1a;border-left:4px solid #d09030;border-radius:6px;">
       <div style="font-size:15px;font-weight:600;color:#ffd060;">△ 경미한 구조 차이</div>
       <div style="font-size:12px;color:#c0a060;margin-top:4px;">Warning/Info 수준의 차이만 있습니다. Row 단계로 진행 가능합니다.</div>
     </div>`;
   }
 
-  // findings 리스트
+  // 우측: findings 리스트 (상세 컬럼이 스크롤 담당 — 인라인 max-height 제거)
+  let detailHtml = '';
   if (diff.findings && diff.findings.length > 0) {
-    html += `<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c0c0e0;">차이 상세 (${diff.findings.length}건)</div>`;
-    html += `<div style="display:flex;flex-direction:column;gap:10px;max-height:440px;overflow-y:auto;">`;
+    detailHtml += `<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c0c0e0;">차이 상세 (${diff.findings.length}건)</div>`;
+    detailHtml += `<div style="display:flex;flex-direction:column;gap:10px;">`;
     diff.findings.forEach((f, idx) => {
       const sev = SEVERITY_STYLE[f.severity] || SEVERITY_STYLE.INFO;
       const ack = !!f.user_acknowledged;
@@ -851,7 +772,7 @@ function renderStructureInto(body, diff) {
         ? 'font-size:13px;color:#80a088;margin-bottom:6px;text-decoration:line-through;'
         : 'font-size:13px;color:#d0d0e0;margin-bottom:6px;';
 
-      html += `<div style="${cardStyle}">
+      detailHtml += `<div style="${cardStyle}">
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap;">
           <span style="padding:2px 8px;background:${sev.bg};color:${sev.fg};border-radius:10px;font-size:11px;font-weight:600;">${sev.label}</span>
           <span style="padding:2px 8px;background:#313150;color:#a0a0c0;border-radius:10px;font-size:11px;">${escapeHtml(f.clause)}</span>
@@ -872,10 +793,14 @@ function renderStructureInto(body, diff) {
         ${f.impact ? `<div style="font-size:11px;color:#909090;margin-top:6px;font-style:italic;">💡 ${escapeHtml(f.impact)}</div>` : ''}
       </div>`;
     });
-    html += `</div>`;
+    detailHtml += `</div>`;
   }
 
-  body.innerHTML = html;
+  // 가로 2단: 좌=요약 / 우=차이 상세
+  body.innerHTML = `<div class="result-cols">
+    <div>${summaryHtml}</div>
+    <div class="result-detail-col">${detailHtml}</div>
+  </div>`;
 
   // acknowledge 버튼 이벤트 바인딩 — PATCH 후 전체 ComparisonRequest 를 다시 받아 재렌더
   body.querySelectorAll('button[data-ack-index]').forEach(btn => {
@@ -919,6 +844,14 @@ document.getElementById('resultModal').addEventListener('click', e => {
 // 모달 바깥 클릭으로 닫기
 document.getElementById('validateModal').addEventListener('click', e => {
   if (e.target === e.currentTarget) e.currentTarget.classList.add('hidden');
+});
+
+// ESC 로 검증·결과 팝업 닫기 (버튼·배경클릭과 병행)
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('validateModal').classList.add('hidden');
+    document.getElementById('resultModal').classList.add('hidden');
+  }
 });
 </script>
 </body>

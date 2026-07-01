@@ -116,7 +116,7 @@ def test_join_style_and_spine_absorbed_only_channel_remains(diff):
     """JOIN vs WITH 스타일(앵커) + WITH-spine(txn CTE) + 타입코어션(to_char)을 모두 흡수하면
     player_group·가맹점 조인은 매칭돼 사라지고, **채널 CASE 필터(진짜 차이)** 만 남는다."""
     jg = _dim(diff, DimensionName.JOIN_GRAPH)
-    blob = " || ".join(jg.only_in_a + jg.only_in_b)
+    blob = " || ".join(jg.only_in_a + jg.only_in_b).lower()  # 표시는 대문자 통일 → 케이스 무관 비교
     # 스타일/스파인으로만 달랐던 조인은 사라짐
     assert "player_group" not in blob, blob
     assert "tb_all_merchant" not in blob, blob  # 가맹점 조인 매칭됨(WITH-spine+cast 흡수)
@@ -125,17 +125,18 @@ def test_join_style_and_spine_absorbed_only_channel_remains(diff):
     # 같은 조인(dcnt_group_mapping↔service_discount)인데 A에만 채널 조건 — 술어 단위 표기
     assert len(jg.only_in_a) == 1, jg.only_in_a
     msg = jg.only_in_a[0]
+    mlow = msg.lower()
     assert "A 쿼리에만" in msg                       # 조인 누락이 아니라 추가 조건 표기
-    assert "channel" in msg                          # 원본 운영명(번역형 acqr_dv_cd 아님)
-    assert "dcnt_group_mapping" in msg and "service_discount" in msg
-    assert "CASE('-')" not in msg                    # 정규화 노이즈 미노출
+    assert "channel" in mlow                         # 원본 운영명(번역형 acqr_dv_cd 아님)
+    assert "dcnt_group_mapping" in mlow and "service_discount" in mlow
+    assert "case('-')" not in mlow                   # 정규화 노이즈 미노출
     assert "원본 ON" in msg                          # 원본 ON 절 텍스트 동반(쿼리에서 검색 가능)
 
 
 def test_b_side_display_not_corrupted(diff):
     """역변환은 A측에만 — B측 표시는 분석명 그대로(grp_nm), A측 운영명(grp_name)으로 오염 안 됨."""
     gk = _dim(diff, DimensionName.GROUP_KEYS)
-    b_blob = " || ".join(gk.only_in_b)
+    b_blob = " || ".join(gk.only_in_b).lower()  # 표시는 대문자 통일 → 케이스 무관 비교
     assert "grp_nm" in b_blob          # 분석명 유지
     assert "grp_name" not in b_blob    # A측 운영명으로 오염되지 않음
 
@@ -150,8 +151,8 @@ def test_group_key_noise_suppressed(diff):
     실차이(B가 grp_nm으로 그룹)만 남는다."""
     gk = _dim(diff, DimensionName.GROUP_KEYS)
     assert gk.only_in_a == []
-    # B-only 잔차는 grp_nm 한 종류뿐(컬럼명 기준)
-    assert all("grp_nm" in x for x in gk.only_in_b), gk.only_in_b
+    # B-only 잔차는 grp_nm 한 종류뿐(컬럼명 기준; 표시는 대문자 원문)
+    assert all("grp_nm" in x.lower() for x in gk.only_in_b), gk.only_in_b
 
 
 def test_tautology_and_param_noise_suppressed(diff):

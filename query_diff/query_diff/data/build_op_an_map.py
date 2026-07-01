@@ -36,6 +36,9 @@ AN_SCHEMA_CSV = _DASH_DATA / "an_schema.csv"
 OP_SCHEMA_CSV = _DASH_DATA / "op_schema.csv"
 META3_OVERRIDES = _HERE / "meta3_overrides.json"
 OUT_JSON = _HERE / "op_an_map.json"
+# 컬럼 data_type 사이드카 — asis·tobe 가 모두 시간형인 OP_TABLE.AN_COL 키.
+# 연-월 추출 관용구 동치를 타입 증거로 확정(제한적 판정→동일)하는 데 쓴다.
+OUT_TYPES_JSON = _HERE / "op_an_types.json"
 
 
 def _u(s: str | None) -> str:
@@ -104,6 +107,30 @@ def _load_from_meta3(dsn: str) -> tuple[dict[str, str], dict[str, list[str]]]:
             continue  # 모호 → identity 유지
         cols[f"{ot}.{oc}"] = an
     return cols, op_catalog
+
+
+def _load_temporal_both_keys(dsn: str) -> list[str]:
+    """META3_DSN 직결 — asis·tobe 가 **모두 시간형**(DATE/TIMESTAMP/DATETIME)인
+    `UPPER(OP_TABLE.AN_COL)` 키 목록(정렬·중복제거). op_an_types.json 의 원천."""
+    try:
+        import psycopg2 as _pg  # type: ignore
+    except Exception:
+        import psycopg as _pg  # type: ignore
+
+    conn = _pg.connect(dsn)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT upper(asis_table_id)||'.'||upper(tobe_col_id) "
+            "FROM meta3.table_col_mapping "
+            "WHERE asis_table_id<>'' AND tobe_col_id<>'' "
+            "AND asis_data_type ~* '^(date|timestamp|datetime)' "
+            "AND tobe_data_type ~* '^(date|timestamp|datetime)'"
+        )
+        keys = {r[0] for r in cur.fetchall() if r[0]}
+    finally:
+        conn.close()
+    return sorted(keys)
 
 
 def build() -> dict:
@@ -215,6 +242,30 @@ def main() -> None:
         f"  columns={m['column_mappings']} tables={m['table_mappings']} "
         f"op_catalog_tables={m['op_catalog_tables']} an_derived={m['an_derived_cols']}"
     )
+
+    # data_type 사이드카(op_an_types.json) — META3_DSN 있을 때만 재생성(없으면 기존 보존).
+    dsn = os.environ.get("META3_DSN")
+    if dsn:
+        try:
+            keys = _load_temporal_both_keys(dsn)
+            OUT_TYPES_JSON.write_text(
+                json.dumps(
+                    {
+                        "_comment": (
+                            "meta3 table_col_mapping 에서 asis·tobe 가 모두 시간형"
+                            "(DATE/TIMESTAMP/DATETIME)인 컬럼. 키=UPPER(OP_TABLE.AN_COL). "
+                            "연-월 추출 관용구의 동치 확정(제한적 판정→동일)에 사용."
+                        ),
+                        "temporal_both": keys,
+                    },
+                    ensure_ascii=False,
+                    indent=1,
+                ),
+                encoding="utf-8",
+            )
+            print(f"wrote {OUT_TYPES_JSON}  temporal_both={len(keys)}")
+        except Exception as e:  # pragma: no cover
+            print(f"[warn] op_an_types.json 재생성 실패(기존 보존): {e}")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,9 @@ if os.path.isdir(_static_dir):
 def index():
     index_path = os.path.join(_static_dir, "index.html")
     if os.path.isfile(index_path):
-        return FileResponse(index_path)
+        # no-cache: 캐시는 하되 사용 전 ETag/Last-Modified 재검증 → 프런트엔드 변경이
+        # 브라우저 휴리스틱 캐싱 때문에 옛 버전으로 굳는 것을 방지(미변경 시 304로 가벼움).
+        return FileResponse(index_path, headers={"Cache-Control": "no-cache"})
     return {"message": "Query Diff Module API"}
 
 

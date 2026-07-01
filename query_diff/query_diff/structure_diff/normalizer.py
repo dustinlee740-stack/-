@@ -31,6 +31,13 @@ _FUNCTION_ALIASES: dict[str, str] = {
     "LEN": "LENGTH",
     "TO_CHAR": "CAST_STR",
     "TO_DATE": "CAST_DATE",
+    # sqlglot이 방언별 날짜 파싱을 다른 노드로 전사한다(Oracle to_date→StrToDate,
+    # Hive to_timestamp→Anonymous 'to_timestamp'). 모두 CAST_DATE로 모아 값 인자만 남긴다.
+    "STR_TO_DATE": "CAST_DATE",
+    "STR_TO_TIME": "CAST_DATE",
+    "TO_TIMESTAMP": "CAST_DATE",
+    "TS_OR_DS_TO_DATE": "CAST_DATE",
+    "TS_OR_DS_TO_TIMESTAMP": "CAST_DATE",
     "TO_NUMBER": "CAST_NUM",
     "DATE_FORMAT": "CAST_STR",
     "UNIX_TIMESTAMP": "UNIX_TIMESTAMP",
@@ -42,6 +49,117 @@ _FUNCTION_ALIASES: dict[str, str] = {
 # 타입 강제 코어션 함수 — 조인/비교에선 운영(to_char) vs 분석(무캐스트) 차이를 흡수하기 위해
 # 내부 인자로 언랩한다(예: to_char(id) ≡ id).
 _CAST_COERCIONS = {"CAST_STR", "CAST_DATE", "CAST_NUM"}
+
+# --- 연-월(날짜 prefix) 추출 관용구 인식 ---
+# A(Oracle) `substr(dt,0,6)` ↔ B(Hive) `from_timestamp(dt,'yyyyMM')` 처럼 컬럼 타입이 달라
+# 추출 방식이 다른 같은 연-월(YYYYMM) 추출을 하나의 토큰으로 모은다. gran 을 토큰에 넣어
+# 연/월/일 입도가 다르면 매칭되지 않게 한다. 토큰에 YEAR_MONTH_MARK 가 있으면 비교기가
+# '제한적 판정'(소프트 동치)으로 표기한다 — substr 은 컬럼 문자열 표현에 의존하기 때문.
+YEAR_MONTH_MARK = "⟨YM:"
+
+# 마스크를 받아 날짜 포맷을 만드는 함수들(시간 성분 없는 순수 날짜 마스크일 때만 흡수).
+_DATE_FORMAT_FUNCS = {
+    "TO_CHAR", "DATE_FORMAT", "TIME_TO_STR",
+    "FROM_TIMESTAMP", "FROM_UNIXTIME", "UNIX_TO_STR",
+}
+# 날짜 코어션 래퍼(예: hive date_format 의 this=TimeStrToTime(col)) — 벗겨 베이스 컬럼 도달.
+_DATE_COERCION_NAMES = {
+    "TIME_STR_TO_TIME", "STR_TO_TIME", "TS_OR_DS_TO_DATE",
+    "TS_OR_DS_TO_TIMESTAMP", "CAST_DATE", "STR_TO_DATE", "TO_TIMESTAMP",
+}
+_DATE_WIDTH_GRAN = {4: "YEAR", 6: "MONTH", 8: "DAY"}
+
+
+def _date_gran_from_mask(mask: str) -> str | None:
+    """날짜 포맷 마스크 → 'YEAR'|'MONTH'|'DAY'|None.
+
+    strftime(`%Y%m`)·Oracle(`YYYYMM`)·raw(`yyyyMM`) 모두 처리. **시간 성분(HH·MI·SS·%H…)이
+    있으면 None**(연-월 절단이 아니므로 흡수하지 않음). 연도 성분이 없어도 None.
+    """
+    m = mask.strip().strip("'\"")
+    if not m:
+        return None
+    if "%" in m:  # strftime
+        comps = set(re.findall(r"%[A-Za-z]", m))
+        if comps & {"%H", "%I", "%M", "%S", "%p", "%T", "%R", "%f"}:
+            return None
+        has_y = bool(comps & {"%Y", "%y"})
+        has_mon = bool(comps & {"%m", "%b", "%B"})
+        has_day = bool(comps & {"%d", "%e", "%j"})
+    else:  # Oracle/raw 포맷 코드
+        u = m.upper()
+        if re.search(r"HH|MI|SS|FF|AM|PM", u):
+            return None
+        has_y = ("YYYY" in u) or ("YY" in u) or ("RR" in u)
+        has_mon = ("MM" in u) or ("MON" in u)
+        has_day = "DD" in u
+    if not has_y:
+        return None
+    return "DAY" if has_day else ("MONTH" if has_mon else "YEAR")
+
+
+def _func_real_name(node: exp.Func) -> str:
+    """함수 실명(대문자). 익명 함수(hive from_timestamp 등)는 sql_name 이 ANONYMOUS 라 node.name 사용."""
+    if isinstance(node, exp.Anonymous):
+        return (node.name or "").upper()
+    return (node.sql_name() or type(node).__name__).upper()
+
+
+def _strip_date_coercion(node: exp.Expression) -> exp.Expression:
+    """TimeStrToTime 등 날짜 코어션 래퍼를 `.this` 로 벗겨 베이스 컬럼/식에 도달."""
+    for _ in range(5):
+        if not isinstance(node, exp.Func):
+            break
+        inner = node.args.get("this")
+        if _func_real_name(node) in _DATE_COERCION_NAMES and isinstance(inner, exp.Expression):
+            node = inner
+        else:
+            break
+    return node
+
+
+def _recognize_date_trunc_idiom(
+    node: exp.Func, alias_map: dict[str, str]
+) -> str | None:
+    """연-월(날짜 prefix) 추출 관용구면 `⟨YM:{col}:{gran}⟩` 토큰, 아니면 None.
+
+    위치 기반: `substr(col, 0|1, {4,6,8})`(첫 N자). 포맷 기반: to_char/date_format/
+    from_timestamp/from_unixtime(col, '…yyyyMM…'). 두 계열 모두 동일 토큰으로 모인다.
+    """
+    # 위치 기반 — substr(col, start, length)
+    if isinstance(node, exp.Substring):
+        start, length = node.args.get("start"), node.args.get("length")
+        if (
+            isinstance(start, exp.Literal) and not start.is_string
+            and isinstance(length, exp.Literal) and not length.is_string
+        ):
+            try:
+                s, ln = int(start.name), int(length.name)
+            except ValueError:
+                return None
+            gran = _DATE_WIDTH_GRAN.get(ln)
+            if s in (0, 1) and gran and isinstance(node.this, exp.Expression):
+                return f"{YEAR_MONTH_MARK}{_canonical_expr(node.this, alias_map)}:{gran}⟩"
+        return None
+
+    # 포맷 기반 — (col, mask) 인자
+    name = _func_real_name(node)
+    if name not in _DATE_FORMAT_FUNCS:
+        return None
+    if isinstance(node, exp.Anonymous):
+        exprs = list(node.expressions or [])
+        col = exprs[0] if exprs else None
+        mask = exprs[1] if len(exprs) >= 2 else None
+    else:
+        col = node.args.get("this")
+        mask = node.args.get("format")
+    if not (isinstance(col, exp.Expression) and isinstance(mask, exp.Literal) and mask.is_string):
+        return None
+    gran = _date_gran_from_mask(mask.name)
+    if gran is None:
+        return None
+    base = _strip_date_coercion(col)
+    return f"{YEAR_MONTH_MARK}{_canonical_expr(base, alias_map)}:{gran}⟩"
 
 
 @dataclass(frozen=True)
@@ -205,11 +323,32 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
     if isinstance(node, exp.Paren):
         return _canonical_expr(node.this, alias_map)
 
+    # CASE/DECODE 정규화 — exp.Case·exp.DecodeCase 는 exp.Func 의 서브클래스이므로
+    # 반드시 Func 분기보다 **앞에서** 처리해야 한다(아니면 Func 분기가 가로채 WHEN/THEN 손실).
+    if isinstance(node, (exp.Case, exp.DecodeCase)):
+        return _canonical_conditional(node, alias_map)
+
+    # 연-월(날짜 prefix) 추출 관용구 — CAST 언랩(아래)보다 **앞**이어야 to_char 의 포맷
+    # 마스크가 버려지지 않는다(substr↔from_timestamp↔to_char 를 한 토큰으로 모음).
     if isinstance(node, exp.Func):
-        fname = _normalize_function_name(node.sql_name() or type(node).__name__)
-        # 타입 코어션(to_char 등)은 조인/비교에서 무시 — 내부 인자로 언랩
+        ym = _recognize_date_trunc_idiom(node, alias_map)
+        if ym is not None:
+            return ym
+
+    if isinstance(node, exp.Func):
+        # 익명 함수(예: hive to_timestamp)는 sql_name()이 'ANONYMOUS' 라 실제 이름을 잃는다.
+        # 실명(node.name)으로 정규화해 동의어/언랩이 동작하게 한다.
+        if isinstance(node, exp.Anonymous):
+            fname = _normalize_function_name(node.name)
+        else:
+            fname = _normalize_function_name(node.sql_name() or type(node).__name__)
+        # 타입 코어션(to_char/날짜 파싱 등)은 조인/비교에서 무시 — 값 인자로 언랩
         if fname in _CAST_COERCIONS:
-            inner = node.args.get("this")
+            # 익명 함수는 인자가 expressions 에, 일반 노드는 this 에 있다.
+            if isinstance(node, exp.Anonymous):
+                inner = node.expressions[0] if node.expressions else None
+            else:
+                inner = node.args.get("this")
             if isinstance(inner, exp.Expression):
                 return _canonical_expr(inner, alias_map)
         args = [_canonical_expr(a, alias_map) for a in node.args.values() if isinstance(a, exp.Expression)]
@@ -232,19 +371,56 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
             return f"({a} {op} {b})"
         return f"({left} {op} {right})"
 
-    if isinstance(node, exp.Case):
-        parts = []
-        for ifs in node.args.get("ifs", []) or []:
-            cond = _canonical_expr(ifs.this, alias_map)
-            then = _canonical_expr(ifs.args.get("true"), alias_map)
-            parts.append(f"WHEN {cond} THEN {then}")
-        default = node.args.get("default")
-        if default is not None:
-            parts.append(f"ELSE {_canonical_expr(default, alias_map)}")
-        return "CASE " + " ".join(parts) + " END"
-
     # fallback: sqlglot 기본 SQL 직렬화 후 lower-case
     return node.sql().lower()
+
+
+def _canonical_conditional(
+    node: exp.Expression, alias_map: dict[str, str]
+) -> str:
+    """DECODE / CASE(단순·검색형)를 단일 **검색형 CASE** canonical 로 정규화.
+
+    `DECODE(op, v1,r1, v2,r2, …, d)` ≡ `CASE op WHEN v1 THEN r1 … ELSE d END`
+    ≡ `CASE WHEN op=v1 THEN r1 … ELSE d END`. 작성 방언(DECODE vs CASE WHEN)이
+    달라도 같은 조건→결과 매핑이면 같게 본다.
+
+    - 조건의 `op = v` 는 기존 EQ 정규화를 재사용(exp.EQ 노드를 만들어 `_canonical_expr`
+      호출 → NULL≡'' 흡수·피연산자 정렬 일관).
+    - WHEN 순서는 **보존**(검색형 CASE 는 첫 일치 우선이라 순서가 의미를 가짐 → 정렬 금지).
+    """
+    whens: list[tuple[str, str]] = []
+    default: exp.Expression | None = None
+
+    if isinstance(node, exp.DecodeCase):
+        exprs = list(node.expressions or [])
+        if exprs:
+            operand = exprs[0]
+            rest = exprs[1:]
+            i = 0
+            while i + 1 < len(rest):
+                cond = _canonical_expr(
+                    exp.EQ(this=operand.copy(), expression=rest[i].copy()), alias_map
+                )
+                whens.append((cond, _canonical_expr(rest[i + 1], alias_map)))
+                i += 2
+            if i < len(rest):  # 인자가 홀수면 마지막은 default
+                default = rest[i]
+    else:  # exp.Case — 단순(this=피연산자) / 검색형(this=None)
+        operand = node.args.get("this")
+        for ifs in node.args.get("ifs", []) or []:
+            if operand is not None:
+                cond = _canonical_expr(
+                    exp.EQ(this=operand.copy(), expression=ifs.this.copy()), alias_map
+                )
+            else:
+                cond = _canonical_expr(ifs.this, alias_map)
+            whens.append((cond, _canonical_expr(ifs.args.get("true"), alias_map)))
+        default = node.args.get("default")
+
+    parts = [f"WHEN {c} THEN {t}" for c, t in whens]
+    if default is not None:
+        parts.append(f"ELSE {_canonical_expr(default, alias_map)}")
+    return "CASE " + " ".join(parts) + " END"
 
 
 # --- 절별 추출 ---

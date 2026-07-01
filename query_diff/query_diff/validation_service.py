@@ -64,18 +64,21 @@ def _preprocess_sql(sql: str) -> str:
     sql = _BROKEN_HINT_RE.sub(" ", sql)
 
     def _replace_var(m: re.Match) -> str:
+        # 문자열 리터럴 내부인지 판단 — 앞쪽 작은따옴표 개수가 홀수면 리터럴 안.
+        # 단일 글자 룩백(sql[start-1])은 `'%${V}%'`처럼 변수가 리터럴 **중간**에 있으면 오판하므로
+        # 전체 앞부분 따옴표 패리티로 본다(이스케이프 ''는 2개로 세어져 패리티 보존).
+        start = m.start()
+        in_quotes = sql[:start].count("'") % 2 == 1
         default = m.group(2)
         if default is not None:
             stripped = default.strip()
-            # 이미 따옴표로 감싸진 문맥인지 확인
-            start = m.start()
-            in_quotes = start > 0 and sql[start - 1] == "'"
             if stripped.isdigit():
                 return stripped
             if in_quotes:
                 return stripped  # 외부 따옴표가 있으므로 추가하지 않음
             return f"'{stripped}'"
-        return "'__PLACEHOLDER__'"
+        # 기본값 없음 — 외부 따옴표 문맥이면 따옴표를 덧붙이지 않아 이중화('') 방지
+        return "__PLACEHOLDER__" if in_quotes else "'__PLACEHOLDER__'"
 
     return _TEMPLATE_VAR_RE.sub(_replace_var, sql)
 

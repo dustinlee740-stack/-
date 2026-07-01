@@ -52,13 +52,13 @@ def test_ias_pair_structural_matches_semantic():
     blob = "\n".join(
         f"{f.clause.value}|{f.rule_id}|{f.description}|{f.a_snippet}|{f.b_snippet}"
         for f in d.findings
-    )
+    ).lower()  # snippet 은 대문자 통일 → 케이스 무관 비교
     # ① 채널 CASE 조인 (dcnt_group_mapping.channel)
-    assert "channel" in blob and "JOIN_CONDITION_MISMATCH" in blob
+    assert "channel" in blob and "join_condition_mismatch" in blob
     # ② 가맹점명 simple_nm(A) vs mc_nm(B) — MAX 인자 차이
     assert "simple_nm" in blob and "mc_nm" in blob
     # ③ grp_nm 그룹핑 차이
-    assert "grp_nm" in blob and "GROUP_BY_COLUMN_MISMATCH" in blob
+    assert "grp_nm" in blob and "group_by_column_mismatch" in blob
 
 
 def test_ias_anchors_are_searchable_english():

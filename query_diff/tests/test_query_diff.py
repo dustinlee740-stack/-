@@ -98,6 +98,31 @@ class TestValidation:
         assert _preprocess_sql("'${aspId=ABC123}'") == "'ABC123'"
         assert _preprocess_sql("${noDefault}") == "'__PLACEHOLDER__'"
 
+    def test_preprocess_quoted_no_default(self):
+        """따옴표 안 기본값 없는 변수 → 따옴표 이중화('') 금지"""
+        assert _preprocess_sql("'${start_day}'") == "'__PLACEHOLDER__'"
+
+    def test_quoted_no_default_var_parses(self):
+        """회귀: to_timestamp('${start_day}', ...)가 ''__PLACEHOLDER__''로 깨지지 않음"""
+        sql = ("SELECT 1 FROM cs.tb_pg_ob_withdraw ow "
+               "WHERE ow.sys_cre_dttm BETWEEN to_timestamp('${start_day}', 'yyyyMMdd') "
+               "AND to_timestamp('${end_day}', 'yyyyMMdd')")
+        assert validate_sql(sql, Dialect.HIVE).is_valid is True
+
+    def test_preprocess_var_mid_string_literal(self):
+        """변수가 문자열 리터럴 **중간**(`'%${V=파주}%'`)이어도 따옴표 이중화 없이 치환."""
+        # 리터럴 중간(앞 글자가 % ) — 따옴표 패리티로 내부 판정 → 기본값에 따옴표 덧붙이지 않음
+        assert _preprocess_sql("LIKE '%${NOT_HOME=파주}%'") == "LIKE '%파주%'"
+        # 바로-앞 따옴표 케이스도 동일하게 정상
+        assert _preprocess_sql("'${V=파주}시'") == "'파주시'"
+        assert _preprocess_sql("'${V=파주} 외'") == "'파주 외'"
+
+    def test_like_pattern_template_var_parses(self):
+        """회귀: CASE WHEN … LIKE '%${V=파주}%' … (리터럴 중간 변수)가 깨지지 않고 파싱."""
+        sql = ("SELECT CASE WHEN addr LIKE '%${NOT_HOME=파주}%' THEN '${NOT_HOME=파주}시' "
+               "ELSE '${NOT_HOME=파주} 외' END c FROM t")
+        assert validate_sql(sql, Dialect.HIVE).is_valid is True
+
     def test_en_dash_comment_auto_fix(self):
         """Word/Confluence에서 '--'가 en-dash '–'로 자동교정된 주석도 파싱되어야 함"""
         sql = """SELECT 1 FROM t
@@ -384,8 +409,8 @@ class TestAPIIntegration:
 
     # --- 실행 조건 검증 ---
 
-    def test_execute_requires_metrics(self):
-        """READY 상태여도 지표 없으면 실행 불가"""
+    def test_execute_without_metrics_succeeds(self):
+        """차이 요약(metrics)은 선택 입력 — 지표 없이도 비교 실행 가능(DONE)."""
         res = client.post("/api/comparisons?title=지표없음")
         req_id = res.json()["id"]
 
@@ -397,10 +422,10 @@ class TestAPIIntegration:
         })
         client.post(f"/api/comparisons/{req_id}/validate")
 
-        # 지표 없이 실행
+        # 지표(/summary) 없이 바로 실행 — 200 + DONE
         res = client.post(f"/api/comparisons/{req_id}/execute")
-        assert res.status_code == 400
-        assert "차이 요약" in res.json()["detail"]
+        assert res.status_code == 200
+        assert res.json()["status"] == "DONE"
 
     def test_execute_rerun_allowed(self):
         """DONE 상태에서 재실행 가능"""

@@ -23,6 +23,18 @@ import sqlglot
 from sqlglot import exp
 
 _DEFAULT_MAP_PATH = Path(__file__).resolve().parent.parent / "data" / "op_an_map.json"
+# 컬럼 data_type 사이드카 — asis·tobe 가 모두 시간형(DATE/TIMESTAMP/DATETIME)인 컬럼 키 집합.
+# 연-월 추출 관용구 동치를 '제한적 판정'이 아닌 '동일(✓)'로 확정하는 타입 증거.
+_DEFAULT_TYPES_PATH = _DEFAULT_MAP_PATH.parent / "op_an_types.json"
+
+
+def _load_temporal_keys(path: str | Path) -> set[str]:
+    """op_an_types.json → {UPPER(OP_TABLE.AN_COL)} (양쪽 시간형). 없으면 빈 집합."""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {_u(k) for k in d.get("temporal_both", [])}
 
 
 class SchemaMapping(Protocol):
@@ -68,25 +80,38 @@ class OpAnMap:
         tables: dict[str, str],
         op_catalog: dict[str, list[str]],
         an_derived: dict[str, str] | None = None,
+        temporal_keys: set[str] | None = None,
     ) -> None:
         self.columns = columns          # "OP_TABLE.OP_COL" -> {an_table, an_col, source_expr}
         self.tables = tables            # OP_TABLE -> AN_TABLE
         self.op_catalog = op_catalog    # OP_TABLE -> [OP_COL, ...]
         self.an_derived = an_derived or {}
+        # UPPER(OP_TABLE.AN_COL) — asis·tobe 모두 시간형인 컬럼(연-월 동치 확정용)
+        self.temporal_keys = temporal_keys or set()
 
     @classmethod
-    def from_dict(cls, d: dict) -> "OpAnMap":
+    def from_dict(cls, d: dict, temporal_keys: set[str] | None = None) -> "OpAnMap":
         return cls(
             columns=d.get("columns", {}),
             tables=d.get("tables", {}),
             op_catalog=d.get("op_catalog", {}),
             an_derived=d.get("an_derived", {}),
+            temporal_keys=temporal_keys,
         )
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "OpAnMap":
         p = Path(path) if path else _DEFAULT_MAP_PATH
-        return cls.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        tkeys = _load_temporal_keys(p.parent / "op_an_types.json")
+        return cls.from_dict(json.loads(p.read_text(encoding="utf-8")), temporal_keys=tkeys)
+
+    def temporal_reliable(self, table_qualified_an: str) -> bool:
+        """`TABLE.AN_COL`(연-월 토큰의 컬럼)이 양쪽 시간형으로 확인되면 True.
+
+        시간형(DATE/TIMESTAMP/DATETIME)은 숫자(연·월·일)만 담겨 substr/포맷 추출이 같은 연-월
+        버킷을 내므로, 연-월 관용구 동치를 '제한적 판정'이 아닌 '동일'로 확정할 수 있다.
+        미수록/미상이면 False(과추출 우선 — 소프트 유지)."""
+        return _u(table_qualified_an) in self.temporal_keys
 
     def translate_table(self, op_table: str) -> str:
         """운영 테이블 → 분석 테이블. 매핑 없으면 원본(identity)."""
