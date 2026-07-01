@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+_preview.png
+_c.js
+hue_config.md
+hue_auth.json

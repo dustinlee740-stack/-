@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>운영계 → 분석계 이관 현황</title>
+<style>
+  :root{
+    --done:#1a7f37; --partial:#bf8700; --none:#cf222e; --na:#6e7781;
+    --bg:#f6f8fa; --card:#fff; --line:#d0d7de; --ink:#1f2328; --mut:#656d76;
+    --mig:#1a7f37; --notmig:#cf222e; --exc:#6e7781; --der:#8250df; --pii:#bc4c00;
+    --th:#f1f3f5; --rowline:#eaeef2; --sub:#fbfcfd; --hover:#f0f3f6; --barbg:#eaeef2;
+    --colbg:#eef4fb; --colline:#d6e3f0; --colth:#dceafb; --colthink:#1c4e80; --colaccent:#4a90d9;
+    --hue:#1a7f37;
+  }
+  body.dark{
+    --done:#3fb950; --partial:#d29922; --none:#f85149; --na:#8b949e;
+    --bg:#0d1117; --card:#161b22; --line:#30363d; --ink:#e6edf3; --mut:#8b949e;
+    --mig:#3fb950; --notmig:#f85149; --exc:#8b949e; --der:#a371f7; --pii:#db6d28;
+    --th:#1c2128; --rowline:#21262d; --sub:#11161d; --hover:#1c2128; --barbg:#21262d;
+    --colbg:#10243a; --colline:#1f3b57; --colth:#16314d; --colthink:#9ecbf0; --colaccent:#388bfd;
+    --hue:#3fb950;
+  }
+  *{box-sizing:border-box}
+  /* 전체 UI 확대: zoom은 글자를 더 큰 크기로 재렌더(transform:scale과 달리 흐려지지 않음) */
+  body{margin:0;font-family:"Segoe UI","Malgun Gothic",sans-serif;background:var(--bg);color:var(--ink);font-size:13px;zoom:1.2}
+  header{background:#24292f;color:#fff;padding:14px 20px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  header h1{font-size:17px;margin:0}
+  header .date{color:#a0a8b0;font-size:12px}
+  header .drop-hint{margin-left:auto;font-size:11px;color:#a0a8b0}
+  .wrap{padding:16px 20px;max-width:1500px;margin:0 auto}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px;margin-bottom:14px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .kpi .v{font-size:22px;font-weight:700}
+  .kpi .l{font-size:11px;color:var(--mut);margin-top:2px}
+  .kpi.warn .v{color:var(--pii)} .kpi.bad .v{color:var(--none)}
+  .bar{height:8px;border-radius:5px;background:var(--barbg);overflow:hidden;margin-top:6px}
+  .bar>span{display:block;height:100%;background:var(--done)}
+  .controls{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:12px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .controls input[type=text],.controls select{padding:5px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px}
+  .controls input[type=text]{min-width:230px}
+  .chk{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--ink)}
+  .chk small{color:var(--mut)}
+  table{width:100%;border-collapse:collapse;background:var(--card)}
+  .ctbl{border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  th{background:var(--th);text-align:left;padding:8px 10px;font-size:11px;color:var(--mut);font-weight:600;border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:7px 10px;border-bottom:1px solid var(--rowline);vertical-align:top}
+  tr.comp{cursor:pointer} tr.comp:hover{background:var(--hover)}
+  td.num{text-align:left;font-variant-numeric:tabular-nums}
+  .code{font-weight:700}
+  .role{color:var(--mut);font-size:11px;max-width:340px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .badge{display:inline-block;padding:1px 8px;border-radius:11px;font-size:11px;font-weight:600;color:#fff}
+  .b-done{background:var(--done)} .b-partial{background:var(--partial)} .b-none{background:var(--none)} .b-na{background:var(--na)}
+  .ratecell{min-width:120px}
+  .ratecell .bar{margin-top:3px}
+  .pill{display:inline-block;padding:0 6px;border-radius:9px;font-size:10px;font-weight:600;border:1px solid}
+  .p-mig{color:var(--mig);border-color:var(--mig)}
+  .p-notmig{color:var(--notmig);border-color:var(--notmig)}
+  .p-exc{color:var(--exc);border-color:var(--exc)}
+  .p-der{color:var(--der);border-color:var(--der)}
+  .p-pii{color:var(--pii);border-color:var(--pii)}
+  .warnflag{color:var(--pii);font-weight:600}
+  .sub{background:var(--sub)}
+  .sub table{background:transparent}
+  .sub h4{margin:6px 0;font-size:12px}
+  .compmeta{padding:10px 14px;color:var(--mut);font-size:12px;border-left:3px solid var(--line);margin:4px 0 8px;background:var(--card)}
+  .tbl-row{cursor:pointer} .tbl-row:hover{background:var(--hover)}
+  .colwrap{padding:6px 10px 10px;background:var(--colbg);border-left:3px solid var(--colaccent);border-radius:0 0 6px 6px;margin:0 0 4px}
+  .colwrap table{background:var(--card);border:1px solid var(--colline);border-radius:6px;overflow:hidden}
+  .colwrap th{background:var(--colth);color:var(--colthink)}
+  .mono{font-family:Consolas,monospace;font-size:11px}
+  .muted{color:var(--mut)}
+  .up{text-transform:uppercase}
+  .expr{color:var(--der);font-size:11px}
+  details.expr-d summary{cursor:pointer;color:var(--der);font-size:11px}
+  .empty{padding:24px;text-align:center;color:var(--mut)}
+  footer{padding:14px 20px;color:var(--mut);font-size:11px;border-top:1px solid var(--line);margin-top:20px}
+  footer pre{white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;color:var(--mut)}
+  .drag-over{outline:3px dashed #2da44e;outline-offset:-6px}
+  .themebtn{margin-left:12px;background:#30363d;color:#fff;border:1px solid #444c56;border-radius:6px;padding:4px 11px;font-size:12px;cursor:pointer;align-self:center}
+  .themebtn:hover{background:#3c444d}
+</style>
+</head>
+<body>
+<header>
+  <h1>운영계 → 분석계 이관 현황</h1>
+  <span class="date" id="hdrDate"></span>
+  <span class="drop-hint">최신 CSV(op_schema/an_schema/reasons/components)를 이 창에 드래그&드롭하면 즉석 반영</span>
+  <button id="themeBtn" class="themebtn" type="button" title="다크 모드 전환">🌙 다크</button>
+</header>
+<div class="wrap">
+  <div class="kpis" id="kpis"></div>
+  <div class="controls">
+    <input type="text" id="q" placeholder="검색: 컴포넌트 코드·이름·테이블·컬럼">
+    <select id="fCat"><option value="">대분류 전체</option></select>
+    <label class="chk"><input type="checkbox" class="fst" value="이관" checked>이관</label>
+    <label class="chk"><input type="checkbox" class="fst" value="미이관" checked>미이관</label>
+    <label class="chk"><input type="checkbox" class="fst" value="제외" checked>제외</label>
+    <label class="chk"><input type="checkbox" class="fst" value="파생컬럼" checked>분석계전용</label>
+    <label class="chk"><input type="checkbox" id="fPii">PII 이관됨만 <small>(경고)</small></label>
+    <label class="chk"><input type="checkbox" id="fUnassigned">사유미지정만</label>
+  </div>
+  <div class="ctbl">
+    <table>
+      <thead><tr>
+        <th style="width:18px"></th><th>운영계</th><th>분석계</th><th>전체 이름</th><th>역할</th>
+        <th class="num">테이블</th><th class="num">컬럼</th>
+        <th class="num">이관</th><th class="num">미이관</th><th class="num">제외</th>
+        <th class="ratecell">이관율</th><th>상태</th>
+      </tr></thead>
+      <tbody id="compBody"></tbody>
+    </table>
+    <div class="empty" id="emptyMsg" style="display:none">조건에 맞는 컴포넌트가 없습니다.</div>
+  </div>
+</div>
+<footer>
+  <div id="reconcile"></div>
+</footer>
+
+<script>
+var EMBEDDED = /*__DATA__*/;
+
+/* ---------- 규칙 상수 (Python common.py와 일치) ---------- */
+var ST={MIG:"이관",NOT:"미이관",EXC:"제외",DER:"파생컬럼",ORPHAN:"운영계미등재"};
+var EXCLUDING = EMBEDDED.excludingReasons || ["NO_REQUEST","PII_EXCLUDED","UNFIT"];
+var RLAB = EMBEDDED.reasonLabels || {};
+
+function norm(s){return (s==null?"":(""+s)).trim().toUpperCase();}
+function pii(v){return ["Y","YES","TRUE","1"].indexOf(norm(v))>=0;}
+function firstLine(s){s=(s||"").trim();var i=s.indexOf("\n");return i<0?s:s.slice(0,i);}
+
+/* 컬럼 설명+순서 인덱스: {분석계 table\tcolumn: {cmt, seq}} (Hue 메타스토어 노출 순서) */
+function buildCommentIndex(comments){
+  var idx={};
+  (comments||[]).forEach(function(r){
+    var t=norm(r.table),c=norm(r.column);
+    if(!t||!c) return;
+    var seq=parseInt(r.col_seq,10);
+    idx[t+"\t"+c]={cmt:(r.comment||"").trim(), seq:(isNaN(seq)?null:seq)};
+  });
+  return idx;
+}
+/* 분석계 컴포넌트 인덱스: {분석계 table: Hue DB(schema)}. Hue의 데이터베이스명이 분석계 컴포넌트. */
+function buildSchemaIndex(comments){
+  var idx={};
+  (comments||[]).forEach(function(r){
+    var t=norm(r.table), sc=(r.schema||"").trim();
+    if(t&&sc&&!idx[t]) idx[t]=sc;
+  });
+  return idx;
+}
+function lookupDesc(idx, anTable, anColumn, fallback){
+  var k=norm(anTable)+"\t"+norm(anColumn), e=idx[k];
+  if(anTable&&anColumn&&e&&e.cmt) return {desc:e.cmt, src:"Hue"};
+  return {desc:fallback||"", src:"기존"};
+}
+function lookupSeq(idx, anTable, anColumn){
+  var e=idx[norm(anTable)+"\t"+norm(anColumn)];
+  return (e&&e.seq!=null)?e.seq:null;
+}
+
+/* ---------- 모델 계산 (Python compute_model과 동일 규칙) ---------- */
+function computeModel(op, an, reasons, comps, comments){
+  var cidx=buildCommentIndex(comments);
+  var scidx=buildSchemaIndex(comments);
+  var migrated={}, opKeys={}, opNames={}, anNames={}, anTbl={};
+  an.forEach(function(r){
+    var oc=norm(r.op_component),ot=norm(r.op_table),ocol=norm(r.op_column);
+    if(ocol){var k=oc+"\t"+ot+"\t"+ocol; if(!(k in migrated)) migrated[k]={at:r.an_table||"",ac:r.an_column||"",acomp:r.an_component||""};}
+  });
+  op.forEach(function(r){opKeys[norm(r.component)+"\t"+norm(r.table)+"\t"+norm(r.column)]=1;});
+
+  var colReason={}, tblReason={};
+  reasons.forEach(function(r){
+    var c=norm(r.component),t=norm(r.table),col=norm(r.column);
+    var v={code:(r.reason_code||"").trim(),note:r.reason_note||""};
+    if(col) colReason[c+"\t"+t+"\t"+col]=v; else tblReason[c+"\t"+t]=v;
+  });
+  var roles={}; comps.forEach(function(r){roles[norm(r.Name)]=r;});
+
+  var tree={}; // code -> {tables:{name->{cols:[]}}}
+  function tnode(c,t){
+    if(!tree[c]) tree[c]={tables:{}};
+    if(!tree[c].tables[t]) tree[c].tables[t]={cols:[]};
+    return tree[c].tables[t];
+  }
+  // 운영계 컬럼
+  op.forEach(function(r){
+    var c=norm(r.component),t=norm(r.table),col=norm(r.column);
+    var k=c+"\t"+t+"\t"+col, isP=pii(r.is_pii);
+    var m=migrated[k];
+    var o={op:r.column,type:r.data_type||"",pii:isP};
+    if(!opNames[c]) opNames[c]=r.component;
+    if(m){
+      if(m.acomp&&!anNames[c]) anNames[c]=m.acomp;
+      if(m.at&&!anTbl[c+"\t"+t]) anTbl[c+"\t"+t]=m.at;
+      o.status=ST.MIG; o.an=m.ac;
+      var dl=lookupDesc(cidx, m.at, m.ac, r.column_desc);  // 이관 컬럼: 분석계 키로 Hue 설명
+      o.desc=dl.desc; o.descSrc=dl.src; o.seq=lookupSeq(cidx, m.at, m.ac);
+    } else {
+      var rs=colReason[k]||tblReason[c+"\t"+t]||null, auto=false;
+      if(!rs && isP){rs={code:"PII_EXCLUDED",note:""}; auto=true;}
+      var code=rs?rs.code:null;
+      var exc=code && EXCLUDING.indexOf(code)>=0;
+      o.status=exc?ST.EXC:ST.NOT; o.code=code; o.note=rs?rs.note:""; o.auto=auto;
+      o.desc=r.column_desc||""; o.descSrc="기존";  // 미이관: Hue 설명 없음
+    }
+    tnode(c,t).cols.push(o);
+  });
+  // 분석계 전용
+  an.forEach(function(r){
+    var oc=norm(r.op_component),ot=norm(r.op_table),ocol=norm(r.op_column);
+    if(ocol && (oc+"\t"+ot+"\t"+ocol) in opKeys) return;
+    var c=norm(r.an_component),t=norm(r.an_table);
+    if(!anNames[c]) anNames[c]=r.an_component;
+    if(r.an_table&&!anTbl[c+"\t"+t]) anTbl[c+"\t"+t]=r.an_table;
+    var derived=(!ocol)||!!(r.source_expr&&r.source_expr.trim());
+    var dl=lookupDesc(cidx, r.an_table, r.an_column, "");  // 분석계전용 컬럼도 Hue 설명
+    tnode(c,t).cols.push({op:"",an:r.an_column,type:"",desc:dl.desc,descSrc:dl.src,pii:false,
+      status:derived?ST.DER:ST.ORPHAN, expr:r.source_expr||"", seq:lookupSeq(cidx, r.an_table, r.an_column)});
+  });
+
+  // 집계 + 메타
+  var comps_out=[], T={comp:0,tbl:0,op:0,mig:0,notmig:0,exc:0,der:0,orphan:0,piiMig:0,unassigned:0,
+                       descHue:0,descLegacy:0};
+  Object.keys(tree).sort().forEach(function(c){
+    var cc={code:c, opComp:opNames[c]||"", anComp:"", tables:[], cnt:blank(), piiMig:0, unassigned:0};
+    var anCompHue="";
+    var role=roles[c]||{};
+    cc.fullName=role["Full Name"]||""; cc.roleKo=firstLine(role["Korean Description"]);
+    cc.roleKoFull=role["Korean Description"]||""; cc.cat=role["대분류"]||"";
+    cc.catM=role["중분류"]||""; cc.catS=role["소분류"]||"";
+    Object.keys(tree[c].tables).sort().forEach(function(t){
+      var anT=anTbl[c+"\t"+t]||t;
+      if(!anCompHue){var sc=scidx[norm(anT)]; if(sc) anCompHue=sc;}  // Hue DB명 = 분석계 컴포넌트
+      var tt={name:t, cols:tree[c].tables[t].cols, cnt:blank(), piiMig:0, unassigned:0, desc:""};
+      tt.cols.forEach(function(o){
+        if(o.status===ST.MIG){tt.cnt.op++;tt.cnt.mig++; if(o.pii){tt.piiMig++;}}
+        else if(o.status===ST.EXC){tt.cnt.op++;tt.cnt.exc++;}
+        else if(o.status===ST.NOT){tt.cnt.op++;tt.cnt.notmig++; if(o.code==null) tt.unassigned++;}
+        else if(o.status===ST.DER){tt.cnt.der++;}
+        else if(o.status===ST.ORPHAN){tt.cnt.orphan++;}
+        if(o.status===ST.MIG||o.status===ST.EXC||o.status===ST.NOT){
+          if(o.descSrc==="Hue") T.descHue++; else T.descLegacy++;
+        }
+      });
+      tt.cols.sort(colSort);
+      finalize(tt.cnt);
+      cc.tables.push(tt); addInto(cc.cnt,tt.cnt); cc.piiMig+=tt.piiMig; cc.unassigned+=tt.unassigned;
+    });
+    cc.tables.sort(function(a,b){return a.name<b.name?-1:1;});
+    cc.anComp=(anCompHue||anNames[c]||"").toUpperCase();  // 분석계 컴포넌트 = Hue DB명(없으면 CSV an_component)
+    finalize(cc.cnt);
+    comps_out.push(cc);
+    T.comp++; T.tbl+=cc.tables.length;
+    T.op+=cc.cnt.op;T.mig+=cc.cnt.mig;T.notmig+=cc.cnt.notmig;T.exc+=cc.cnt.exc;
+    T.der+=cc.cnt.der;T.orphan+=cc.cnt.orphan;T.piiMig+=cc.piiMig;T.unassigned+=cc.unassigned;
+  });
+  T.denom=T.op-T.exc; T.rate=T.denom>0?Math.round(T.mig*1000/T.denom)/10:0;
+  comps_out.sort(function(a,b){return a.code<b.code?-1:1;});
+  return {components:comps_out, totals:T};
+}
+function blank(){return {op:0,mig:0,notmig:0,exc:0,der:0,orphan:0,denom:0,rate:0,badge:""};}
+function addInto(a,b){a.op+=b.op;a.mig+=b.mig;a.notmig+=b.notmig;a.exc+=b.exc;a.der+=b.der;a.orphan+=b.orphan;}
+function finalize(c){c.denom=c.op-c.exc; c.rate=c.denom>0?Math.round(c.mig*1000/c.denom)/10:0; c.badge=badge(c.mig,c.denom);}
+function badge(m,d){if(d<=0)return"대상아님"; if(m>=d)return"완료"; if(m<=0)return"미이관"; return"부분";}
+var STORD={이관:0,미이관:1,제외:2,파생컬럼:3,운영계미등재:4};
+function colSort(a,b){
+  // Hue 노출 순서(seq) 우선, seq 없는 컬럼은 뒤로(상태→이름)
+  var sa=(a.seq!=null)?a.seq:1e9, sb=(b.seq!=null)?b.seq:1e9;
+  if(sa!==sb) return sa-sb;
+  var d=(STORD[a.status]||9)-(STORD[b.status]||9); if(d)return d;
+  return (a.op||a.an||"")<(b.op||b.an||"")?-1:1;
+}
+
+/* ---------- 렌더 ---------- */
+var MODEL=null;
+function badgeClass(b){return b==="완료"?"b-done":b==="부분"?"b-partial":b==="미이관"?"b-none":"b-na";}
+function esc(s){return (s==null?"":(""+s)).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+function rateBar(rate,denom){
+  if(denom<=0) return '<span class="muted">대상없음</span>';
+  return rate+'% <div class="bar"><span style="width:'+rate+'%"></span></div>';
+}
+
+function renderKpis(T){
+  var k=[
+    ["컴포넌트",T.comp,""],["테이블",T.tbl,""],["운영계 컬럼",T.op,""],
+    ["전체 이관율",T.rate+"%","rate"],["이관",T.mig,""],["미이관",T.notmig,""],
+    ["제외(대상아님)",T.exc,""],["사유미지정",T.unassigned, T.unassigned>0?"bad":""],
+    ["PII 이관됨(경고)",T.piiMig, T.piiMig>0?"warn":""],["분석계전용(파생)",T.der,""]
+  ];
+  document.getElementById("kpis").innerHTML=k.map(function(x){
+    var extra = x[2]==="rate" ? '<div class="bar"><span style="width:'+T.rate+'%"></span></div>' : "";
+    return '<div class="kpi '+(x[2]==="rate"?"":x[2])+'"><div class="v">'+x[1]+'</div><div class="l">'+x[0]+'</div>'+extra+'</div>';
+  }).join("");
+}
+
+function statusPill(o){
+  if(o.status===ST.MIG) return '<span class="pill p-mig">이관</span>'+(o.pii?' <span class="pill p-pii">PII 이관됨</span>':"");
+  if(o.status===ST.EXC) return '<span class="pill p-exc">제외</span>';
+  if(o.status===ST.NOT) return '<span class="pill p-notmig">미이관</span>';
+  if(o.status===ST.DER) return '<span class="pill p-der">파생</span>';
+  return '<span class="pill p-der">운영계미등재</span>';
+}
+function reasonCell(o){
+  if(o.status===ST.MIG) return '<span class="muted">—</span>';
+  if(o.status===ST.DER||o.status===ST.ORPHAN) return '<span class="muted">—</span>';
+  if(o.code==null) return '<span class="warnflag">사유미지정</span>';
+  var lab=RLAB[o.code]||o.code;
+  return esc(lab)+(o.auto?' <span class="muted">(자동)</span>':"")+(o.note?'<br><span class="muted">'+esc(o.note)+'</span>':"");
+}
+
+function passColumn(o){ // 상태 필터
+  var sset=getStatusFilter();
+  var bucket = (o.status===ST.MIG)?"이관":(o.status===ST.NOT)?"미이관":(o.status===ST.EXC)?"제외":"파생컬럼";
+  if(!sset[bucket]) return false;
+  if(document.getElementById("fPii").checked && !(o.status===ST.MIG&&o.pii)) return false;
+  if(document.getElementById("fUnassigned").checked && !(o.status===ST.NOT&&o.code==null)) return false;
+  return true;
+}
+function getStatusFilter(){var s={};document.querySelectorAll(".fst").forEach(function(c){s[c.value]=c.checked;});return s;}
+
+function descMark(o){
+  // 설명 출처 마커: Hue=● (Hive Metastore Comment), 기존=빈칸(샘플 보조설명)
+  if(o.descSrc==="Hue") return '<span title="Hue (Hive Metastore) Comment" style="color:var(--hue)">● </span>';
+  return "";
+}
+function renderColumns(tt){
+  var rows=tt.cols.filter(passColumn);
+  if(!rows.length) return '<div class="muted" style="padding:6px 10px">표시할 컬럼이 없습니다(필터).</div>';
+  var body=rows.map(function(o){
+    var expr = o.expr ? '<details class="expr-d"><summary>매핑식</summary><span class="mono expr">'+esc(o.expr)+'</span></details>' : "";
+    return '<tr>'+
+      '<td class="mono up">'+(esc(o.op)||'<span class="muted">—</span>')+(o.pii?' <span class="pill p-pii">PII</span>':"")+'</td>'+
+      '<td class="mono up">'+(esc(o.an)||'<span class="muted">—</span>')+'</td>'+
+      '<td>'+descMark(o)+esc(o.desc)+'</td>'+
+      '<td>'+statusPill(o)+'</td>'+
+      '<td>'+reasonCell(o)+'</td>'+
+      '<td>'+expr+'</td></tr>';
+  }).join("");
+  return '<div class="colwrap"><table>'+
+    '<thead><tr><th>운영계 컬럼</th><th>분석계 컬럼</th><th>설명 <span class="muted" style="font-weight:400" title="●=Hue(Hive Metastore) Comment, 표시없음=샘플 보조설명">(●Hue)</span></th><th>상태</th><th>미이관 사유</th><th></th></tr></thead>'+
+    '<tbody>'+body+'</tbody></table></div>';
+}
+
+function renderTables(cc){
+  var html='';
+  if(cc.roleKoFull) html+='<div class="compmeta"><b>'+esc(cc.code)+' · '+esc(cc.fullName)+'</b>'+
+    (cc.cat?' <span class="muted">['+esc(cc.cat)+' &gt; '+esc(cc.catM)+' &gt; '+esc(cc.catS)+']</span>':"")+
+    '<br>'+esc(cc.roleKoFull).replace(/\n/g,"<br>")+'</div>';
+  html+='<table><thead><tr><th style="width:18px"></th><th>테이블</th>'+
+    '<th class="num">컬럼</th><th class="num">이관</th><th class="num">미이관</th><th class="num">제외</th>'+
+    '<th class="ratecell">이관율</th><th>상태</th></tr></thead><tbody>';
+  cc.tables.forEach(function(tt,i){
+    // 테이블에 보이는 컬럼이 하나도 없으면 숨김(필터)
+    if(!tt.cols.some(passColumn)) return;
+    var warn = tt.piiMig>0 ? ' <span class="warnflag" title="PII가 분석계에 이관됨">⚠PII</span>' : "";
+    html+='<tr class="tbl-row" data-t="'+i+'"><td>▸</td>'+
+      '<td class="mono">'+esc(tt.name)+warn+'</td>'+
+      '<td class="num">'+tt.cnt.op+'</td><td class="num">'+tt.cnt.mig+'</td>'+
+      '<td class="num">'+tt.cnt.notmig+'</td><td class="num">'+tt.cnt.exc+'</td>'+
+      '<td class="ratecell">'+rateBar(tt.cnt.rate,tt.cnt.denom)+'</td>'+
+      '<td><span class="badge '+badgeClass(tt.cnt.badge)+'">'+tt.cnt.badge+'</span></td></tr>'+
+      '<tr class="sub colrow" data-cols="'+i+'" style="display:none"><td></td><td colspan="7"></td></tr>';
+  });
+  html+='</tbody></table>';
+  return html;
+}
+
+function passComponent(cc){
+  // 대분류 필터
+  var cat=document.getElementById("fCat").value;
+  if(cat && cc.cat!==cat) return false;
+  // 검색
+  var q=norm(document.getElementById("q").value);
+  if(q){
+    var hay=norm(cc.code+" "+cc.opComp+" "+cc.anComp+" "+cc.fullName+" "+cc.roleKoFull);
+    var inTables=cc.tables.some(function(t){
+      if(norm(t.name).indexOf(q)>=0) return true;
+      return t.cols.some(function(o){return norm(o.op).indexOf(q)>=0||norm(o.an).indexOf(q)>=0;});
+    });
+    if(hay.indexOf(q)<0 && !inTables) return false;
+  }
+  // PII/사유미지정 토글: 해당 컬럼을 가진 컴포넌트만
+  if(document.getElementById("fPii").checked && cc.piiMig===0) return false;
+  if(document.getElementById("fUnassigned").checked && cc.unassigned===0) return false;
+  // 상태 필터로 보이는 컬럼이 전혀 없으면 숨김
+  var anyCol=cc.tables.some(function(t){return t.cols.some(passColumn);});
+  if(!anyCol) return false;
+  return true;
+}
+
+function render(){
+  renderKpis(MODEL.totals);
+  var body=document.getElementById("compBody"); body.innerHTML="";
+  var shown=0;
+  MODEL.components.forEach(function(cc,ci){
+    if(!passComponent(cc)) return;
+    shown++;
+    var tr=document.createElement("tr"); tr.className="comp"; tr.dataset.c=ci;
+    tr.innerHTML='<td>▸</td>'+
+      '<td class="code">'+(esc(cc.opComp)||'<span class="muted">—</span>')+'</td>'+
+      '<td class="code">'+(esc(cc.anComp)||'<span class="muted">—</span>')+'</td>'+
+      '<td>'+esc(cc.fullName)+'</td><td class="role" title="'+esc(cc.roleKo)+'">'+esc(cc.roleKo)+'</td>'+
+      '<td class="num">'+cc.tables.length+'</td><td class="num">'+cc.cnt.op+'</td>'+
+      '<td class="num">'+cc.cnt.mig+'</td><td class="num">'+cc.cnt.notmig+'</td><td class="num">'+cc.cnt.exc+'</td>'+
+      '<td class="ratecell">'+rateBar(cc.cnt.rate,cc.cnt.denom)+'</td>'+
+      '<td><span class="badge '+badgeClass(cc.cnt.badge)+'">'+cc.cnt.badge+'</span>'+
+        (cc.piiMig>0?' <span class="warnflag" title="PII 이관됨">⚠</span>':"")+'</td>';
+    body.appendChild(tr);
+    var sub=document.createElement("tr"); sub.className="sub"; sub.style.display="none";
+    sub.innerHTML='<td></td><td colspan="11" class="subcell"></td>';
+    body.appendChild(sub);
+  });
+  document.getElementById("emptyMsg").style.display=shown?"none":"block";
+}
+
+/* 컴포넌트 펼침 / 테이블 펼침 */
+document.getElementById("compBody").addEventListener("click",function(e){
+  var tr=e.target.closest("tr"); if(!tr) return;
+  if(tr.classList.contains("comp")){
+    var sub=tr.nextElementSibling; var open=sub.style.display!=="none";
+    sub.style.display=open?"none":""; tr.firstChild.textContent=open?"▸":"▾";
+    if(!open){
+      var cc=MODEL.components[+tr.dataset.c];
+      var cell=sub.querySelector(".subcell"); cell.innerHTML=renderTables(cc);
+      bindTableRows(cell,cc);
+    }
+  }
+});
+function bindTableRows(cell,cc){
+  cell.querySelectorAll(".tbl-row").forEach(function(row){
+    row.addEventListener("click",function(){
+      var i=+row.dataset.t; var colrow=cell.querySelector('.colrow[data-cols="'+i+'"]');
+      var open=colrow.style.display!=="none";
+      colrow.style.display=open?"none":""; row.firstChild.textContent=open?"▸":"▾";
+      if(!open) colrow.querySelector("td:last-child").innerHTML=renderColumns(cc.tables[i]);
+    });
+  });
+}
+
+function renderReconcile(T){
+  var sum=T.mig+T.notmig+T.exc;
+  var covPct=T.op>0?Math.round(T.descHue*1000/T.op)/10:0;
+  var txt="reconcile  |  운영계 컬럼 "+T.op+" = 이관 "+T.mig+" + 미이관 "+T.notmig+" + 제외 "+T.exc+" (합 "+sum+(sum===T.op?" ✓":" ✗")+")"+
+    "  |  전체 이관율 = "+T.mig+"/"+T.denom+" = "+T.rate+"%"+
+    "  |  분석계전용 파생 "+T.der+" / 운영계미등재 "+T.orphan+
+    "  |  사유미지정 "+T.unassigned+" · PII 이관됨 "+T.piiMig+
+    "  |  컬럼설명 Hue: 매칭 "+T.descHue+" / 기존 "+T.descLegacy+" (커버 "+covPct+"%)";
+  document.getElementById("reconcile").innerHTML="<pre>"+esc(txt)+"</pre>";
+}
+
+/* ---------- 부팅 ---------- */
+function rebuild(d){
+  MODEL=computeModel(d.op||[], d.an||[], d.reasons||[], d.components||[], d.comments||[]);
+  // 대분류 옵션
+  var cats={}; MODEL.components.forEach(function(c){if(c.cat)cats[c.cat]=1;});
+  var sel=document.getElementById("fCat");
+  sel.innerHTML='<option value="">대분류 전체</option>'+Object.keys(cats).sort().map(function(c){return '<option>'+esc(c)+'</option>';}).join("");
+  document.getElementById("hdrDate").textContent=(d.date?("기준일 "+d.date):"")+ "  ·  데이터 최신본";
+  render(); renderReconcile(MODEL.totals);
+}
+["q","fCat","fPii","fUnassigned"].forEach(function(id){
+  document.getElementById(id).addEventListener("input",render);
+  document.getElementById(id).addEventListener("change",render);
+});
+document.querySelectorAll(".fst").forEach(function(c){c.addEventListener("change",render);});
+
+/* ---------- 드래그앤드롭(인라인 최소 CSV 파서, CDN 없음) ---------- */
+function parseCSV(text){
+  text=text.replace(/^﻿/,"");
+  var rows=[],row=[],f="",i=0,q=false,n=text.length;
+  while(i<n){var c=text[i];
+    if(q){ if(c==='"'){ if(text[i+1]==='"'){f+='"';i+=2;continue;} q=false;i++;continue;} f+=c;i++;continue; }
+    if(c==='"'){q=true;i++;continue;}
+    if(c===','){row.push(f);f="";i++;continue;}
+    if(c==='\r'){i++;continue;}
+    if(c==='\n'){row.push(f);rows.push(row);row=[];f="";i++;continue;}
+    f+=c;i++;
+  }
+  if(f.length||row.length){row.push(f);rows.push(row);}
+  if(!rows.length) return [];
+  var hdr=rows[0].map(function(h){return h.trim();});
+  return rows.slice(1).filter(function(r){return r.some(function(x){return x!=="";});})
+    .map(function(r){var o={};hdr.forEach(function(h,j){o[h]=r[j]!=null?r[j]:"";});return o;});
+}
+function classify(name,rows){
+  var h=rows.length?Object.keys(rows[0]):[];
+  if(h.indexOf("an_component")>=0) return "an";
+  if(h.indexOf("reason_code")>=0) return "reasons";
+  if(h.indexOf("comment")>=0) return "comments";
+  if(h.indexOf("Name")>=0||h.indexOf("Full Name")>=0) return "components";
+  if(h.indexOf("component")>=0&&h.indexOf("column")>=0) return "op";
+  return null;
+}
+var CUR={op:EMBEDDED.op,an:EMBEDDED.an,reasons:EMBEDDED.reasons,components:EMBEDDED.components,
+  comments:EMBEDDED.comments,date:EMBEDDED.date,
+  reasonLabels:EMBEDDED.reasonLabels,excludingReasons:EMBEDDED.excludingReasons};
+window.addEventListener("dragover",function(e){e.preventDefault();document.body.classList.add("drag-over");});
+window.addEventListener("dragleave",function(e){if(e.relatedTarget===null)document.body.classList.remove("drag-over");});
+window.addEventListener("drop",function(e){
+  e.preventDefault();document.body.classList.remove("drag-over");
+  var files=[].slice.call(e.dataTransfer.files); var pend=files.length, got=[];
+  files.forEach(function(file){
+    var rd=new FileReader();
+    rd.onload=function(){
+      var rows=parseCSV(rd.result); var kind=classify(file.name,rows);
+      if(kind){CUR[kind]=rows; got.push(file.name+"→"+kind);} else got.push(file.name+"→무시");
+      if(--pend===0){CUR.date=CUR.date||""; rebuild(CUR);
+        alert("반영됨:\n"+got.join("\n"));}
+    };
+    rd.readAsText(file,"utf-8");
+  });
+});
+
+/* ---------- 다크 모드 토글(우측 상단) ---------- */
+(function(){
+  var btn=document.getElementById("themeBtn");
+  function apply(dark){
+    document.body.classList.toggle("dark",dark);
+    btn.textContent=dark?"☀ 라이트":"🌙 다크";
+    try{localStorage.setItem("mdash-theme",dark?"dark":"light");}catch(e){}
+  }
+  var saved=null; try{saved=localStorage.getItem("mdash-theme");}catch(e){}
+  var init=saved?(saved==="dark"):(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches);
+  apply(!!init);
+  btn.addEventListener("click",function(){apply(!document.body.classList.contains("dark"));});
+})();
+
+rebuild(CUR);
+</script>
+</body>
+</html>
