@@ -1,6 +1,6 @@
 # meta3 스키마매핑 데이터 검증 보고서
 
-> 대상: `meta3.table_col_mapping`(+`v_oltp_table_columns`) 을 query_diff **No.3 스키마 매핑 딕셔너리**(운영계 Oracle ↔ 분석계 Hive)의 소스로 쓸 수 있는가
+> 대상: `meta3.table_col_mapping`(+`v_oltp_tbl_col_info`) 을 query_diff **No.3 스키마 매핑 딕셔너리**(운영계 Oracle ↔ 분석계 Hive)의 소스로 쓸 수 있는가
 > 검증일: 2026-06-25 (v2: 2026-06-26 v_oltp identity 규칙 반영) · 조회: MCP `meta3-db`(PostgreSQL), 모든 식별자 **대문자** 조회
 > 관련 문서: `AGENTS.md`(규칙①·②), `query_diff/flow.md`(No.3/No.5/No.6), `query_diff/structure_diff/schema_mapping.py`
 
@@ -11,7 +11,7 @@
 운영↔분석 매핑은 **단일 테이블이 아니라 두 meta3 객체의 결합**으로 해석한다(§B-2, §G):
 
 1. `table_col_mapping` 에 있으면 → **리네임 매핑**(asis 운영 → tobe 분석). 운영≠분석.
-2. 없고 `v_oltp_table_columns` 에 있으면(주로 std_yn='Y') → **운영=분석 identity**(표준화 완료, 이름 그대로).
+2. 없고 `v_oltp_tbl_col_info` 에 있으면(주로 std_yn='Y') → **운영=분석 identity**(표준화 완료, 이름 그대로).
 3. 둘 다 없으면 → meta3 미커버.
 
 - ✅ `table_col_mapping`(27,543행) 은 운영(asis)↔분석(tobe) **컬럼 단위 리네임 매핑**으로 No.3 축과 일치. (asis=운영, tobe=분석 — 사용자 확인)
@@ -68,10 +68,10 @@
 
 ### B-2. v_oltp 의 역할 = identity(운영=분석) 집합 — ✅ 재해석
 
-`v_oltp_table_columns`(운영 물리 카탈로그, 22,953컬럼)는 `table_col_mapping` 의 **결손이 아니라 보완 객체**다. 두 객체는 **거의 분리된 테이블 모집단**을 가진다(매핑 테이블 1,703개 중 v_oltp에 존재하는 건 205개뿐). 이는 누락이 아니라 **역할 분담**이다:
+`v_oltp_tbl_col_info`(운영 물리 카탈로그, 22,953컬럼)는 `table_col_mapping` 의 **결손이 아니라 보완 객체**다. 두 객체는 **거의 분리된 테이블 모집단**을 가진다(매핑 테이블 1,703개 중 v_oltp에 존재하는 건 205개뿐). 이는 누락이 아니라 **역할 분담**이다:
 
 - `table_col_mapping` = 표준화 과정에서 **이름이 바뀐(리네임)** 컬럼.
-- `v_oltp_table_columns` = **이미 표준화돼 운영=분석이 동일한** 컬럼(+ 일부 비표준).
+- `v_oltp_tbl_col_info` = **이미 표준화돼 운영=분석이 동일한** 컬럼(+ 일부 비표준).
 
 v_oltp 22,953컬럼을 매핑 기준으로 분류:
 
@@ -161,7 +161,7 @@ N:1 병합 표본:
 
 - `same_table(a,b)` / `same_column(a,b)`:
   1. `table_col_mapping` 에서 asis↔tobe 대응을 조회(운영≠분석 리네임). 컴포넌트(db_id) 컨텍스트 필수(KODASP↔KOD 변환표).
-  2. 없으면 `v_oltp_table_columns` 존재 여부로 identity 판정 → **이때는 기존 `IdentitySchemaMapping`(이름 동일=동일)이 정답**. 즉 IdentityMapping은 **폐기 대상이 아니라 2단계 fallback 컴포넌트로 재사용**한다.
+  2. 없으면 `v_oltp_tbl_col_info` 존재 여부로 identity 판정 → **이때는 기존 `IdentitySchemaMapping`(이름 동일=동일)이 정답**. 즉 IdentityMapping은 **폐기 대상이 아니라 2단계 fallback 컴포넌트로 재사용**한다.
   3. 둘 다 없으면 미커버(False/예외).
 - 캐싱: 27,543 매핑행 + v_oltp 22,953행 모두 소규모 → 메모리 적재 가능. 조회 식별자 **대문자 정규화** 필수.
 - 추가 제공: PK(`tobe_pk`)·타입(`tobe_data_type`) → No.5 매칭 키/캐스팅에 활용.
@@ -197,7 +197,7 @@ N:1 병합 표본:
 1) table_col_mapping(asis) 에 있나?
      ├─ 예 → 분석 = 대응 tobe (운영≠분석, 리네임).  [27,543 매핑]
      └─ 아니오 ↓
-2) v_oltp_table_columns 에 있나?
+2) v_oltp_tbl_col_info 에 있나?
      ├─ 예(std_yn='Y') → 운영=분석 identity (이름 그대로).  [14,489 표준화 컬럼]
      ├─ 예(std_yn='N') → ⚠️ identity 단정 보류, "확인 필요" 표시.  [2,793]
      └─ 아니오 ↓

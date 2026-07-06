@@ -375,6 +375,32 @@ def _canonical_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> s
     return node.sql().lower()
 
 
+def _display_expr(node: exp.Expression | None, alias_map: dict[str, str]) -> str:
+    """표시용 자연형 술어. 비교용 `_canonical_expr` 와 **같은 이름 해소·리터럴 정규화**를 쓰되,
+    사람이 원 쿼리와 대조하기 쉽도록:
+    - EQ/NEQ 피연산자를 **정렬하지 않고**(작성 순서 = `컬럼 op 값`), 연산자를 `=`/`!=` 로 표기
+      (canonical 은 정렬 + `<>` 로 정규화 — 매칭 전용).
+    NULL≡'' 흡수, IN 목록 정렬, GT/LT·IS·LIKE·컬럼·리터럴 등은 canonical 과 동일(위임).
+    """
+    if isinstance(node, (exp.EQ, exp.NEQ)):
+        left = _canonical_expr(node.left, alias_map)
+        right = _canonical_expr(node.right, alias_map)
+        # NULL ≡ '' 는 canonical 과 동일 처리(운영 NULL ↔ 분석 빈문자열 동치).
+        if left == "''" or right == "''":
+            other = right if left == "''" else left
+            return (
+                f"{other} IS NULL"
+                if isinstance(node, exp.EQ)
+                else f"{other} IS NOT NULL"
+            )
+        op = "=" if isinstance(node, exp.EQ) else "!="
+        return f"{left} {op} {right}"
+    if isinstance(node, exp.Or):
+        parts = [_display_expr(c, alias_map) for c in node.flatten()]
+        return "(" + " OR ".join(parts) + ")"
+    return _canonical_expr(node, alias_map)
+
+
 def _canonical_conditional(
     node: exp.Expression, alias_map: dict[str, str]
 ) -> str:

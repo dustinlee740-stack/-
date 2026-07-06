@@ -1,0 +1,15 @@
+# query_diff 코어 런타임 의존성 (웹 백엔드 + 파이썬 비교 엔진)
+fastapi
+uvicorn[standard]
+pydantic>=2
+sqlglot
+requests
+beautifulsoup4
+
+# 개발/테스트: pytest, httpx (FastAPI TestClient)
+# 오프라인 빌드(선택): psycopg2-binary  # data/build_op_an_map.py 가 meta3 에서 op_an_map 생성
+#
+# "🤖 AI로 비교"(claude -p 구독 경로) 전제 — pip 의존성 아님:
+#   · claude CLI 설치 + 구독 로그인 (claude → /login → Pro/Max), /status 로 확인
+#   · 앱 실행 셸에서 ANTHROPIC_API_KEY 미설정 (설정돼 있으면 구독 대신 metered 과금)
+#   · meta3-db / Kona-hue MCP 가 사용자 스코프에 등록 (claude -p 가 자동 로드)

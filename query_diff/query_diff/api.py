@@ -250,6 +250,56 @@ def execute_comparison(req_id: str):
     return req
 
 
+# --- AI 비교 실행 (개인·로컬: 헤드리스 claude -p 구독 + MCP 스킬) ---
+
+@app.post("/api/comparisons/{req_id}/execute-ai", response_model=ComparisonRequest)
+async def execute_ai_comparison(req_id: str):
+    """의미 비교를 파이썬 엔진 대신 Claude+MCP(query-diff-compare 스킬)로 수행.
+
+    구문 비교는 결정적 파이썬 엔진을 유지하고, 의미 비교만 AI 경로로 대체한다(기존 execute와 병존).
+    claude CLI 부재·오류는 500이 아니라 SemanticDiff(LIMITED)로 반환한다.
+    """
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+
+    if req.status not in (ComparisonStatus.READY, ComparisonStatus.DONE):
+        raise HTTPException(status_code=400, detail="검증 완료 상태에서만 실행할 수 있습니다.")
+
+    op_an = _op_an_map()
+    req.status = ComparisonStatus.COMPARING
+    try:
+        req.structure_diff = compare_structures(req.query_a, req.query_b, op_an=op_an)
+    except Exception as e:
+        req.status = ComparisonStatus.ERROR
+        store.update(req)
+        raise HTTPException(status_code=500, detail=f"구조 비교 실패: {e}")
+
+    try:
+        from query_diff.ai_diff import compare_via_cli  # 지연 임포트
+
+        req.semantic_diff = await compare_via_cli(
+            req.query_a.sql_raw,
+            req.query_a.dialect,
+            req.query_b.sql_raw,
+            req.query_b.dialect,
+            op_an=op_an,
+        )
+    except Exception as e:
+        from query_diff.models import SemanticVerdict
+
+        req.semantic_diff = SemanticDiff(
+            verdict=SemanticVerdict.LIMITED,
+            reason="AI 의미 비교 중 예기치 못한 오류가 발생했습니다.",
+            error=str(e),
+        )
+
+    req.status = ComparisonStatus.DONE
+    store.update(req)
+
+    return req
+
+
 # --- 구조 비교 독립 엔드포인트 ---
 
 @app.post("/api/comparisons/{req_id}/structure-diff", response_model=StructureDiff)

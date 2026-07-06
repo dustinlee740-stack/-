@@ -257,22 +257,26 @@ def _lineage_caveat(table: str, lin: OdsLineage, reconciled: bool) -> str:
     if lin.spine:
         lines.append(f"원천 스파인: {', '.join(sorted(s.upper() for s in lin.spine))}")
     lines.append(f"경로: {' → '.join(c.upper() for c in lin.chain)}")
-    pts = []
+    # 대사 필요 지점 — 섹션([라벨]) + 항목별 `·` 줄로 펼쳐 스캔이 쉽게 한다.
+    # (프런트 amber 박스는 white-space:pre-line — 들여쓰기는 접히므로 줄바꿈·글리프로만 계층 표기.)
+    sections: list[tuple[str, list[str]]] = []
     if lin.filters:
-        pts.append("적재/필터: " + "; ".join(lin.filters[:5]))
+        sections.append(("적재/필터", list(lin.filters[:5])))
     if lin.joins:
-        pts.append(
-            "조인: " + ", ".join(lin.joins)
-            + " (INNER=매칭 안 되는 행은 빠질 수 있음 · LEFT=대상이 여러 건이면 행이 늘 수 있음)"
-        )
+        sections.append(("조인", [
+            ", ".join(lin.joins),
+            "INNER=매칭 안 되는 행이 빠질 수 있음 · LEFT=대상이 여러 건이면 행이 늘 수 있음",
+        ]))
     if lin.aggregated:
-        pts.append(
-            "집계 단위 차이: B는 여러 건을 묶어 집계(GROUP BY)한 결과라, "
-            "A(원장·건별)와 세는 단위(행 기준)가 달라 값이 다를 수 있음"
-        )
-    if pts:
-        lines.append("대사 필요 지점:")
-        lines += [f" · {p}" for p in pts]
+        sections.append(("집계 단위 차이", [
+            "B는 여러 건을 묶어 집계(GROUP BY)한 결과라, "
+            "A(원장·건별)와 세는 단위(행 기준)가 달라 값이 다를 수 있음",
+        ]))
+    if sections:
+        lines.append("대사 필요 지점")
+        for label, items in sections:
+            lines.append(f"[{label}]")
+            lines += [f"· {it}" for it in items]
     lines.append("→ 운영 데이터 대사로 확인 필요")
     return "\n".join(lines)
 

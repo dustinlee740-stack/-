@@ -16,6 +16,7 @@ from query_diff.structure_diff.normalizer import (
     _AGG_FUNCTIONS,
     _build_alias_map,
     _canonical_expr,
+    _display_expr,
     _norm_ident,
     _normalize_function_name,
     _split_and,
@@ -70,6 +71,17 @@ def _extract_base_tables(select: exp.Select) -> list[str]:
     return sorted(names)
 
 
+def _join_type(join: exp.Join) -> str:
+    """조인 타입 문자열(INNER/LEFT/RIGHT/FULL/CROSS)."""
+    side = (join.args.get("side") or "").upper()
+    kind = (join.args.get("kind") or "").upper()
+    if "CROSS" in kind:
+        return "CROSS"
+    if side in ("LEFT", "RIGHT", "FULL"):
+        return side
+    return "INNER"
+
+
 def _extract_join_edges(
     select: exp.Select, alias_map: dict[str, str]
 ) -> list[JoinEdge]:
@@ -94,14 +106,7 @@ def _extract_join_edges(
             join.args.get("side") or join.args.get("kind")
         ):
             continue
-        side = (join.args.get("side") or "").upper()
-        kind = (join.args.get("kind") or "").upper()
-        if "CROSS" in kind:
-            jtype = "CROSS"
-        elif side in ("LEFT", "RIGHT", "FULL"):
-            jtype = side
-        else:
-            jtype = "INNER"
+        jtype = _join_type(join)
 
         right_name = ""
         inner = join.this
@@ -124,6 +129,60 @@ def _extract_join_edges(
         )
 
     return edges
+
+
+def join_display_labels(tree: exp.Expression) -> dict[tuple[str, str], str]:
+    """패스스루 해소 **이전** 트리에서 조인별 표시 라벨을 만든다(CTE 경계 존중).
+
+    라벨은 각 조인의 **등치 조인 키**(양변이 모두 `테이블.컬럼`)가 실제로 잇는 두 엔티티를
+    쿼리에 쓰인 이름 그대로 보여준다:
+      - 실제 테이블 → 테이블명
+      - 파생 스코프(CTE/서브쿼리)가 단일 베이스 → 그 베이스명 (예: `ksd` → `service_discount`)
+      - 파생 스코프가 다중 베이스(환원 불가) → 파생/CTE 이름 (예: `address_info`)
+    반환: `(right_table, join_type)` → `"SIDE_A ↔ SIDE_B"`(정렬·대문자). 등치 키가 없거나
+    조인 대상(right)이 테이블이 아니면(무명 서브쿼리 조인 등) 항목을 생략 → 호출측이 폴백.
+
+    **표시 전용**이다. 조인 매칭은 여전히 패스스루 해소된 베이스 테이블 집합(`_edge_table_set`)을
+    쓴다 — 평면 조인 쿼리와 CTE 쿼리를 같은 조인으로 짝짓기 위함.
+    """
+    # 파생 스코프 별칭 → 표시명: 단일 베이스면 그 베이스, 다중 베이스면 파생명 자체(환원 불가)
+    derived_disp: dict[str, str] = {}
+    for alias, sel in _derived_selects(tree):
+        bases = _extract_base_tables(sel)
+        derived_disp[alias] = bases[0] if len(set(bases)) == 1 else alias
+
+    def _disp(name: str) -> str:
+        return derived_disp.get(name, name)
+
+    labels: dict[tuple[str, str], str] = {}
+    for sel in _all_selects(tree):
+        amap = _build_alias_map(sel)
+        for join in sel.args.get("joins", []) or []:
+            inner = join.this
+            if not isinstance(inner, exp.Table):
+                continue
+            right = _norm_ident(inner.name)
+            on = join.args.get("on")
+            if on is None:
+                continue
+            # 등치 조인 키(양변 모두 테이블.컬럼)가 잇는 테이블만 수집 — `col = 리터럴` 필터·CASE 제외
+            sides: set[str] = set()
+            for part in _split_and(on):
+                if not isinstance(part, exp.EQ):
+                    continue
+                left, rt = part.left, part.right
+                if not (isinstance(left, exp.Column) and isinstance(rt, exp.Column)):
+                    continue
+                for col in (left, rt):
+                    if not col.table:
+                        continue
+                    ref = _norm_ident(col.table)
+                    sides.add(_disp(amap.get(ref, ref)))
+            if len(sides) < 2:
+                continue
+            label = " ↔ ".join(sorted(s.upper() for s in sides if s))
+            labels.setdefault((right, _join_type(join)), label)
+    return labels
 
 
 def _is_tautology(pred: str) -> bool:
@@ -166,13 +225,34 @@ def _extract_all_predicates(
     )
 
 
+def _extract_pred_provenance(
+    select: exp.Select, alias_map: dict[str, str]
+) -> list[tuple[str, str]]:
+    """WHERE→HAVING **절 순서**로 `(canonical, display)` 쌍 목록. 항상 참인 필러 제외.
+
+    canonical 은 매칭·정렬 색인 키, display 는 표시용 자연형(`컬럼 op 값`·`!=`). 표시 순서·문법
+    복원용 provenance(비교 집합과 별개)."""
+    out: list[tuple[str, str]] = []
+    for clause in ("where", "having"):
+        node = select.args.get(clause)
+        if node is None:
+            continue
+        for p in _split_and(node.this):
+            canon = _canonical_expr(p, alias_map)
+            if _is_tautology(canon):
+                continue
+            out.append((canon, _display_expr(p, alias_map)))
+    return out
+
+
 def _extract_group_keys(
     select: exp.Select, alias_map: dict[str, str]
 ) -> list[str]:
     group = select.args.get("group")
     if group is None:
         return []
-    return sorted([_canonical_expr(e, alias_map) for e in group.expressions])
+    # 원본 GROUP BY 절 순서 보존(표시 정합) — 매칭은 집합 기반이라 순서 무관.
+    return [_canonical_expr(e, alias_map) for e in group.expressions]
 
 
 # --- 위치 기반(최신 1건) 집계 인식 — Oracle KEEP(DENSE_RANK FIRST/LAST) ↔ AGG(CASE WHEN rank()=k …) ---
@@ -388,8 +468,27 @@ def _extract_aggregates_and_projections(
             projections.append(_canonical_expr(proj, alias_map))
 
     aggregates.sort()
-    projections.sort()
+    # projections 는 정렬하지 않는다 — 최외곽 select(쿼리) 순서를 표시에 보존(group_keys 와 동일).
     return aggregates, projections
+
+
+def projection_aliases(tree: exp.Expression) -> dict[str, str]:
+    """최외곽 SELECT 의 출력 별칭 맵: canonical 식 → 출력명(별칭).
+
+    표시에서 canonical 폴백(원문 raw 단위 매칭 실패 — 예: CTE 인라인된 CASE)에 별칭을 덧붙이기 위함.
+    canonical 은 `plan.projections`(=`_extract_aggregates_and_projections`)와 동일하게
+    `_canonical_expr(식, 최외곽 alias_map)` 로 만들어 키를 정합시킨다. 집계 별칭도 포함될 수 있으나
+    조회는 projection 에서만 하므로 무해. **GROUP BY 표시에도 재사용** — group-by 가 참조하는 SELECT
+    출력이 최외곽에 인라인되면 group key canonical == 해당 SELECT canonical 이라 같은 키로 매칭된다."""
+    top = _top_select(tree)
+    if top is None:
+        return {}
+    amap = _build_alias_map(top)
+    out: dict[str, str] = {}
+    for proj in top.expressions:
+        if isinstance(proj, exp.Alias) and proj.alias:
+            out.setdefault(_canonical_expr(proj, amap), proj.alias)
+    return out
 
 
 def _passthrough_outputs(
@@ -577,6 +676,8 @@ def build_logical_plan(
     aggs: set[tuple[str, str]] = set()
     edges: list[JoinEdge] = []
     seen_edge_keys: set[str] = set()
+    pred_display: dict[str, str] = {}   # canonical → 표시용 자연형
+    pred_order: dict[str, int] = {}     # canonical → 원문 등장 순서(전 스코프 누적)
 
     # base/predicate/join/aggregate 는 전 스코프 합집합(CTE 관통)
     for sel in selects:
@@ -590,6 +691,12 @@ def build_logical_plan(
             where_preds.add(p)
         for p in _extract_having_predicates(sel, amap):
             having_preds.add(p)
+
+        # 표시용 provenance(절 순서·자연문법) — 비교 집합과 별개, 최초 등장 기준으로 누적.
+        for canon, disp in _extract_pred_provenance(sel, amap):
+            pred_display.setdefault(canon, disp)
+            if canon not in pred_order:
+                pred_order[canon] = len(pred_order)
 
         for e in _extract_join_edges(sel, amap):
             # CTE 해소 후 ON 이 참조하는 테이블이 전부 CTE명일 때만(미해소 CTE↔CTE noise) 제외.
@@ -629,8 +736,11 @@ def build_logical_plan(
         all_predicates=sorted(where_preds | having_preds),
         where_predicates=sorted(where_preds),
         having_predicates=sorted(having_preds),
-        group_keys=sorted(group_keys),
+        pred_display=pred_display,
+        pred_order=pred_order,
+        group_keys=group_keys,   # 쿼리 절 순서 보존(표시용) — 정렬 안 함
         aggregates=sorted(aggs),
-        projections=sorted(projections),
+        projections=projections,   # 쿼리 절 순서 보존(표시용) — group_keys 와 동일, 정렬 안 함
+
         limitations=list(limitations),
     )

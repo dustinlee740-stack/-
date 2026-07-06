@@ -34,13 +34,16 @@ from query_diff.semantic_diff.plan_compare import (
     _detranslate,
     _diff_sets,
     _diff_sets_by_column,
+    _edge_reps,
     _group_edges,
-    _lookup_raw_on,
+    _join_label,
+    _raw_on_for,
     _orig_text,
+    _pred_disp1,
+    _pred_display_list,
     _RawSrc,
     _raw_group_map,
     _raw_on_map,
-    _raw_predicate_map,
     _raw_select_map,
     _ref_cols,
     _shape,
@@ -135,18 +138,37 @@ def _join_findings(
     rename: dict[str, str],
     raw_on_a: dict[str, str],
     raw_on_b: dict[str, str],
+    disp_a: dict[tuple[str, str], str] | None = None,
+    disp_b: dict[tuple[str, str], str] | None = None,
 ) -> list[DiffFinding]:
-    """조인을 ON 참조 테이블 집합으로 페어링(앵커 무관)하고 타입·ON 술어 차이를 렌더."""
+    """조인을 ON 참조 테이블 집합으로 페어링(앵커 무관)하고 타입·ON 술어 차이를 렌더.
+
+    페어링은 앵커-무관 테이블집합(패스스루 해소)으로 하되, 표시 **라벨**은 CTE 경계를 존중하는
+    '실제 조인 쌍'(`disp_a`/`disp_b`, `planner.join_display_labels`)으로 보여준다 — 없으면 폴백.
+    """
     ga, gb = _group_edges(a.join_edges), _group_edges(b.join_edges)
+    ea, eb = _edge_reps(a.join_edges), _edge_reps(b.join_edges)
+    disp_a = disp_a or {}
+    disp_b = disp_b or {}
+
+    def _rep(reps: dict, ts: frozenset, types: set[str]):
+        """ts 의 존재 타입 중 하나로 대표 엣지 조회(라벨 표기용)."""
+        for t in sorted(types):
+            r = reps.get((ts, t))
+            if r is not None:
+                return r
+        return None
 
     # 테이블 집합 단위로 묶어 타입/술어를 비교 (타입 차이를 JOIN_TYPE_MISMATCH 로 분리)
     tablesets = {k[0] for k in ga} | {k[0] for k in gb}
     findings: list[DiffFinding] = []
 
     for ts in sorted(tablesets, key=lambda s: sorted(s)):
-        label = "↔".join(sorted(t.upper() for t in ts))
         a_types = {k[1] for k in ga if k[0] == ts}
         b_types = {k[1] for k in gb if k[0] == ts}
+        rep_a, rep_b = _rep(ea, ts, a_types), _rep(eb, ts, b_types)
+        label_a = _join_label(rep_a, disp_a, ts)
+        label_b = _join_label(rep_b, disp_b, ts)
         a_preds: set[str] = set()
         for k in ga:
             if k[0] == ts:
@@ -158,26 +180,26 @@ def _join_findings(
 
         # 한쪽에만 있는 조인
         if not a_types:
-            raw = _upper_disp(_lookup_raw_on(raw_on_b, ts))
+            raw = _upper_disp(_raw_on_for(raw_on_b, rep_b, ts))
             findings.append(DiffFinding(
                 clause=ClauseType.JOIN,
                 rule_id="JOIN_CONDITION_MISMATCH",
                 severity=Severity.CRITICAL,
                 a_snippet="",
-                b_snippet=label + (f" (ON: {raw})" if raw else ""),
-                description=f"`{label}` 조인이 B 쿼리에만 있습니다.",
+                b_snippet=label_b + (f" (ON: {raw})" if raw else ""),
+                description=f"`{label_b}` 조인이 B 쿼리에만 있습니다.",
                 impact="조인 대상이 한쪽에만 있으면 결과 row 수가 달라집니다.",
             ))
             continue
         if not b_types:
-            raw = _upper_disp(_lookup_raw_on(raw_on_a, ts))
+            raw = _upper_disp(_raw_on_for(raw_on_a, rep_a, ts))
             findings.append(DiffFinding(
                 clause=ClauseType.JOIN,
                 rule_id="JOIN_CONDITION_MISMATCH",
                 severity=Severity.CRITICAL,
-                a_snippet=label + (f" (ON: {raw})" if raw else ""),
+                a_snippet=label_a + (f" (ON: {raw})" if raw else ""),
                 b_snippet="",
-                description=f"`{label}` 조인이 A 쿼리에만 있습니다.",
+                description=f"`{label_a}` 조인이 A 쿼리에만 있습니다.",
                 impact="조인 대상이 한쪽에만 있으면 결과 row 수가 달라집니다.",
             ))
             continue
@@ -188,10 +210,10 @@ def _join_findings(
                 clause=ClauseType.JOIN,
                 rule_id="JOIN_TYPE_MISMATCH",
                 severity=Severity.CRITICAL,
-                a_snippet=f"{'/'.join(sorted(a_types))} JOIN {label}",
-                b_snippet=f"{'/'.join(sorted(b_types))} JOIN {label}",
+                a_snippet=f"{'/'.join(sorted(a_types))} JOIN {label_a}",
+                b_snippet=f"{'/'.join(sorted(b_types))} JOIN {label_b}",
                 description=(
-                    f"`{label}` 조인 유형이 다릅니다 "
+                    f"`{label_a}` 조인 유형이 다릅니다 "
                     f"(A={'/'.join(sorted(a_types))}, B={'/'.join(sorted(b_types))})."
                 ),
                 impact="INNER/LEFT 차이는 누락 행 수를 바꿔 합계 gap 의 주 원인이 될 수 있습니다.",
@@ -203,8 +225,8 @@ def _join_findings(
         dpa, dpb, _param = _absorb_parameterized(dpa, dpb)
         dpa = _da(dpa, rename)
         if dpa or dpb:
-            raw_a = _upper_disp(_lookup_raw_on(raw_on_a, ts))
-            raw_b = _upper_disp(_lookup_raw_on(raw_on_b, ts))
+            raw_a = _upper_disp(_raw_on_for(raw_on_a, rep_a, ts))
+            raw_b = _upper_disp(_raw_on_for(raw_on_b, rep_b, ts))
             anchors = [_upper_disp(c) for c in _ref_cols(dpa) + _ref_cols(dpb)]
             findings.append(DiffFinding(
                 clause=ClauseType.JOIN,
@@ -213,7 +235,7 @@ def _join_findings(
                 a_snippet=_upper_disp(" AND ".join(dpa)) + (f"  (원본 ON: {raw_a})" if raw_a else ""),
                 b_snippet=_upper_disp(" AND ".join(dpb)) + (f"  (원본 ON: {raw_b})" if raw_b else ""),
                 description=(
-                    f"`{label}` 조인 ON 조건이 다릅니다. 확인할 컬럼: "
+                    f"`{label_a}` 조인 ON 조건이 다릅니다. 확인할 컬럼: "
                     f"{', '.join(anchors) or '(상수 조건)'}"
                 ),
                 impact="조인 키 차이는 매칭되는 row 조합 자체를 바꿉니다.",
@@ -226,8 +248,6 @@ def _where_findings(
     a: LogicalPlan,
     b: LogicalPlan,
     rename: dict[str, str],
-    raw_pred_a: _RawSrc | None = None,
-    raw_pred_b: _RawSrc | None = None,
 ) -> list[DiffFinding]:
     _matched, oa, ob, _sh = _diff_sets(a.where_predicates, b.where_predicates)
     oa, ob, _param = _absorb_parameterized(oa, ob)  # 플레이스홀더 값차 흡수
@@ -259,16 +279,16 @@ def _where_findings(
             clause=ClauseType.WHERE,
             rule_id="WHERE_LITERAL_MISMATCH",
             severity=Severity.CRITICAL,
-            a_snippet=_disp(_da([pa], rename), raw_pred_a),
-            b_snippet=_disp([pb], raw_pred_b),
+            a_snippet=_pred_disp1(pa, a, rename),
+            b_snippet=_pred_disp1(pb, b),
             description="WHERE 조건의 비교 값(리터럴)이 다릅니다.",
             impact="필터 값 차이는 집계 범위를 직접 바꿉니다 (예: 기간/상태 값).",
         ))
         oa = [p for p in oa if p != pa]
         ob = [p for p in ob if p != pb]
 
-    for p in oa:
-        snip = _disp(_da([p], rename), raw_pred_a)
+    for p in sorted(oa, key=lambda c: a.pred_order.get(c, 1_000_000)):
+        snip = _pred_disp1(p, a, rename)
         findings.append(DiffFinding(
             clause=ClauseType.WHERE,
             rule_id="WHERE_PREDICATE_ONLY_IN_A",
@@ -281,8 +301,8 @@ def _where_findings(
             ),
             impact="A가 더 제한적이면 B보다 결과 집합이 작을 수 있습니다.",
         ))
-    for p in ob:
-        snip = _disp([p], raw_pred_b)
+    for p in sorted(ob, key=lambda c: b.pred_order.get(c, 1_000_000)):
+        snip = _pred_disp1(p, b)
         findings.append(DiffFinding(
             clause=ClauseType.WHERE,
             rule_id="WHERE_PREDICATE_ONLY_IN_B",
@@ -302,8 +322,6 @@ def _having_findings(
     a: LogicalPlan,
     b: LogicalPlan,
     rename: dict[str, str],
-    raw_pred_a: _RawSrc | None = None,
-    raw_pred_b: _RawSrc | None = None,
 ) -> list[DiffFinding]:
     _matched, oa, ob, _sh = _diff_sets(a.having_predicates, b.having_predicates)
     oa, ob, _param = _absorb_parameterized(oa, ob)
@@ -314,8 +332,8 @@ def _having_findings(
         clause=ClauseType.HAVING,
         rule_id="HAVING_MISMATCH",
         severity=Severity.WARNING,
-        a_snippet=_disp(_da(oa, rename), raw_pred_a),
-        b_snippet=_disp(ob, raw_pred_b),
+        a_snippet=", ".join(_pred_display_list(oa, a, rename)),
+        b_snippet=", ".join(_pred_display_list(ob, b)),
         description="HAVING(집계 후 필터) 조건이 다릅니다.",
         impact="집계 후 필터 차이로 포함되는 그룹 수가 달라질 수 있습니다.",
     )]
@@ -529,21 +547,21 @@ def _findings_from_plans(
     raw_on_a: dict[str, str],
     raw_on_b: dict[str, str],
     op_an: OpAnMap | None = None,
-    raw_pred_a: _RawSrc | None = None,
-    raw_pred_b: _RawSrc | None = None,
     raw_group_a: _RawSrc | None = None,
     raw_group_b: _RawSrc | None = None,
     raw_select_a: _RawSrc | None = None,
     raw_select_b: _RawSrc | None = None,
+    disp_a: dict[tuple[str, str], str] | None = None,
+    disp_b: dict[tuple[str, str], str] | None = None,
 ) -> list[DiffFinding]:
     """두 LogicalPlan 의 차이를 절별 DiffFinding 목록으로 렌더(절 우선순위 순).
 
     snippet 은 의미 비교와 **동일하게 원문 리터럴**(대문자·별칭·순서) — 원본 소스 raw 맵 전달."""
     findings: list[DiffFinding] = []
     findings += _from_findings(plan_a, plan_b, rename)
-    findings += _join_findings(plan_a, plan_b, rename, raw_on_a, raw_on_b)
-    findings += _where_findings(plan_a, plan_b, rename, raw_pred_a, raw_pred_b)
-    findings += _having_findings(plan_a, plan_b, rename, raw_pred_a, raw_pred_b)
+    findings += _join_findings(plan_a, plan_b, rename, raw_on_a, raw_on_b, disp_a, disp_b)
+    findings += _where_findings(plan_a, plan_b, rename)
+    findings += _having_findings(plan_a, plan_b, rename)
     findings += _group_findings(plan_a, plan_b, rename, raw_group_a, raw_group_b)
     findings += _agg_findings(plan_a, plan_b, rename, raw_select_a, raw_select_b)
     findings += _projection_findings(plan_a, plan_b, rename, raw_select_a, raw_select_b)
@@ -575,6 +593,7 @@ def compare_structures(
     # planner 는 structure_diff.normalizer 에 의존하므로(역방향) 모듈 로드 순환을 피해 지연 import.
     from query_diff.semantic_diff.planner import (
         build_logical_plan,
+        join_display_labels,
         recover_column_qualifiers,
         resolve_derived_passthrough,
     )
@@ -610,6 +629,7 @@ def compare_structures(
         excise_decorrelation(tree_a, tree_b, decorr)
 
     raw_on_a = _raw_on_map(tree_a)
+    disp_a = join_display_labels(tree_a)  # 조인 표시 라벨(CTE 경계 존중) — 패스스루/번역 전 원본에서
 
     # 순서: 파생 테이블(CTE+서브쿼리) 통과 해소 → 단일 테이블 스코프 미한정 컬럼 한정 → 번역
     # (analyzer.compare_semantic 과 동일).
@@ -619,6 +639,7 @@ def compare_structures(
         tree_a, rename_a = translate_op_to_an(tree_a, op_an)
 
     raw_on_b = _raw_on_map(tree_b)
+    disp_b = join_display_labels(tree_b)
     tree_b = recover_column_qualifiers(resolve_derived_passthrough(tree_b))
 
     plan_a = build_logical_plan(tree_a, _lim_a)
@@ -627,12 +648,12 @@ def compare_structures(
     # 차이 snippet 을 원문 리터럴로 — 의미 비교와 동일하게 원본 소스에서 raw 맵 캡처.
     findings = _findings_from_plans(
         plan_a, plan_b, rename_a, raw_on_a, raw_on_b, op_an,
-        raw_pred_a=_raw_predicate_map(query_a.sql_raw, dialect_a),
-        raw_pred_b=_raw_predicate_map(query_b.sql_raw, dialect_b),
         raw_group_a=_raw_group_map(query_a.sql_raw, dialect_a),
         raw_group_b=_raw_group_map(query_b.sql_raw, dialect_b),
         raw_select_a=_raw_select_map(query_a.sql_raw, dialect_a),
         raw_select_b=_raw_select_map(query_b.sql_raw, dialect_b),
+        disp_a=disp_a,
+        disp_b=disp_b,
     )
     if decorr is not None:
         findings.append(DiffFinding(

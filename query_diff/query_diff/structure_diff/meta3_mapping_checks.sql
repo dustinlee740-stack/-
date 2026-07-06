@@ -36,7 +36,7 @@ ORDER BY n DESC;
 --     3) 둘 다 없으면 -> meta3 미커버
 --   v_oltp는 운영(asis) 명명과 정렬됨(match_asis >> match_tobe 확인용).
 -- ============================================================
-WITH o AS (SELECT db_id, tbl_id, col_id, std_yn FROM meta3.v_oltp_table_columns)
+WITH o AS (SELECT db_id, tbl_id, col_id, std_yn FROM meta3.v_oltp_tbl_col_info)
 SELECT
   count(*) AS oltp_total,
   count(*) FILTER (WHERE EXISTS (SELECT 1 FROM meta3.table_col_mapping m
@@ -53,7 +53,7 @@ FROM o;
 
 -- B-2b. 매핑에 없는(둘 다 미매칭) v_oltp 컬럼의 std_yn 분포
 --   std_yn='Y' = 표준화 완료 = 운영=분석 identity / 'N' = identity 단정 보류(확인 필요)
-WITH o AS (SELECT db_id, tbl_id, col_id, std_yn FROM meta3.v_oltp_table_columns)
+WITH o AS (SELECT db_id, tbl_id, col_id, std_yn FROM meta3.v_oltp_tbl_col_info)
 SELECT std_yn, count(*) n
 FROM o
 WHERE NOT EXISTS (SELECT 1 FROM meta3.table_col_mapping m
@@ -67,7 +67,7 @@ WITH o AS (
     NOT EXISTS (SELECT 1 FROM meta3.table_col_mapping m
        WHERE (upper(m.asis_db_id)=upper(v.db_id) AND upper(m.asis_table_id)=upper(v.tbl_id) AND upper(m.asis_col_id)=upper(v.col_id))
           OR (upper(m.tobe_db_id)=upper(v.db_id) AND upper(m.tobe_table_id)=upper(v.tbl_id) AND upper(m.tobe_col_id)=upper(v.col_id))) AS not_in_map
-  FROM meta3.v_oltp_table_columns v
+  FROM meta3.v_oltp_tbl_col_info v
 )
 SELECT db_id, tbl_id, col_id, col_nm
 FROM o WHERE not_in_map AND std_yn='Y' AND db_id='IAS'

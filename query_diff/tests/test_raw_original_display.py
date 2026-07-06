@@ -101,14 +101,21 @@ def test_structure_findings_show_original_literal():
     assert "SUM(" in blob                               # 원문 함수
 
 
-def test_predicate_diff_shows_original_text():
+def test_predicate_diff_shows_resolved_natural_grammar():
+    """술어 차이는 **해소명 + 자연문법(`컬럼 op 값`·`!=`) + 원문 WHERE 순서**로 노출.
+
+    canonical 정렬형(`값 = 컬럼`·`<>`·알파벳 정렬)이 아니라 사람이 원 쿼리와 대조하기 쉬운 형태.
+    (GROUP BY/집계의 '원문 식' 표시와 달리 술어는 해소명을 유지 — 사용자 확정.)"""
     A = ("SELECT tah.x FROM tgs.tb_api_history tah "
          "WHERE tah.request_dt >= to_date('20250201','yyyymmdd') AND tah.api_rsp_code = 'A0000'")
     B = "SELECT tah.x FROM tgs.tb_api_history tah WHERE tah.rqs_url_hsh_val = 'Z9'"
     r = compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=load_op_an_map())
     pred = next(d for d in r.dimensions if d.dimension == DimensionName.PREDICATES)
     assert pred.matched is False
-    joined = " | ".join(pred.only_in_a)
-    # 원문 그대로: 원본 별칭(tah)·원본 컬럼(request_dt)·원본 함수(to_date) — 정규화 잔재 없음
-    assert "request_dt" in joined.lower() and "to_date" in joined.lower()
-    assert "rqs_dt" not in joined.lower() and "str_to_date" not in joined.lower()
+    up = (" | ".join(pred.only_in_a)).upper()
+    # 자연문법: 컬럼이 연산자 왼쪽(canonical 의 `값 = 컬럼` 정렬형 아님)
+    assert "API_RSP_CODE = 'A0000'" in up and "'A0000' = " not in up
+    # 원문 WHERE 순서 보존: request_dt(>=) → api_rsp_code(=)
+    assert up.index("REQUEST_DT") < up.index("API_RSP_CODE")
+    # 해소명 유지(원본 별칭 tah 아님)
+    assert "TAH." not in up

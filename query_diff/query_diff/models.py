@@ -19,6 +19,19 @@ _TABLE_REF_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_]")
 _EQUI_JOIN_RE = re.compile(r"""^[\w.'"]+ = [\w.'"]+$""")
 
 
+def _is_equi_join_key(p: str) -> bool:
+    """조인 **키**(양변이 모두 `테이블.컬럼`)인 등치만 인정 — `컬럼 = 리터럴` 필터는 제외.
+
+    ON 절에 `AI.RN = 1`(윈도우 순위 필터)처럼 `컬럼 = 리터럴` 이 섞이면, 조인 대상이 아닌
+    테이블(예: CTE명 `address_info`)을 조인 테이블집합에 잘못 끌어와 페어링·라벨을 오염시킨다.
+    조인 키는 두 테이블 컬럼을 잇는 등치뿐이므로 양변 모두 `테이블.컬럼` 일 때만 조인 키로 본다.
+    """
+    if not _EQUI_JOIN_RE.match(p):
+        return False
+    lhs, _, rhs = p.partition(" = ")
+    return bool(_TABLE_REF_RE.search(lhs)) and bool(_TABLE_REF_RE.search(rhs))
+
+
 def _edge_table_set(
     on_predicates: list[str], left_table: str = "", right_table: str = ""
 ) -> set[str]:
@@ -27,11 +40,12 @@ def _edge_table_set(
     `t.channel = CASE WHEN u.x ... END` 처럼 값 표현식(CASE·함수) 안에서만 참조되는 테이블(u)
     은 조인 대상으로 끌어오지 않는다 — 그러면 같은 조인이 한쪽에서만 테이블집합이 부풀어
     페어링이 깨진다(예: 채널 CASE 가 ias_transaction 을 끌어와 2-테이블 조인이 3-테이블로).
-    등치 키로 2개 미만이면(CROSS·복합조건 등) 전체 참조 + left/right 로 보강.
+    마찬가지로 `AI.RN = 1` 같은 `컬럼 = 리터럴` 필터도 조인 키가 아니므로 제외한다
+    (`_is_equi_join_key`). 등치 키로 2개 미만이면(CROSS·복합조건 등) 전체 참조 + left/right 로 보강.
     """
     ts: set[str] = set()
     for p in on_predicates:
-        if _EQUI_JOIN_RE.match(p):
+        if _is_equi_join_key(p):
             ts.update(_TABLE_REF_RE.findall(p))
     if len(ts) < 2:
         for p in on_predicates:
@@ -196,6 +210,8 @@ class LogicalPlan(BaseModel):
     all_predicates: list[str] = Field(default_factory=list)        # sorted canonical (WHERE ∪ HAVING)
     where_predicates: list[str] = Field(default_factory=list)      # sorted canonical (WHERE만)
     having_predicates: list[str] = Field(default_factory=list)     # sorted canonical (HAVING만)
+    pred_display: dict[str, str] = Field(default_factory=dict)     # canonical → 표시용 자연형(컬럼 op 값·!=)
+    pred_order: dict[str, int] = Field(default_factory=dict)       # canonical → 원문 WHERE/HAVING 등장 순서
     group_keys: list[str] = Field(default_factory=list)
     aggregates: list[tuple[str, str]] = Field(default_factory=list)  # (func, arg)
     projections: list[str] = Field(default_factory=list)           # non-aggregate

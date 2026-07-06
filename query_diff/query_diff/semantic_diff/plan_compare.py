@@ -72,9 +72,11 @@ def _diff_sets_by_column(
     mb: dict[str, str] = {}
     for x in b:
         mb.setdefault(_bare(x), x)
-    only_a = sorted(ma[k] for k in ma if k not in mb)
-    only_b = sorted(mb[k] for k in mb if k not in ma)
-    shared = sorted(ma[k] for k in ma if k in mb)
+    # 입력(dict 삽입) 순서 보존 — group_keys·projections 모두 최외곽 select(쿼리 절) 순서로 들어와
+    # 표시 정합을 맞춘다(build_logical_plan 에서 정렬 안 함).
+    only_a = [ma[k] for k in ma if k not in mb]
+    only_b = [mb[k] for k in mb if k not in ma]
+    shared = [ma[k] for k in ma if k in mb]
     return (not only_a and not only_b), only_a, only_b, shared
 
 
@@ -380,9 +382,14 @@ def _raw_on_map(tree: exp.Expression) -> dict[str, str]:
     return m
 
 
-def _lookup_raw_on(raw_map: dict[str, str], tables: frozenset[str]) -> str:
-    """테이블 집합 중 하나로 원본 ON 텍스트 조회(길면 축약)."""
-    for t in sorted(tables):
+def _raw_on_for(
+    raw_map: dict[str, str], rep: JoinEdge | None, tables: frozenset[str]
+) -> str:
+    """원본 ON 텍스트 조회(길면 축약). raw_map 은 조인 대상(right_table)명으로 keyed 이므로 대표
+    엣지의 right_table 로 우선 조회한다(매칭용 테이블집합이 CTE 해소로 그 이름을 잃어도 안전).
+    없으면 테이블집합에서 폴백."""
+    keys = ([rep.right_table] if (rep is not None and rep.right_table) else []) + sorted(tables)
+    for t in keys:
         r = raw_map.get(t)
         if r:
             return (r[:200] + "…") if len(r) > 200 else r
@@ -417,6 +424,21 @@ def _upper_disp(s: str) -> str:
         last = m.end()
     out.append(s[last:].upper())
     return "".join(out)
+
+
+def _collapse_ws(s: str) -> str:
+    """따옴표 **밖** 공백(개행 포함) 연속을 단일 공백으로 축약 — 여러 줄로 쓴 식(CASE 등)을 한 줄로.
+
+    CASE WHEN … END 처럼 사용자가 여러 줄로 작성한 원본 슬라이스의 개행을 접어 한 줄로 보인다.
+    문자열/인용식별자 리터럴 안의 공백은 보존(`_QUOTE_SPAN_RE`)."""
+    out: list[str] = []
+    last = 0
+    for m in _QUOTE_SPAN_RE.finditer(s):
+        out.append(re.sub(r"\s+", " ", s[last:m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(re.sub(r"\s+", " ", s[last:]))
+    return "".join(out).strip()
 
 
 # --- 토큰 기반 리터럴 절 추출 (재렌더 정규화 회피 — 사용자가 쓴 그대로) ---
@@ -517,12 +539,43 @@ def _norm_sig(s: str) -> str:
     return _WS_RE.sub("", s).upper()
 
 
-def _build_rawsrc(units: list[str], dialect: str) -> _RawSrc:
+# 표시용 CTE 출력→원천 컬럼 치환: 따옴표 밖 + **점 앞 아님**(비한정) + 문자시작 식별자만.
+_RESOLVE_TOK_RE = re.compile(r"(?<![.\w])[A-Za-z_가-힣][A-Za-z0-9_가-힣]*")
+
+
+def _resolve_cte_cols(text: str, resolve_map: dict[str, str] | None) -> str:
+    """표시용: 따옴표 밖의 **비한정(점 앞 아님)** 식별자 토큰을 CTE 출력→원천 `table.col`로 치환.
+
+    `SUBSTR(DAY,0,6) 년월` → `SUBSTR(ias_transaction.approval_date,0,6) 년월`(DAY=IT.APPROVAL_DATE).
+    한정참조(`t.DAY`)·따옴표 안 리터럴·숫자 리터럴은 건드리지 않는다(소문자 기준 조회)."""
+    if not resolve_map:
+        return text
+
+    def _seg(s: str) -> str:
+        return _RESOLVE_TOK_RE.sub(
+            lambda m: resolve_map.get(m.group(0).lower(), m.group(0)), s
+        )
+
+    out: list[str] = []
+    last = 0
+    for m in _QUOTE_SPAN_RE.finditer(text):
+        out.append(_seg(text[last:m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(_seg(text[last:]))
+    return "".join(out)
+
+
+def _build_rawsrc(
+    units: list[str], dialect: str, resolve_map: dict[str, str] | None = None
+) -> _RawSrc:
     """원문 단위 목록(별칭 포함, **소스 순서대로**)을 컬럼·정규형·순서 색인으로.
 
-    키잉·정규형은 내부적으로 별칭을 떼고(`_strip_alias_text`) 식만 사용 — 표시는 별칭 포함 원문."""
+    키잉·정규형은 내부적으로 별칭을 떼고(`_strip_alias_text`) 식만 사용 — 표시는 별칭 포함 원문.
+    `resolve_map` 주어지면 각 단위의 CTE 출력 컬럼을 원천 컬럼으로 치환(표시 해소) 후 키잉·표시."""
     src = _RawSrc()
     for i, full in enumerate(units):
+        full = _resolve_cte_cols(full, resolve_map)
         src.order.setdefault(full, i)
         expr = _strip_alias_text(full, dialect)
         for c in _frag_cols(expr, dialect):
@@ -540,6 +593,37 @@ def _prep(sql: str) -> str:
     return _preprocess_sql(sql.rstrip().rstrip(";"))
 
 
+def cte_col_resolution(sql: str, dialect: str = "") -> dict[str, str]:
+    """원본 SQL(정규화 전)의 CTE/서브쿼리 **단순 통과 출력 컬럼** → 원천 `table.col`(소문자) 매핑.
+
+    A측 표시에서 CTE 출력 별칭(예: `IT.APPROVAL_DATE AS DAY`)을 원천 컬럼으로 되돌리는 데 쓴다
+    (`_resolve_cte_cols`). 여러 파생 스코프에서 서로 다른 원천으로 매핑되는 **모호** 컬럼은 제외.
+    파싱 실패 시 빈 맵. 순환 회피 위해 planner/normalizer 헬퍼는 지연 import."""
+    from query_diff.semantic_diff.planner import _derived_selects, _passthrough_outputs
+    from query_diff.structure_diff.normalizer import _build_alias_map
+
+    try:
+        tree = sqlglot.parse_one(_prep(sql), dialect=dialect or None)
+    except Exception:
+        return {}
+    if tree is None:
+        return {}
+    resolved: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for _alias, sel in _derived_selects(tree):
+        for out_col, (base_tbl, base_col) in _passthrough_outputs(
+            sel, _build_alias_map(sel)
+        ).items():
+            val = f"{base_tbl}.{base_col}"
+            if out_col in resolved and resolved[out_col] != val:
+                ambiguous.add(out_col)
+            else:
+                resolved.setdefault(out_col, val)
+    for k in ambiguous:
+        resolved.pop(k, None)
+    return resolved
+
+
 def _raw_predicate_map(sql: str, dialect: str = "") -> _RawSrc:
     """원본 WHERE/HAVING 술어 **리터럴** 색인(`tah.request_dt BETWEEN … AND …` 보존)."""
     s = _prep(sql)
@@ -550,14 +634,20 @@ def _raw_predicate_map(sql: str, dialect: str = "") -> _RawSrc:
     return _build_rawsrc(units, dialect)
 
 
-def _raw_select_map(sql: str, dialect: str = "") -> _RawSrc:
-    """원본 SELECT 식 **리터럴** 색인(**출력 별칭 포함**, 순서 보존) — projection·집계 표시용."""
+def _raw_select_map(
+    sql: str, dialect: str = "", resolve_map: dict[str, str] | None = None
+) -> _RawSrc:
+    """원본 SELECT 식 **리터럴** 색인(**출력 별칭 포함**, 순서 보존) — projection·집계 표시용.
+
+    `resolve_map` 주어지면 CTE 출력 컬럼을 원천 컬럼으로 해소해 표시(`cte_col_resolution`)."""
     s = _prep(sql)
     units = _clause_unit_texts(s, dialect, TokenType.SELECT, TokenType.COMMA)
-    return _build_rawsrc(units, dialect)
+    return _build_rawsrc(units, dialect, resolve_map)
 
 
-def _raw_group_map(sql: str, dialect: str = "") -> _RawSrc:
+def _raw_group_map(
+    sql: str, dialect: str = "", resolve_map: dict[str, str] | None = None
+) -> _RawSrc:
     """원본 GROUP BY 식 **리터럴** 색인. 위치참조(`group by 1,2,3`)는 해당 SELECT 식(별칭 포함)으로 해소."""
     s = _prep(sql)
     sel = _clause_unit_texts(s, dialect, TokenType.SELECT, TokenType.COMMA)
@@ -568,14 +658,21 @@ def _raw_group_map(sql: str, dialect: str = "") -> _RawSrc:
             out.append(sel[int(k) - 1])     # 위치참조 → SELECT 식(별칭 포함)
         else:
             out.append(u)
-    return _build_rawsrc(out, dialect)
+    return _build_rawsrc(out, dialect, resolve_map)
 
 
-def _orig_text(canon_items: list[str], src: _RawSrc | None) -> list[str]:
+def _orig_text(
+    canon_items: list[str], src: _RawSrc | None,
+    alias_of: dict[str, str] | None = None,
+) -> list[str]:
     """canonical 차이 항목 → **원문 텍스트(별칭 포함·원문 순서·대문자 통일)**.
 
     ①차이 컬럼→col_map ②(컬럼 없는 집계)정규형→norm_map ③폴백(토큰이면 컬럼참조 — `⟨…⟩` 미노출).
-    모은 단위를 소스 순서로 정렬 후 대문자화(한글 별칭·따옴표 안 리터럴은 보존)."""
+    모은 단위를 소스 순서로 정렬 후 대문자화(한글 별칭·따옴표 안 리터럴은 보존).
+
+    `alias_of`(canonical→출력 별칭)가 주어지고 항목이 **canonical 폴백**으로 표시될 때(원문 raw 단위
+    매칭 실패, 예: CTE 인라인 CASE) `… AS 별칭` 을 덧붙인다. raw 매칭 항목은 이미 원문 별칭이 있어 미부착."""
+    alias_of = alias_of or {}
     found: list[str] = []
     seen: set[str] = set()
     for it in canon_items:
@@ -589,14 +686,39 @@ def _orig_text(canon_items: list[str], src: _RawSrc | None) -> list[str]:
                 if u:
                     units = [u]
         if not units:
-            units = refs if "⟨" in it else [it]
+            if "⟨" in it:
+                units = refs
+            else:
+                al = alias_of.get(it)
+                units = [f"{it} AS {al}" if al else it]
         for u in units:
             if u not in seen:
                 seen.add(u)
                 found.append(u)
     if src is not None:
         found.sort(key=lambda u: src.order.get(u, 1_000_000))
-    return [_upper_disp(u) for u in found]
+    return [_collapse_ws(_upper_disp(u)) for u in found]
+
+
+# --- 술어 표시(해소명 + 자연문법 + 원문 절 순서) ---
+
+def _pred_display_list(canons: list[str], plan, rename: dict[str, str] | None = None) -> list[str]:
+    """canonical 술어 목록 → **원문 WHERE/HAVING 절 순서**로 정렬 → plan.pred_display 의
+    **자연문법형(컬럼 op 값·!=)** 으로 치환 → (rename 시)A측 운영명 역변환 → 대문자 통일.
+
+    canonical 은 매칭 전용, 표시는 사람이 원 쿼리와 대조하기 쉬운 자연형으로. pred_display/
+    pred_order 에 없는 항목(흡수 재작성 등)은 canonical 을 그대로 폴백."""
+    ordered = sorted(canons, key=lambda c: plan.pred_order.get(c, 1_000_000))
+    disp = [plan.pred_display.get(c, c) for c in ordered]
+    if rename:
+        disp = _da(disp, rename)
+    return [_upper_disp(x) for x in disp]
+
+
+def _pred_disp1(canon: str, plan, rename: dict[str, str] | None = None) -> str:
+    """단일 canonical → 표시 문자열(자연문법·해소명·대문자)."""
+    out = _pred_display_list([canon], plan, rename)
+    return out[0] if out else canon
 
 
 # --- 조인 엣지 앵커-무관 그룹핑 ---
@@ -614,3 +736,26 @@ def _group_edges(edges: list[JoinEdge]) -> dict[tuple, set[str]]:
         key = (_edge_tables(e), e.join_type)
         g.setdefault(key, set()).update(e.on_predicates)
     return g
+
+
+def _edge_reps(edges: list[JoinEdge]) -> dict[tuple, JoinEdge]:
+    """그룹 키((테이블집합, join_type)) → 대표 JoinEdge. 표시 라벨용 right_table/join_type 확보."""
+    m: dict[tuple, JoinEdge] = {}
+    for e in edges:
+        m.setdefault((_edge_tables(e), e.join_type), e)
+    return m
+
+
+def _join_label(
+    rep: JoinEdge | None, disp: dict[tuple[str, str], str], tables: frozenset[str]
+) -> str:
+    """조인 표시 라벨 — 대표 엣지의 (right_table, join_type)로 표시맵 조회, 없으면 테이블집합 폴백.
+
+    표시맵(`planner.join_display_labels`)은 CTE 경계를 존중해 '실제 조인 쌍'을 담는다. 폴백
+    (패스스루 해소된 ON 테이블집합 나열)은 표시맵에 없을 때(무명 서브쿼리 조인 등)만 쓰인다.
+    """
+    if rep is not None:
+        label = disp.get((rep.right_table, rep.join_type))
+        if label:
+            return label
+    return "↔".join(sorted(t.upper() for t in tables))

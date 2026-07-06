@@ -1,0 +1,307 @@
+"""헤드리스 `claude -p`(구독)로 **의미 비교 판정만** — Python이 변환·ODS정의를 전부 선제공.
+
+개인·로컬 전용. 느림의 원인이던 "Claude의 agentic 정보 탐색(meta3 MCP·파일 hunting)"을 없앤다:
+  1) `compare_semantic`(정적 op↔an 맵)으로 정규화 base diff 생성(빠름·무료)
+  2) 쿼리가 `ods.*` 를 읽으면 그 정의 SQL(`ODS_<T>.sql`)을 파일에서 읽어 선로딩
+  3) base + 원본 SQL + ODS 정의를 프롬프트(stdin)에 임베드해 `claude -p --json-schema` 를
+     **MCP·도구·스킬 없이 단일-샷** 호출 → Claude 는 판정만
+  4) 구조화 출력(`structured_output`) → `SemanticDiff`
+
+인증=구독(자식 env 에서 `ANTHROPIC_API_KEY` 제거 → metered 과금 방지). 프롬프트는 커질 수 있어
+**stdin** 으로 전달(Windows 커맨드라인 길이 제한 회피). 모든 실패는 `SemanticDiff(LIMITED)` 로 반환.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+
+from query_diff.ai_diff.schema import AI_SEMANTIC_DIFF_SCHEMA, AiSemanticDiff
+from query_diff.models import Dialect, SemanticDiff, SemanticVerdict
+from query_diff.semantic_diff import compare_semantic
+
+_DEFAULT_TIMEOUT = 300  # 초 (QD_AI_TIMEOUT 로 재정의)
+_DEFAULT_MODEL = "claude-sonnet-5"
+_ODS_REF_RE = re.compile(r"\bods\.([A-Za-z_]\w*)", re.IGNORECASE)
+_ODS_MAX_FILES = 12
+_ODS_MAX_CHARS = 48000  # ODS 정의 임베드 총량 캡(다단계 ODS→ODS 계보 수용)
+
+
+def _limited(reason: str, error: str = "") -> SemanticDiff:
+    return SemanticDiff(verdict=SemanticVerdict.LIMITED, reason=reason, error=error or reason)
+
+
+def _find_claude() -> str | None:
+    return shutil.which("claude") or shutil.which("claude.cmd")
+
+
+def _compact(base: SemanticDiff) -> dict:
+    """SemanticDiff → AiSemanticDiff 와 동일 형태로 축약(plan_a/b·structure 제거)."""
+    return {
+        "verdict": base.verdict.value,
+        "reason": base.reason,
+        "issues": list(base.issues),
+        "limitations": list(base.limitations),
+        "dimensions": [
+            {
+                "dimension": d.dimension.value,
+                "matched": d.matched,
+                "limited": d.limited,
+                "only_in_a": list(d.only_in_a),
+                "only_in_b": list(d.only_in_b),
+                "shared": list(d.shared),
+                "explanation": d.explanation,
+                "caveat": d.caveat,
+            }
+            for d in base.dimensions
+        ],
+    }
+
+
+def _ods_context(sql_a: str, sql_b: str) -> tuple[dict[str, str], bool]:
+    """두 SQL이 참조하는 ODS 집계 테이블의 정의 SQL 텍스트 수집(재귀·캡).
+
+    `QD_ODS_DIR` 미설정/파일 없음 → ({}, False)(무해). 정의 내부의 추가 `ods.*` 는 재귀로 따라간다
+    (참조 스캔은 **원본 전체**로 하고, 임베드 텍스트만 캡). 반환 2번째 = 길이/개수 캡으로 **잘림 여부**.
+    """
+    try:
+        from query_diff.semantic_diff.ods_lineage import ods_registry
+    except Exception:
+        return {}, False
+    reg = ods_registry()
+    if not reg:
+        return {}, False
+    out: dict[str, str] = {}
+    seen: set[str] = set()
+    frontier = [m.group(1).lower() for s in (sql_a, sql_b) for m in _ODS_REF_RE.finditer(s)]
+    total = 0
+    truncated = False
+    while frontier and len(out) < _ODS_MAX_FILES:
+        name = frontier.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        path = reg.get(name)
+        if not path:
+            continue
+        try:
+            full = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        text = full
+        if total + len(text) > _ODS_MAX_CHARS:
+            text = text[: max(0, _ODS_MAX_CHARS - total)]
+            truncated = True
+        if not text:
+            truncated = True
+            break
+        out[name] = text
+        total += len(text)
+        # 참조 스캔은 원본 전체로 → 임베드가 잘려도 하위 계보는 계속 따라간다
+        frontier += [m.group(1).lower() for m in _ODS_REF_RE.finditer(full)]
+    # 파일수 캡에 걸려 아직 따라갈 ODS 가 남은 경우도 잘림
+    if len(out) >= _ODS_MAX_FILES and any(n not in seen and reg.get(n) for n in frontier):
+        truncated = True
+    return out, truncated
+
+
+def _build_prompt(sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=False) -> str:
+    parts = [
+        "너는 운영계(A)↔분석계(B) SQL 마이그레이션의 **의미 비교 판정자**다. 아래는 파이썬 엔진이 "
+        "op↔an 정적 매핑(meta3 파생)으로 A를 변환한 뒤 낸 base 비교 결과와 원본 쿼리다. "
+        "**외부 조회 없이** 주어진 정보로만 판정하라.\n\n",
+        f"[A dialect] {dia_a}\n[B dialect] {dia_b}\n\n",
+        "[BASE DIFF — 이미 op↔an 정규화됨] (JSON)\n"
+        + json.dumps(compact, ensure_ascii=False, indent=2) + "\n\n",
+        "[A SQL]\n" + sql_a.strip() + "\n\n",
+        "[B SQL]\n" + sql_b.strip() + "\n\n",
+    ]
+    if ods_defs:
+        chain = " → ".join(ods_defs.keys())
+        parts.append(f"[ODS 정의 SQL — B가 읽는 ods.* 집계 테이블의 적재 정의. 계보(의존순): {chain}]\n")
+        parts.append("각 단계는 또 다른 ods.* 를 읽을 수 있으니(다단계 집계) 아래 정의를 끝까지 따라가 "
+                     "**최종 운영계 원천과 각 단계의 적재 필터·집계 단위(GROUP BY)** 를 확인하라.\n")
+        if ods_truncated:
+            parts.append("(주의: 일부 하위 ODS 정의가 길이 제한으로 축약됨 — 축약분은 적재 필터·집계 "
+                         "단위 위주로 판단하고, 불확실하면 caveat로 '확인 필요' 표기.)\n")
+        for name, text in ods_defs.items():
+            parts.append(f"-- ODS: {name}\n{text.strip()}\n\n")
+    parts.append(
+        "[판정 지침]\n"
+        "- 각 차원의 차이가 **실제로 결과 데이터를 바꾸는지** 판단하라(무해한 LEFT 조인·동치 술어·표기차는 매칭).\n"
+        "- base 는 이미 정규화됐으니 `only_in_*` 는 대개 실제 차이다. 이름만 다른 잔여 매핑이 명백하면 매칭 "
+        "처리하되, 확신 없으면 그 차원 `caveat` 에 '확인 필요'로 남겨라(근거 없는 추측 금지).\n"
+        "- **ODS**: 위 정의 SQL로, B가 읽는 ods.* 집계본이 A의 원천 집계와 **세는 단위(GROUP BY 기준)** 가 "
+        "같은지 판정하라. 다르면 값이 달라질 수 있으니 해당 차원(대개 BASE_TABLES/AGGREGATES)의 `caveat` 에 "
+        "'집계 단위 차이 — 대사 필요'를 남겨라.\n"
+        "- verdict: 모든 차원이 실질 동치면 EQUIVALENT, 실차이가 있으면 DIVERGENT, 판단 불가한 구문 제약이 "
+        "크면 LIMITED.\n"
+        "- 반드시 **AiSemanticDiff 구조화 출력(JSON)** 으로만 답하라. 설명·마크다운 코드블록 없이 "
+        "**오직 JSON 객체 하나만** 출력하라."
+    )
+    return "".join(parts)
+
+
+def _build_argv(claude_path: str, schema_json: str) -> list[str]:
+    argv = [
+        claude_path, "-p",
+        "--output-format", "json",
+        "--json-schema", schema_json,
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',  # MCP 끔
+        "--model", os.environ.get("QD_AI_MODEL", _DEFAULT_MODEL),
+        # 판정만 하면 되는데 기본 adaptive thinking 이 런어웨이(수분+ 사고)로 타임아웃 유발 →
+        # effort 를 낮춰 바로 출력하게 한다(QD_AI_EFFORT 로 재정의).
+        "--effort", os.environ.get("QD_AI_EFFORT", "low"),
+    ]
+    if os.name == "nt" and claude_path.lower().endswith((".cmd", ".bat")):
+        argv = ["cmd", "/c", *argv]
+    return argv
+
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
+
+
+def _parse_json_loose(text: str) -> dict | None:
+    """모델 텍스트에서 JSON 객체를 견고하게 추출: ①직접 → ②```펜스 → ③첫 균형 {…}(문자열 인지)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:  # ① 직접
+        o = json.loads(text)
+        if isinstance(o, dict):
+            return o
+    except json.JSONDecodeError:
+        pass
+    m = _JSON_FENCE_RE.search(text)  # ② 코드펜스 안
+    if m:
+        try:
+            o = json.loads(m.group(1))
+            if isinstance(o, dict):
+                return o
+        except json.JSONDecodeError:
+            pass
+    start = text.find("{")  # ③ 첫 균형 {…} 블록
+    if start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        o = json.loads(text[start : i + 1])
+                        if isinstance(o, dict):
+                            return o
+                    except json.JSONDecodeError:
+                        pass
+                    break
+    return None
+
+
+def _extract_structured(envelope: dict) -> dict | None:
+    so = envelope.get("structured_output")
+    if isinstance(so, dict):
+        return so
+    result = envelope.get("result")
+    if isinstance(result, str):
+        return _parse_json_loose(result)
+    return None
+
+
+async def compare_via_cli(
+    sql_a: str,
+    dialect_a: Dialect,
+    sql_b: str,
+    dialect_b: Dialect,
+    op_an=None,
+) -> SemanticDiff:
+    claude_path = _find_claude()
+    if not claude_path:
+        return _limited("AI 비교 사용 불가 — claude CLI 미설치(또는 PATH에 없음)")
+
+    # 1) Python 변환+diff (동기, 빠름·무료)
+    try:
+        base = compare_semantic(sql_a, dialect_a, sql_b, dialect_b, op_an=op_an)
+    except Exception as e:
+        return _limited("base 비교(파이썬) 실패", str(e))
+
+    compact = _compact(base)
+    ods_defs, ods_truncated = _ods_context(sql_a, sql_b)
+    prompt = _build_prompt(
+        sql_a, sql_b, dialect_a.value, dialect_b.value, compact, ods_defs, ods_truncated
+    )
+    schema_json = json.dumps(AI_SEMANTIC_DIFF_SCHEMA, ensure_ascii=False)
+    argv = _build_argv(claude_path, schema_json)
+
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)  # 구독 강제
+
+    cwd = tempfile.mkdtemp(prefix="qd_ai_")  # 중립 cwd(프로젝트 스킬/CLAUDE.md 미로드 → 시작 비용↓)
+    timeout_s = int(os.environ.get("QD_AI_TIMEOUT", str(_DEFAULT_TIMEOUT)))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode("utf-8")), timeout=timeout_s
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return _limited("AI 비교 시간 초과", f"{timeout_s}s 초과")
+
+        if proc.returncode != 0:
+            err = (stderr_b or b"").decode("utf-8", "replace")[:500]
+            return _limited("claude -p 실행 실패", f"exit={proc.returncode} {err}")
+
+        stdout = (stdout_b or b"").decode("utf-8", "replace")
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            return _limited("AI 비교 출력 파싱 실패", f"{e}: {stdout[:300]}")
+        if not isinstance(envelope, dict):
+            return _limited("AI 비교 출력 형식 오류", str(type(envelope)))
+
+        structured = _extract_structured(envelope)
+        if structured is None:
+            snippet = str(envelope.get("result", ""))[:300]
+            return _limited(
+                "AI 비교가 구조화 결과를 반환하지 못했습니다.",
+                f"is_error={envelope.get('is_error')} stop={envelope.get('stop_reason')} "
+                f"result={snippet}",
+            )
+        return AiSemanticDiff.model_validate(structured).to_semantic_diff()
+    except Exception as e:
+        return _limited("AI 비교 중 예기치 못한 오류가 발생했습니다.", str(e))
+    finally:
+        try:
+            os.rmdir(cwd)
+        except OSError:
+            pass

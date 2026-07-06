@@ -37,6 +37,8 @@ from query_diff.semantic_diff.optimizer import _detect_limitations, normalize_qu
 from query_diff.semantic_diff.planner import (
     POSITIONAL_AGG_MARK,
     build_logical_plan,
+    join_display_labels,
+    projection_aliases,
     recover_column_qualifiers,
     resolve_derived_passthrough,
 )
@@ -50,13 +52,16 @@ from query_diff.semantic_diff.plan_compare import (
     _year_month_detail,
     _diff_sets,
     _diff_sets_by_column,
+    _edge_reps,
     _group_edges,
-    _lookup_raw_on,
+    _join_label,
+    cte_col_resolution,
+    _raw_on_for,
     _orig_text,
+    _pred_display_list,
     _RawSrc,
     _raw_group_map,
     _raw_on_map,
-    _raw_predicate_map,
     _raw_select_map,
     _ref_cols,
     _upper_disp,
@@ -117,12 +122,8 @@ def _compare_base_tables(
             else f"읽는 테이블 {len(sh)}개 모두 동일 — {', '.join(_upper_disp(t) for t in sh)}"
         )
     else:
-        parts = []
-        if oa:
-            parts.append(f"A에만 있는 테이블: {', '.join(oa)}")
-        if ob:
-            parts.append(f"B에만 있는 테이블: {', '.join(ob)}")
-        expl = _diff_lines("읽는 기본 테이블이 다릅니다", parts)
+        # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인만.
+        expl = "읽는 기본 테이블이 다릅니다"
     return DimensionResult(
         dimension=DimensionName.BASE_TABLES,
         matched=matched,
@@ -141,14 +142,21 @@ def _compare_join_graph(
     rename: dict[str, str] | None = None,
     raw_on_a: dict[str, str] | None = None,
     raw_on_b: dict[str, str] | None = None,
+    disp_a: dict[tuple[str, str], str] | None = None,
+    disp_b: dict[tuple[str, str], str] | None = None,
 ) -> DimensionResult:
     """조인을 (ON 참조 테이블집합, 조인타입) 으로 페어링하고 ON 술어 단위로 비교.
 
+    페어링은 앵커-무관 테이블집합(패스스루 해소)으로 하되, 표시 **라벨**은 CTE 경계를 존중하는
+    '실제 조인 쌍'(`disp_a`/`disp_b`, `planner.join_display_labels`)으로 보여준다 — 없으면 폴백.
     차이는 **원본 쿼리에서 찾을 수 있는 앵커**(테이블·컬럼 영문 + 해당 조인 ON 절 원문)로 표기.
     """
     ga, gb = _group_edges(a.join_edges), _group_edges(b.join_edges)
+    ea, eb = _edge_reps(a.join_edges), _edge_reps(b.join_edges)
     raw_on_a = raw_on_a or {}
     raw_on_b = raw_on_b or {}
+    disp_a = disp_a or {}
+    disp_b = disp_b or {}
 
     only_a: list[str] = []
     only_b: list[str] = []
@@ -157,21 +165,23 @@ def _compare_join_graph(
 
     for key in sorted(set(ga) | set(gb), key=lambda k: (sorted(k[0]), k[1])):
         tables, jtype = key
-        label = "↔".join(sorted(t.upper() for t in tables))
+        rep_a, rep_b = ea.get(key), eb.get(key)
         pa = ga.get(key)
         pb = gb.get(key)
         if pa is None:
-            raw = _lookup_raw_on(raw_on_b, tables)
+            label = _join_label(rep_b, disp_b, tables)
+            raw = _raw_on_for(raw_on_b, rep_b, tables)
             only_b.append(
-                f"`{label}` 조인이 B 쿼리에만 있습니다"
-                + (f" (B 원본 ON: {raw})" if raw else "")
+                f"{label} 조인이 B 쿼리에만 있습니다"
+                + (f"\nB 원본 ON: {raw}" if raw else "")
             )
             continue
         if pb is None:
-            raw = _lookup_raw_on(raw_on_a, tables)
+            label = _join_label(rep_a, disp_a, tables)
+            raw = _raw_on_for(raw_on_a, rep_a, tables)
             only_a.append(
-                f"`{label}` 조인이 A 쿼리에만 있습니다"
-                + (f" (A 원본 ON: {raw})" if raw else "")
+                f"{label} 조인이 A 쿼리에만 있습니다"
+                + (f"\nA 원본 ON: {raw}" if raw else "")
             )
             continue
         # 같은 테이블쌍·타입 — ON 술어 차이만 비교
@@ -184,18 +194,20 @@ def _compare_join_graph(
             shared_cnt += 1
             continue
         if dpa:
-            raw = _lookup_raw_on(raw_on_a, tables)
+            label = _join_label(rep_a, disp_a, tables)
+            raw = _raw_on_for(raw_on_a, rep_a, tables)
             only_a.append(
-                f"`{label}` 조인 — A 쿼리에만 추가 조인 조건. 확인할 컬럼: "
+                f"{label} 조인 — A 쿼리에만 추가 조인 조건. 확인할 컬럼: "
                 f"{', '.join(_ref_cols(dpa)) or '(상수 조건)'}"
-                + (f" (A 원본 ON: {raw})" if raw else "")
+                + (f"\nA 원본 ON: {raw}" if raw else "")
             )
         if dpb:
-            raw = _lookup_raw_on(raw_on_b, tables)
+            label = _join_label(rep_b, disp_b, tables)
+            raw = _raw_on_for(raw_on_b, rep_b, tables)
             only_b.append(
-                f"`{label}` 조인 — B 쿼리에만 추가 조인 조건. 확인할 컬럼: "
+                f"{label} 조인 — B 쿼리에만 추가 조인 조건. 확인할 컬럼: "
                 f"{', '.join(_ref_cols(dpb)) or '(상수 조건)'}"
-                + (f" (B 원본 ON: {raw})" if raw else "")
+                + (f"\nB 원본 ON: {raw}" if raw else "")
             )
 
     # 원문(원본 ON·확인 컬럼) 대문자 통일 — 라벨은 위에서 이미 대문자, ON/컬럼은 따옴표 밖만 대문자.
@@ -212,10 +224,8 @@ def _compare_join_graph(
             else "양쪽 모두 조인 없음"
         )
     else:
-        expl = _diff_lines(
-            "테이블 연결 방식(JOIN)이 다릅니다" + param_note,
-            only_a + only_b,
-        )
+        # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인만.
+        expl = "테이블 연결 방식(JOIN)이 다릅니다" + param_note
     return DimensionResult(
         dimension=DimensionName.JOIN_GRAPH,
         matched=matched,
@@ -230,18 +240,15 @@ def _compare_predicates(
     a: LogicalPlan,
     b: LogicalPlan,
     rename: dict[str, str] | None = None,
-    raw_pred_a: _RawSrc | None = None,
-    raw_pred_b: _RawSrc | None = None,
 ) -> DimensionResult:
     matched, oa, ob, sh = _diff_sets(a.all_predicates, b.all_predicates)
     oa, ob, param = _absorb_parameterized(oa, ob)
     oa, ob, _qnoise = _absorb_qualifier_noise(oa, ob)   # 한정자만 다른 동일 술어(노이즈) 흡수
     oa, ob, date_range = _absorb_date_range(oa, ob)     # 원시↔일추출 날짜범위(제한적) 흡수
-    oa = _da(oa, rename)
     matched = not oa and not ob
-    # 차이 술어는 **원문 그대로·대문자 통일**(원본 별칭·연산자·값) 노출 — 쿼리에서 바로 찾게.
-    disp_a = _orig_text(oa, raw_pred_a)
-    disp_b = _orig_text(ob, raw_pred_b)
+    # 표시: 원문 WHERE/HAVING **절 순서** + **자연문법(컬럼 op 값·!=)** + 해소명(A측 운영명 역변환).
+    disp_a = _pred_display_list(oa, a, rename)
+    disp_b = _pred_display_list(ob, b)
     param_note = (
         f" · 값만 다른 항목(날짜·코드 등) {len(param)}개는 비교 제외" if param else ""
     )
@@ -254,15 +261,11 @@ def _compare_predicates(
         if date_range:
             expl += " · 날짜 범위(원시↔일추출) 동치 간주(제한적)"
     else:
-        parts = []
-        if disp_a:
-            parts.append(f"A 쿼리에만: {', '.join(_ref_cols(disp_a)) or ', '.join(disp_a)}")
-        if disp_b:
-            parts.append(f"B 쿼리에만: {', '.join(_ref_cols(disp_b)) or ', '.join(disp_b)}")
+        # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
             "조회 조건(WHERE/HAVING)이 다릅니다" + param_note,
-            parts,
-            "해당 쿼리 WHERE 절에서 위 조건을 확인하세요",
+            [],
+            "해당 쿼리 WHERE 절에서 하기 조건을 확인하세요",
         )
     return DimensionResult(
         dimension=DimensionName.PREDICATES,
@@ -308,15 +311,21 @@ def _compare_group_keys(
     op_an: OpAnMap | None = None,
     raw_group_a: _RawSrc | None = None,
     raw_group_b: _RawSrc | None = None,
+    proj_alias_a: dict[str, str] | None = None,
+    proj_alias_b: dict[str, str] | None = None,
 ) -> DimensionResult:
     matched, oa, ob, sh = _diff_sets_by_column(a.group_keys, b.group_keys)
+    # canonical 폴백(원문 raw 미매칭, 예: CTE 인라인 CASE) 표시에 `AS 별칭` 부착 — group-by 가
+    # 참조하는 최외곽 SELECT 출력 별칭 재사용. A는 oa 역번역과 동일하게 별칭 맵 키도 역번역.
+    pa = proj_alias_a or {}
+    alias_a = {_da([c], rename)[0]: al for c, al in pa.items()} if rename else pa
     oa = _da(oa, rename)
     # 연-월 관용구로 일치한 경우: 타입 확정이면 동일(✓), 아니면 제한적 판정.
     ym_present, ym_reliable = _ym_status(sh, op_an)
     ym_soft = ym_present and not ym_reliable
     # 표시는 **원문 GROUP BY 식 그대로**(내부 토큰 ⟨YM:⟩ 미노출, 대문자 통일).
-    disp_a = _orig_text(oa, raw_group_a)
-    disp_b = _orig_text(ob, raw_group_b)
+    disp_a = _orig_text(oa, raw_group_a, alias_a)
+    disp_b = _orig_text(ob, raw_group_b, proj_alias_b or {})
     if matched:
         expl = (
             f"묶음 기준(GROUP BY) {len(sh)}개 모두 동일"
@@ -326,15 +335,11 @@ def _compare_group_keys(
         if ym_present and ym_reliable:
             expl += " · 날짜 추출 관용구 인식(타입 검증)"
     else:
-        parts = []
-        if disp_a:
-            parts.append(f"A 쿼리에만: {', '.join(_ref_cols(disp_a)) or ', '.join(disp_a)}")
-        if disp_b:
-            parts.append(f"B 쿼리에만: {', '.join(_ref_cols(disp_b)) or ', '.join(disp_b)}")
+        # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
             "묶음 기준(GROUP BY)이 다릅니다",
-            parts,
-            "해당 쿼리 GROUP BY 절에서 위 조건을 확인하세요. 한쪽만 묶으면 합계 단위가 달라집니다",
+            [],
+            "해당 쿼리 GROUP BY 절에서 하기 조건을 확인하세요. 한쪽만 묶으면 합계 단위가 달라집니다",
         )
     # 제한적 판정 캐비엣은 **실제 GROUP BY 추출식·정확한 입도**로 동적 생성(하드코딩 아님).
     caveat = (
@@ -386,15 +391,11 @@ def _compare_aggregates(
     if matched:
         expl = f"집계식 {len(sh)}개 모두 동일" if sh else "양쪽 모두 집계 없음"
     else:
-        parts = []
-        if disp_a:
-            parts.append(f"A 쿼리: {', '.join(disp_a)}")
-        if disp_b:
-            parts.append(f"B 쿼리: {', '.join(disp_b)}")
+        # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
             "계산식(SELECT 집계)이 다릅니다",
-            parts,
-            "각 쿼리 SELECT 절에서 위 집계식을 확인하세요",
+            [],
+            "각 쿼리 SELECT 절에서 하기 집계식을 확인하세요",
         )
     return DimensionResult(
         dimension=DimensionName.AGGREGATES,
@@ -416,28 +417,30 @@ def _compare_projections(
     op_an: OpAnMap | None = None,
     raw_select_a: _RawSrc | None = None,
     raw_select_b: _RawSrc | None = None,
+    proj_alias_a: dict[str, str] | None = None,
+    proj_alias_b: dict[str, str] | None = None,
 ) -> DimensionResult:
     matched, oa, ob, sh = _diff_sets_by_column(a.projections, b.projections)
+    # canonical 폴백(원문 raw 미매칭, 예: CTE 인라인 CASE) 표시에 `AS 별칭` 부착.
+    # A는 oa 를 역번역하므로 별칭 맵 키도 동일 역번역해 정합시킨다(B는 역번역 없음).
+    pa = proj_alias_a or {}
+    alias_a = {_da([c], rename)[0]: al for c, al in pa.items()} if rename else pa
     oa = _da(oa, rename)
     ym_present, ym_reliable = _ym_status(sh, op_an)
     ym_soft = ym_present and not ym_reliable
     # 표시는 **원문 SELECT 식 그대로**(내부 토큰·정규화 CASE 미노출, 대문자 통일).
-    disp_a = _orig_text(oa, raw_select_a)
-    disp_b = _orig_text(ob, raw_select_b)
+    disp_a = _orig_text(oa, raw_select_a, alias_a)
+    disp_b = _orig_text(ob, raw_select_b, proj_alias_b or {})
     if matched:
         expl = "출력 컬럼(SELECT) 모두 동일"
         if ym_present and ym_reliable:
             expl += " · 날짜 추출 관용구 인식(타입 검증)"
     else:
-        parts = []
-        if disp_a:
-            parts.append(f"A 쿼리에만: {', '.join(_ref_cols(disp_a)) or ', '.join(disp_a)}")
-        if disp_b:
-            parts.append(f"B 쿼리에만: {', '.join(_ref_cols(disp_b)) or ', '.join(disp_b)}")
+        # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
             "출력(SELECT) 컬럼이 다릅니다",
-            parts,
-            "해당 쿼리 SELECT 절에서 위 출력을 확인하세요",
+            [],
+            "해당 쿼리 SELECT 절에서 하기 출력을 확인하세요",
         )
     caveat = (
         _year_month_detail(sh, [raw_select_a], [raw_select_b], rename)[0]
@@ -455,28 +458,16 @@ def _compare_projections(
     )
 
 
-# 차원 → 사람이 읽는 짧은 라벨(문제 총합 롤업용)
+# 차원 → 사람이 읽는 짧은 라벨(문제 요약 롤업용).
+# **프런트 `static/index.html` 의 DIM_LABEL 과 동기 유지** — 좌측 요약과 우측 차원별 비교 카드 라벨 일치.
 _DIM_LABEL: dict[DimensionName, str] = {
     DimensionName.BASE_TABLES: "읽는 테이블",
-    DimensionName.JOIN_GRAPH: "테이블 연결(JOIN)",
-    DimensionName.PREDICATES: "조회 조건(WHERE·HAVING)",
-    DimensionName.GROUP_KEYS: "묶음 기준(GROUP BY)",
+    DimensionName.JOIN_GRAPH: "조인 그래프",
+    DimensionName.PREDICATES: "필터 조건 (WHERE/HAVING)",
+    DimensionName.GROUP_KEYS: "GROUP BY 키",
     DimensionName.AGGREGATES: "집계식",
-    DimensionName.PROJECTIONS: "출력 컬럼(SELECT)",
+    DimensionName.PROJECTIONS: "비집계 출력",
 }
-
-
-def _issue_diff(d: DimensionResult) -> str:
-    """불일치 차원의 짧은 요약(A에만/B에만 핵심 — 상세는 차원별 비교에)."""
-    def _cap(items: list[str]) -> str:
-        head = ", ".join(items[:3])
-        return head + (" …" if len(items) > 3 else "")
-    parts = []
-    if d.only_in_a:
-        parts.append("A에만 " + _cap(d.only_in_a))
-    if d.only_in_b:
-        parts.append("B에만 " + _cap(d.only_in_b))
-    return " / ".join(parts) if parts else "다름"
 
 
 def _short_limitation(lim: str) -> str:
@@ -495,7 +486,8 @@ def _decide_verdict(
     # 전 차원 문제 총합(verdict 무관하게 모두 수집) — ✗ 차이 / ⚠ 제한·주의
     issues: list[str] = []
     for d in unmatched_core:
-        issues.append(f"✗ {_DIM_LABEL.get(d.dimension, d.dimension.value)}: {_issue_diff(d)}")
+        headline = (d.explanation or "").splitlines()[0] or "다릅니다"
+        issues.append(f"✗ {_DIM_LABEL.get(d.dimension, d.dimension.value)}: {headline}")
     for d in limited_dims:
         detail = (d.caveat or d.explanation).splitlines()[0] if (d.caveat or d.explanation) else "확인 권장"
         issues.append(f"⚠ {_DIM_LABEL.get(d.dimension, d.dimension.value)} 제한적 판정 — {detail}")
@@ -584,10 +576,14 @@ def compare_semantic(
 
     # 번역/해소 전 원본 ON·WHERE/HAVING 텍스트 확보(사용자가 원본 쿼리에서 찾을 수 있게)
     raw_on_a = _raw_on_map(tree_a)
+    # 조인 표시 라벨(CTE 경계 존중, '실제 조인 쌍') — 패스스루/번역 전 원본 트리에서 계산
+    disp_a = join_display_labels(tree_a)
     # 차이 표시는 **원본 소스 리터럴**에서 추출(재렌더 정규화 회피) — 트리 아닌 원본 SQL 사용.
-    raw_pred_a = _raw_predicate_map(sql_a, da)
-    raw_group_a = _raw_group_map(sql_a, da)
-    raw_select_a = _raw_select_map(sql_a, da)
+    # (술어는 plan 의 pred_display/pred_order 로 표시하므로 raw predicate map 은 쓰지 않는다.)
+    # A는 CTE 출력 컬럼(예: DAY=IT.APPROVAL_DATE)을 원천 컬럼으로 해소해 표시(원문 SUBSTR 등 구조 유지).
+    resolve_a = cte_col_resolution(sql_a, da)
+    raw_group_a = _raw_group_map(sql_a, da, resolve_a)
+    raw_select_a = _raw_select_map(sql_a, da, resolve_a)
 
     # 순서: 파생 테이블(CTE+서브쿼리) 통과 해소 → 단일 테이블 스코프 미한정 컬럼 한정 → 번역.
     # pass-through 가 `c.player_id` 를 원본 운영명 그대로 `recharge_deposit.player_id` 로
@@ -599,7 +595,7 @@ def compare_semantic(
         tree_a, rename_a = translate_op_to_an(tree_a, op_an)
 
     raw_on_b = _raw_on_map(tree_b)
-    raw_pred_b = _raw_predicate_map(sql_b, db)
+    disp_b = join_display_labels(tree_b)
     raw_group_b = _raw_group_map(sql_b, db)
     raw_select_b = _raw_select_map(sql_b, db)
     tree_b = recover_column_qualifiers(resolve_derived_passthrough(tree_b))
@@ -607,14 +603,24 @@ def compare_semantic(
     plan_a = build_logical_plan(tree_a, lim_a)
     plan_b = build_logical_plan(tree_b, lim_b)
 
+    # 최외곽 SELECT 출력 별칭(canonical→별칭) — projection canonical 폴백 표시에 `AS 별칭` 부착용.
+    proj_alias_a = projection_aliases(tree_a)
+    proj_alias_b = projection_aliases(tree_b)
+
     # 비교는 분석명 기준, A측 표시(only_in_a·explanation의 A부분)만 원본 운영명으로 역변환.
     dims = [
         _compare_base_tables(plan_a, plan_b, rename_a),
-        _compare_join_graph(plan_a, plan_b, rename_a, raw_on_a, raw_on_b),
-        _compare_predicates(plan_a, plan_b, rename_a, raw_pred_a, raw_pred_b),
-        _compare_group_keys(plan_a, plan_b, rename_a, op_an, raw_group_a, raw_group_b),
+        _compare_join_graph(plan_a, plan_b, rename_a, raw_on_a, raw_on_b, disp_a, disp_b),
+        _compare_predicates(plan_a, plan_b, rename_a),
+        _compare_group_keys(
+            plan_a, plan_b, rename_a, op_an, raw_group_a, raw_group_b,
+            proj_alias_a, proj_alias_b,
+        ),
         _compare_aggregates(plan_a, plan_b, rename_a, raw_select_a, raw_select_b),
-        _compare_projections(plan_a, plan_b, rename_a, op_an, raw_select_a, raw_select_b),
+        _compare_projections(
+            plan_a, plan_b, rename_a, op_an, raw_select_a, raw_select_b,
+            proj_alias_a, proj_alias_b,
+        ),
     ]
 
     # 디코릴레이션이면 JOIN_GRAPH 를 제한적 판정으로 표기(상관 서브쿼리↔LEFT JOIN 동치 간주).

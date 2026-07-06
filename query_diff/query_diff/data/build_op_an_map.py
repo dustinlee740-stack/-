@@ -5,7 +5,7 @@ migration_dashboard 의 두 로컬 CSV 를 병합해 비교 엔진이 읽을 `op
 - an_schema.csv  : 운영(op)→분석(an) 컬럼 리네임 매핑 + 변환식(source_expr).
                    meta3.table_col_mapping 의 로컬 등가물(검증 보고서에서 일치 확인).
 - op_schema.csv  : 운영 물리 카탈로그(컴포넌트/테이블/컬럼). identity 판정용
-                   (= meta3.v_oltp_table_columns 의 로컬 등가물).
+                   (= meta3.v_oltp_tbl_col_info 의 로컬 등가물).
 
 산출물 `op_an_map.json` 구조:
   {
@@ -86,7 +86,7 @@ def _load_from_meta3(dsn: str) -> tuple[dict[str, str], dict[str, list[str]]]:
             if ot and oc and tc:
                 grp[(ot, oc)].add(tc)
         cur.execute(
-            "SELECT upper(tbl_id), upper(col_id) FROM meta3.v_oltp_table_columns "
+            "SELECT upper(tbl_id), upper(col_id) FROM meta3.v_oltp_tbl_col_info "
             "WHERE tbl_id<>'' AND col_id<>''"
         )
         for t, c in cur.fetchall():

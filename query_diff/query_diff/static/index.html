@@ -237,6 +237,7 @@
 <div class="bottom-bar">
   <button class="btn" id="btnValidate">검증</button>
   <button class="btn btn-primary" id="btnExecute" disabled>비교 실행 →</button>
+  <button class="btn" id="btnExecuteAI" disabled title="Claude+MCP로 비교 (meta3/hue 활용, 수십 초 소요)">🤖 AI로 비교</button>
 </div>
 
 <!-- 검증 결과 모달 -->
@@ -334,6 +335,7 @@ function formatNumber(n) {
 // 쿼리 소스가 바뀌면 [비교 실행]을 잠그고 재검증을 유도(이전 검증 결과로 실행되는 stale 방지).
 function invalidateValidation(panel) {
   document.getElementById('btnExecute').disabled = true;
+  document.getElementById('btnExecuteAI').disabled = true;
   const s = panel?.querySelector('.validation-status');
   if (s) s.innerHTML = `<span class="status-suggestion">🔄 변경됨 — [검증]을 다시 눌러주세요</span>`;
 }
@@ -520,6 +522,7 @@ function showValidationResult(data) {
   results.innerHTML = html;
   ignoreBtn.style.display = allValid ? 'none' : '';
   document.getElementById('btnExecute').disabled = !allValid;
+  document.getElementById('btnExecuteAI').disabled = !allValid;
   modal.classList.remove('hidden');
 }
 
@@ -528,6 +531,7 @@ document.getElementById('btnCloseModal').addEventListener('click', () => {
 });
 document.getElementById('btnIgnoreError').addEventListener('click', () => {
   document.getElementById('btnExecute').disabled = false;
+  document.getElementById('btnExecuteAI').disabled = false;
   document.getElementById('validateModal').classList.add('hidden');
 });
 
@@ -546,6 +550,34 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
   } else {
     const err = await res.json();
     showToast('실행 실패: ' + (err.detail || '알 수 없는 오류'));
+  }
+});
+
+// --- AI 비교 실행 (개인·로컬: claude -p 구독 경로) ---
+document.getElementById('btnExecuteAI').addEventListener('click', async () => {
+  if (!comparisonId) { showToast('먼저 검증을 실행해주세요.', { kind: 'info' }); return; }
+  const btn = document.getElementById('btnExecuteAI');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '🤖 AI 비교 중… (수십 초)';
+  try {
+    const res = await fetch(`${API}/api/comparisons/${comparisonId}/execute-ai`, { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      showComparisonResult(data);
+    } else if (res.status === 404) {
+      comparisonId = null;
+      document.getElementById('btnExecute').disabled = true;
+      showToast('서버 세션이 만료되었습니다. "검증" 버튼을 다시 눌러주세요.', { kind: 'info' });
+    } else {
+      const err = await res.json();
+      showToast('AI 비교 실패: ' + (err.detail || '알 수 없는 오류'));
+    }
+  } catch (e) {
+    showToast('AI 비교 요청 실패: ' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
   }
 });
 
@@ -704,8 +736,8 @@ function renderSemanticInto(body, sem) {
         ` : ''}
         ${(d.only_in_a?.length || d.only_in_b?.length) ? `
           <div style="display:grid;grid-template-columns:60px 1fr;gap:6px;font-family:monospace;font-size:11px;margin-top:8px;">
-            ${d.only_in_a?.length ? `<div style="color:#80a0c0;">A만:</div><div style="color:#c0d0e0;">${d.only_in_a.map(escapeHtml).join(', ')}</div>` : ''}
-            ${d.only_in_b?.length ? `<div style="color:#c0a080;">B만:</div><div style="color:#e0d0c0;">${d.only_in_b.map(escapeHtml).join(', ')}</div>` : ''}
+            ${d.only_in_a?.length ? `<div style="color:#80a0c0;">A만:</div><div style="color:#c0d0e0;white-space:pre-line;">${d.only_in_a.map(escapeHtml).join('\n')}</div>` : ''}
+            ${d.only_in_b?.length ? `<div style="color:#c0a080;">B만:</div><div style="color:#e0d0c0;white-space:pre-line;">${d.only_in_b.map(escapeHtml).join('\n')}</div>` : ''}
           </div>
         ` : ''}
       </div>`;
