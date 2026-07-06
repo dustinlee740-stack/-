@@ -100,6 +100,27 @@ def test_join_pairing_still_holds_across_cte_and_flat():
     assert len(jg.only_in_b) == 1, jg.only_in_b
 
 
+def test_join_on_qualifier_noise_absorbed():
+    """조인 ON 부가조건이 한정자만 다른 동일 null-체크일 때(qualify 폴백 노이즈) 흡수되어 매칭.
+
+    회귀: `cdm.card_apply_no IS NOT NULL`(A, 한정) vs `card_apply_no IS NOT NULL`(B, 비한정)는
+    NULL≡'' 흡수(_canonical_expr) 후에도 피연산자 한정자만 달라 남던 것 — WHERE(_compare_predicates)
+    와 대칭으로 _compare_join_graph 에도 _absorb_qualifier_noise 를 적용해 동치로 처리한다.
+    """
+    from query_diff.models import JoinEdge, LogicalPlan
+    from query_diff.semantic_diff.analyzer import _compare_join_graph
+
+    equi = "ci.card_apply_no = cdm.card_apply_no"
+    a = LogicalPlan(join_edges=[JoinEdge(
+        left_table="cdm", right_table="ci", join_type="LEFT",
+        on_predicates=[equi, "cdm.card_apply_no IS NOT NULL"])])
+    b = LogicalPlan(join_edges=[JoinEdge(
+        left_table="cdm", right_table="ci", join_type="LEFT",
+        on_predicates=[equi, "card_apply_no IS NOT NULL"])])
+    jg = _compare_join_graph(a, b)
+    assert jg.matched, (jg.only_in_a, jg.only_in_b)
+
+
 def test_both_sides_expose_raw_on():
     """A뿐 아니라 B 전용 조인도 원본 ON 절을 노출한다.
 

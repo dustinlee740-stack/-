@@ -189,6 +189,10 @@ def _compare_join_graph(
         dpb = sorted(pb - pa)
         dpa, dpb, param = _absorb_parameterized(dpa, dpb)
         param_cnt += len(param)
+        # 한정자만 다른 동일 ON 술어(예: `cdm.card_apply_no IS NOT NULL` ↔ 비한정 `card_apply_no
+        # IS NOT NULL`) 흡수 — qualify 폴백 시 A·B 컬럼 한정 상태가 어긋나는 노이즈. WHERE(_compare_
+        # predicates)와 대칭. NULL≡'' 흡수는 이미 _canonical_expr 단계서 끝났고, 남는 한정자차만 제거.
+        dpa, dpb, _qn = _absorb_qualifier_noise(dpa, dpb)
         dpa = _da(dpa, rename)
         if not dpa and not dpb:
             shared_cnt += 1
