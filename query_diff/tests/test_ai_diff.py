@@ -229,6 +229,33 @@ def test_structured_output_schema_is_compliant():
     check(AI_SEMANTIC_DIFF_SCHEMA)
 
 
+def test_build_prompt_has_decision_rubric():
+    """루브릭 회귀 가드: verdict 결정 규칙 문구가 프롬프트에 있어야(실행 간 변동 축소).
+
+    데이터-의존 위험(INNER JOIN 행 누락·nvl NULL→0 등)은 항상 LIMITED 로, 확정 실차이만
+    DIVERGENT 로 가는 상호배타 규칙 + 차원 귀속 규칙이 프롬프트에 명문화됐는지 확인한다.
+    """
+    from query_diff.ai_diff.cli_runner import _build_prompt
+
+    compact = {
+        "verdict": "DIVERGENT", "reason": "", "issues": [], "limitations": [], "dimensions": [],
+    }
+    prompt = _build_prompt("SELECT 1", "SELECT 1", "oracle", "hive", compact, {}, False)
+    # 상호배타 결정 규칙의 핵심 문구
+    assert "상호배타" in prompt
+    assert "데이터-의존 위험" in prompt
+    assert "확정 실차이" in prompt
+    # 데이터-의존 위험은 LIMITED (DIVERGENT 아님)
+    assert "DIVERGENT 아님" in prompt
+    # 차원 귀속 규칙(⚠/✓ 셔플 제거) — 위험은 BASE_TABLES, JOIN_GRAPH 는 최상위 조인만
+    assert "BASE_TABLES" in prompt
+    assert "JOIN_GRAPH" in prompt
+    # 2라운드: 차원 matched(✓) vs 제한(⚠) 플래그 값 자체를 규칙으로 고정
+    assert "자기 차원" in prompt          # 자기 차원 위험이 있을 때만 limited=true
+    assert "PROJECTIONS" in prompt        # nvl → PROJECTIONS 항상 ⚠
+    assert "limited=true" in prompt
+
+
 def _setup_ready(sql_a, sql_b):
     cid = client.post("/api/comparisons").json()["id"]
     client.put(f"/api/comparisons/{cid}/query-a", json={"sql_raw": sql_a, "dialect": "oracle"})
