@@ -262,6 +262,32 @@ def test_build_prompt_has_decision_rubric():
     assert "재판정" in prompt             # base 매칭을 원본 SQL 로 재판정 금지
 
 
+def test_build_prompt_gates_ods_rules_on_ods_defs():
+    """ODS 전용 '고정 결과'(BASE_TABLES 조인 매칭률·증분 → ⚠)는 ods_defs 존재 시에만 프롬프트에 포함.
+
+    비-ODS 직접조회 쿼리엔 '지어내지 마라' 게이팅 문구가 들어가 BASE_TABLES ODS 위험 오탐을 차단한다.
+    """
+    from query_diff.ai_diff.cli_runner import _build_prompt
+
+    compact = {
+        "verdict": "DIVERGENT", "reason": "", "issues": [], "limitations": [], "dimensions": [],
+    }
+    # 비-ODS(ods_defs 빈): 고정 결과 미포함 + '지어내지 마라' 포함
+    p_no = _build_prompt("SELECT 1", "SELECT 1", "oracle", "hive", compact, {}, False)
+    assert "지어내지 마라" in p_no
+    assert "ODS 경유가 아니다" in p_no
+    assert "고정 결과" not in p_no
+    assert "조인 매칭률·증분 커버리지 위험 보유" not in p_no
+    # ODS(ods_defs 있음): 고정 결과 포함
+    p_ods = _build_prompt(
+        "SELECT 1", "SELECT 1", "oracle", "hive", compact,
+        {"foo_agg": "insert into ods.foo_agg select 1 from ias.x"}, False,
+    )
+    assert "고정 결과" in p_ods
+    assert "ODS 집계본을 경유" in p_ods
+    assert "조인 매칭률·증분 커버리지 위험 보유" in p_ods
+
+
 def _setup_ready(sql_a, sql_b):
     cid = client.post("/api/comparisons").json()["id"]
     client.put(f"/api/comparisons/{cid}/query-a", json={"sql_raw": sql_a, "dialect": "oracle"})

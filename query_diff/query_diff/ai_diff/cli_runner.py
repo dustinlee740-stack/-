@@ -169,13 +169,27 @@ def _build_prompt(sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=F
         "  차원 내용이 계보상 동치이고 잔여 위험이 *다른 차원 소관*이면 `matched=true`·`limited=false`(✓)로 "
         "두고 `caveat` 엔 '위험은 <그 차원> 참조'만 남겨라. **caveat 가 있다고 무조건 ⚠ 아님 — 위험의 소유 "
         "차원이 기준이다.**\n"
-        "- 이 유형(운영 원천 직접조회 A ↔ ODS 집계 경유 B)의 **고정 결과**(위 일반 규칙의 적용례):\n"
-        "  · **PREDICATES(필터)**: 필터 '값'이 계보상 동치 → **항상 ✓**(matched, limited=false). 증분 윈도우 "
-        "커버리지 위험은 PREDICATES 소관이 아니라 BASE_TABLES 소관이므로 필터 차원 자체엔 위험 없음.\n"
-        "  · **PROJECTIONS(비집계 출력)**: nvl·NULL→0 은 출력 '값'이 실제로 달라질 수 있는 **자기 차원 위험** "
-        "→ **항상 ⚠**(limited=true). caveat 만 달고 ✓ 로 두지 마라.\n"
-        "  · **BASE_TABLES(읽는 테이블)**: 조인 매칭률·증분 커버리지 위험 보유 → **⚠**(limited=true).\n"
-        "  · **JOIN_GRAPH / GROUP_KEYS / AGGREGATES**: 자기 위험 없음 → **✓**(matched).\n"
+    )
+    # ODS 전용 '고정 결과'는 B가 실제로 ods.* 를 경유할 때(=위 [ODS 정의 SQL] 섹션 존재)만 적용.
+    # 비-ODS 직접조회 쿼리에 조인 매칭률·증분·nvl·파이프라인 위험을 지어내지 못하게 게이팅한다.
+    if ods_defs:
+        parts.append(
+            "- **B가 ODS 집계본을 경유**하므로(위 [ODS 정의 SQL] 참조) 아래 **고정 결과** 적용:\n"
+            "  · **PREDICATES(필터)**: 필터 '값'이 계보상 동치 → **항상 ✓**(matched, limited=false). 증분 "
+            "윈도우 커버리지 위험은 PREDICATES 소관이 아니라 BASE_TABLES 소관이므로 필터 차원 자체엔 위험 없음.\n"
+            "  · **PROJECTIONS(비집계 출력)**: nvl·NULL→0 은 출력 '값'이 실제로 달라질 수 있는 **자기 차원 "
+            "위험** → **항상 ⚠**(limited=true). caveat 만 달고 ✓ 로 두지 마라.\n"
+            "  · **BASE_TABLES(읽는 테이블)**: 조인 매칭률·증분 커버리지 위험 보유 → **⚠**(limited=true).\n"
+            "  · **JOIN_GRAPH / GROUP_KEYS / AGGREGATES**: 자기 위험 없음 → **✓**(matched).\n"
+        )
+    else:
+        parts.append(
+            "- **이 비교는 ODS 경유가 아니다**(위 [ODS 정의 SQL] 섹션 없음 = A·B 모두 테이블 직접조회). 따라서 "
+            "조인 매칭률·증분 커버리지·nvl·적재 파이프라인 같은 **ODS 위험을 BASE_TABLES 등에 지어내지 마라**. "
+            "읽는 테이블이 동일하면 BASE_TABLES 는 **✓**(base 판정 신뢰). 각 차원의 위험은 그 차원이 비교 대상 "
+            "SQL에서 **실제로 떠안는 것만** 인정한다.\n"
+        )
+    parts.append(
         "\n"
         "[NULL/빈 문자열('') 처리 — base 가 이미 결정적으로 판정함, 그대로 relay]\n"
         "- **NULL≡'' 동치:** 운영/Oracle `col IS NULL` ≡ 분석/Hive `col = ''`(및 `IS NOT NULL` ≡ `!= ''`)은 "
