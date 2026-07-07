@@ -174,13 +174,27 @@ def _build_prompt(sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=F
     # 비-ODS 직접조회 쿼리에 조인 매칭률·증분·nvl·파이프라인 위험을 지어내지 못하게 게이팅한다.
     if ods_defs:
         parts.append(
-            "- **B가 ODS 집계본을 경유**하므로(위 [ODS 정의 SQL] 참조) 아래 **고정 결과** 적용:\n"
-            "  · **PREDICATES(필터)**: 필터 '값'이 계보상 동치 → **항상 ✓**(matched, limited=false). 증분 "
-            "윈도우 커버리지 위험은 PREDICATES 소관이 아니라 BASE_TABLES 소관이므로 필터 차원 자체엔 위험 없음.\n"
-            "  · **PROJECTIONS(비집계 출력)**: nvl·NULL→0 은 출력 '값'이 실제로 달라질 수 있는 **자기 차원 "
-            "위험** → **항상 ⚠**(limited=true). caveat 만 달고 ✓ 로 두지 마라.\n"
-            "  · **BASE_TABLES(읽는 테이블)**: 조인 매칭률·증분 커버리지 위험 보유 → **⚠**(limited=true).\n"
-            "  · **JOIN_GRAPH / GROUP_KEYS / AGGREGATES**: 자기 위험 없음 → **✓**(matched).\n"
+            "- **B가 ODS 집계본을 경유**하므로(위 [ODS 정의 SQL] 참조) 아래 **고정 결과** 적용.\n"
+            "  ⚠️ **단, 이 고정 ✓/⚠ 는 base 가 그 차원에 확정 실차이를 남기지 않은 경우에만 적용한다.** base 가 "
+            "op↔an·ODS 계보 흡수 후에도 **다른 집계식·다른 GROUP/출력 라벨·다른 조인 대상이나 키·계보 전체에 "
+            "부재한 필터** 를 `only_in_a`/`only_in_b` 로 남긴 차원은 그것이 **확정 실차이** 이므로 "
+            "**✗(matched=false)** 로 두고 ODS 위험은 **caveat 로만 병기**(고정 ✓/⚠ 로 덮지 마라). 이 종속 규칙을 "
+            "override 하는 단 하나의 예외는 **BASE_TABLES 의 ODS-스파인 테이블 치환**(아래)뿐이다.\n"
+            "  · **BASE_TABLES(읽는 테이블)**: A 원천이 그 ods.* 집계본의 스파인이면(계보로 확인) 테이블명 차이는 "
+            "확정차이 아님 → 조인 매칭률·증분 커버리지 위험 보유 → **⚠**(limited=true). (base 의 테이블 ✗ 를 "
+            "여기서만 ⚠ 로 완화한다.)\n"
+            "  · **PREDICATES(필터)**: 필터 '값'이 계보상 동치인 것은 흡수 → 그것만 남으면 **✓**(증분 윈도우 "
+            "커버리지 위험은 PREDICATES 소관이 아니라 BASE_TABLES 소관). 그러나 **계보를 끝까지 봐도 대응이 없는 "
+            "필터**(base only_in_a 잔존)는 B 결과집합을 넓히는 **확정 실차이 ✗** — '확인 필요 ⚠'로 낮추지 마라. "
+            "⚠ 는 ODS 정의가 길이제한으로 축약됐거나 매핑이 실제로 불명일 때만.\n"
+            "  · **PROJECTIONS(비집계 출력)**: 출력 컬럼·라벨이 그 외엔 동치이면 nvl·NULL→0 은 출력 '값'이 "
+            "달라질 수 있는 **자기 차원 위험** → **⚠**(limited=true). 그러나 base 가 **출력 식/라벨 자체 차이**"
+            "(예: 리터럴 '파주 외' vs '파주시 외')를 남겼으면 **✗ 우선**, nvl 은 caveat 에 병기. GROUP_KEYS 와 "
+            "같은 라벨차는 **같은 판정으로 수렴**하라.\n"
+            "  · **JOIN_GRAPH**: 최상위 조인 구조가 동치일 때만 ✓. base 가 **조인 대상 테이블/키 차이**(다른 "
+            "relation·ON 에 섞인 추가 필터)를 남겼으면 그대로 **✗** — 테이블 치환을 BASE 로 재귀속해 ✓ 로 올리지 "
+            "마라.\n"
+            "  · **GROUP_KEYS / AGGREGATES**: 자기 위험 없음 → base 판정 유지(실차이 있으면 ✗, 없으면 ✓).\n"
         )
     else:
         parts.append(

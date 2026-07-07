@@ -288,6 +288,37 @@ def test_build_prompt_gates_ods_rules_on_ods_defs():
     assert "조인 매칭률·증분 커버리지 위험 보유" in p_ods
 
 
+def test_build_prompt_ods_fixed_result_subordinate_to_base():
+    """ODS '고정 결과'는 base 가 낸 확정 차이에 **종속**돼야 한다(뱃지 흔들림 가드).
+
+    base 가 op↔an·계보 흡수 후에도 only_in_* 로 남긴 차원(다른 집계·다른 라벨·계보에 부재한 필터·
+    다른 조인 대상)은 고정 ✓/⚠ 로 덮지 말고 ✗ 로 유지, ODS 위험은 caveat 로만 병기. BASE_TABLES 의
+    ODS-스파인 테이블 치환만 유일 예외(⚠). JOIN✗ PRED✗ PROJ✗ 로 수렴시키는 문구가 프롬프트에 있어야.
+    """
+    from query_diff.ai_diff.cli_runner import _build_prompt
+
+    compact = {
+        "verdict": "DIVERGENT", "reason": "", "issues": [], "limitations": [], "dimensions": [],
+    }
+    p = _build_prompt(
+        "SELECT 1", "SELECT 1", "oracle", "hive", compact,
+        {"foo_agg": "insert into ods.foo_agg select 1 from ias.x"}, False,
+    )
+    # 지배 조항: 고정 결과는 base 확정차이에 종속(덮지 마라)
+    assert "확정 실차이" in p
+    assert "caveat 로만 병기" in p
+    assert "덮지 마라" in p
+    # 유일 예외는 BASE_TABLES 스파인 치환
+    assert "ODS-스파인 테이블 치환" in p
+    # PROJECTIONS: 라벨/식 자체 차이면 ✗ 우선(nvl 은 caveat) — GROUP_KEYS 와 수렴
+    assert "✗ 우선" in p
+    assert "같은 판정으로 수렴" in p
+    # PREDICATES: 계보에 부재한 필터는 확정 실차이 ✗ — ⚠ 로 낮추지 마라
+    assert "낮추지 마라" in p
+    # JOIN_GRAPH: 테이블 치환을 BASE 로 재귀속해 ✓ 로 올리지 마라(권장안 ✗)
+    assert "올리지 마라" in p
+
+
 def _setup_ready(sql_a, sql_b):
     cid = client.post("/api/comparisons").json()["id"]
     client.put(f"/api/comparisons/{cid}/query-a", json={"sql_raw": sql_a, "dialect": "oracle"})
