@@ -44,8 +44,10 @@ from query_diff.semantic_diff.planner import (
 )
 from query_diff.semantic_diff.plan_compare import (
     _absorb_date_range,
+    _absorb_groupkey_grain,
     _absorb_parameterized,
     _absorb_qualifier_noise,
+    _GROUPKEY_GRAIN_CAVEAT,
     _bare_cols,
     _da,
     _DATE_RANGE_CAVEAT,
@@ -350,6 +352,9 @@ def _compare_group_keys(
     proj_alias_b: dict[str, str] | None = None,
 ) -> DimensionResult:
     matched, oa, ob, sh = _diff_sets_by_column(a.group_keys, b.group_keys)
+    # 함수종속 상위날짜키(년월⊂년월일)·substr↔원본 컬럼 등 grain 실질동치를 결정적으로 흡수(제한적).
+    oa, ob, grain_soft = _absorb_groupkey_grain(oa, ob, a.group_keys, b.group_keys)
+    matched = not oa and not ob
     # canonical 폴백(원문 raw 미매칭, 예: CTE 인라인 CASE) 표시에 `AS 별칭` 부착 — group-by 가
     # 참조하는 최외곽 SELECT 출력 별칭 재사용. A는 oa 역번역과 동일하게 별칭 맵 키도 역번역.
     pa = proj_alias_a or {}
@@ -361,14 +366,18 @@ def _compare_group_keys(
     # 표시는 **원문 GROUP BY 식 그대로**(내부 토큰 ⟨YM:⟩ 미노출, 대문자 통일).
     disp_a = _orig_text(oa, raw_group_a, alias_a)
     disp_b = _orig_text(ob, raw_group_b, proj_alias_b or {})
+    soft = ym_soft or grain_soft
     if matched:
-        expl = (
-            f"묶음 기준(GROUP BY) {len(sh)}개 모두 동일"
-            if sh
-            else "양쪽 모두 GROUP BY 없음"
-        )
+        if sh:
+            expl = f"묶음 기준(GROUP BY) {len(sh)}개 모두 동일"
+        elif grain_soft:
+            expl = "묶음 기준(GROUP BY) grain 동치 간주(제한적)"
+        else:
+            expl = "양쪽 모두 GROUP BY 없음"
         if ym_present and ym_reliable:
             expl += " · 날짜 추출 관용구 인식(타입 검증)"
+        if grain_soft:
+            expl += " · GROUP BY grain 동치 간주(제한적)"
     else:
         # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
@@ -376,15 +385,17 @@ def _compare_group_keys(
             [],
             "해당 쿼리 GROUP BY 절에서 하기 조건을 확인하세요. 한쪽만 묶으면 합계 단위가 달라집니다",
         )
-    # 제한적 판정 캐비엣은 **실제 GROUP BY 추출식·정확한 입도**로 동적 생성(하드코딩 아님).
-    caveat = (
-        _year_month_detail(sh, [raw_group_a], [raw_group_b], rename)[0]
-        if (matched and ym_soft) else ""
-    )
+    # 제한적 판정 캐비엣: YM 소프트는 실제 추출식·입도로 동적 생성, grain 흡수는 함수종속/포맷 안내.
+    _cav = []
+    if matched and ym_soft:
+        _cav.append(_year_month_detail(sh, [raw_group_a], [raw_group_b], rename)[0])
+    if matched and grain_soft:
+        _cav.append(_GROUPKEY_GRAIN_CAVEAT)
+    caveat = "\n\n".join(c for c in _cav if c)
     return DimensionResult(
         dimension=DimensionName.GROUP_KEYS,
         matched=matched,
-        limited=bool(matched and ym_soft),
+        limited=bool(matched and soft),
         only_in_a=disp_a,
         only_in_b=disp_b,
         shared=sh,

@@ -44,8 +44,10 @@ def test_aggregate_keeps_alias_and_source_order():
 
 def test_group_by_shows_original_expr_not_internal_token():
     """GROUP BY 차이는 비교용 내부 토큰(⟨YM:…⟩) 대신 **원문 식**·대문자로(리터럴 간격까지) 노출."""
+    # A=일(substr 1,8) vs B=월(from_timestamp yyyyMM) — 입도가 달라 실제 grain 차이(✗).
+    # (일↔원본 컬럼 같은 함수종속·grain 흡수 케이스는 test_groupkey_grain 에서 별도 검증)
     A = "SELECT 1 FROM tgs.tb_api_history tah GROUP BY substr(tah.request_dt,0,8)"
-    B = "SELECT 1 FROM tgs.tb_api_history tah GROUP BY tah.rqs_dt, from_timestamp(tah.rqs_dt,'yyyyMM')"
+    B = "SELECT 1 FROM tgs.tb_api_history tah GROUP BY from_timestamp(tah.rqs_dt,'yyyyMM')"
     r = compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=load_op_an_map())
     gk = next(d for d in r.dimensions if d.dimension == DimensionName.GROUP_KEYS)
     blob = " | ".join(gk.only_in_a + gk.only_in_b)

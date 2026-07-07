@@ -238,6 +238,85 @@ def _is_null_check(pred: str) -> bool:
     return pred.endswith(" IS NULL") or pred.endswith(" IS NOT NULL")
 
 
+# --- GROUP BY grain 흡수: 함수종속 상위날짜키 + substr↔원본 컬럼(제한적 판정) ---
+
+# A `substr(dt,1,8)[일]` ↔ B `dt`[원본], B `substr(dt,1,6)[월]`(년월일에 함수종속) 처럼 grain 이
+# 실질 동일하나 표기가 달라 GROUP_KEYS 가 흔들리던 것을 엔진이 결정적으로 흡수(matched+제한적).
+_GK_YM_RE = re.compile(r"^⟨YM:(?P<col>.+):(?P<gran>YEAR|MONTH|DAY)⟩$")
+_GK_GRAN = {"YEAR": 4, "MONTH": 6, "DAY": 8}
+_GK_RAW = 99   # 원본 컬럼(추출 안 함) = 가장 fine 한 입도
+
+_GROUPKEY_GRAIN_CAVEAT = (
+    "GROUP BY grain 동치 간주 — 날짜 추출 방식 차이(제한적)\n"
+    "· 상위 날짜키(예 년월 substr 1,6)는 하위(년월일)에 **함수종속** → 추가돼도 grain 불변\n"
+    "· substr(날짜 추출) ↔ 원본 컬럼은 컬럼 실제 포맷/길이에 따라 동일 grain 여부가 갈림\n"
+    "→ 컬럼 실제 포맷 확인 필요"
+)
+
+
+def _gk_parse(key: str) -> tuple[str, int] | None:
+    """group key canonical → (bare_col, gran_rank). YM 토큰=(col,4/6/8), 단순 컬럼=(col,99=raw).
+
+    표현식(공백·괄호 등, YM 아님)은 None → 날짜 grain 흡수 대상 아님. bare_col 은 한정자 제거."""
+    m = _GK_YM_RE.match(key)
+    if m:
+        return m.group("col").rsplit(".", 1)[-1], _GK_GRAN[m.group("gran")]
+    if " " in key or "(" in key or key.startswith("⟨"):
+        return None
+    return key.rsplit(".", 1)[-1], _GK_RAW
+
+
+def _absorb_groupkey_grain(
+    oa: list[str], ob: list[str], full_a: list[str], full_b: list[str]
+) -> tuple[list[str], list[str], bool]:
+    """GROUP BY grain 동치(제한적) 흡수. 반환 (남은A, 남은B, soft).
+
+    (1) 함수종속 coarser 날짜키 제거: 같은 쪽 full 키에 더 fine 한 동일컬럼 키(raw 포함)가 있으면 제거.
+    (2) 원본↔substr 교차 흡수: 같은 컬럼이고 **정확히 한쪽만 raw**, 다른쪽 YM추출이면 쌍 제거 + soft
+        (data-dependent: 원본이 그 입도인지 컬럼 포맷 의존). YM↔YM(둘 다 substr, 다른 gran)은 흡수 안 함."""
+    def _finest_by_col(keys: list[str]) -> dict[str, int]:
+        d: dict[str, int] = {}
+        for k in keys:
+            p = _gk_parse(k)
+            if p:
+                d[p[0]] = max(d.get(p[0], 0), p[1])
+        return d
+
+    fa, fb = _finest_by_col(full_a), _finest_by_col(full_b)
+
+    def _drop_redundant(only: list[str], finest: dict[str, int]) -> list[str]:
+        out = []
+        for k in only:
+            p = _gk_parse(k)
+            if p and p[1] < finest.get(p[0], -1):
+                continue   # 같은 컬럼에 더 fine 한 키 존재 → 함수종속 redundant
+            out.append(k)
+        return out
+
+    ra, rb = _drop_redundant(oa, fa), _drop_redundant(ob, fb)
+
+    used_b: set[int] = set()
+    rem_a: list[str] = []
+    soft = False
+    for x in ra:
+        px = _gk_parse(x)
+        hit = False
+        if px:
+            for j, y in enumerate(rb):
+                if j in used_b:
+                    continue
+                py = _gk_parse(y)
+                if py and py[0] == px[0] and ((px[1] == _GK_RAW) != (py[1] == _GK_RAW)):
+                    used_b.add(j)
+                    hit = True
+                    soft = True
+                    break
+        if not hit:
+            rem_a.append(x)
+    rem_b = [y for j, y in enumerate(rb) if j not in used_b]
+    return rem_a, rem_b, soft
+
+
 def _null_empty_flag(empty_form_preds, matched_canonicals) -> bool:
     """'' 형 null-체크(= ''/!= '' → IS NULL/IS NOT NULL) 중 **매칭된**(matched_canonicals 에 든) 것이
     있으면 True = 운영 real IS NULL ↔ 분석 '' 매칭(혼재 위험).
