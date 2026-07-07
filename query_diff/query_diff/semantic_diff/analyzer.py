@@ -49,6 +49,8 @@ from query_diff.semantic_diff.plan_compare import (
     _bare_cols,
     _da,
     _DATE_RANGE_CAVEAT,
+    _NULL_EMPTY_CAVEAT,
+    _null_empty_flag,
     _year_month_detail,
     _diff_sets,
     _diff_sets_by_column,
@@ -162,6 +164,9 @@ def _compare_join_graph(
     only_b: list[str] = []
     shared_cnt = 0
     param_cnt = 0
+    shared_on_all: set[str] = set()   # 페어링된 조인의 공유 ON 술어(NULL/빈문자 위험 판별용)
+    absorbed_on_a: set[str] = set()   # 한정자-노이즈 흡수된 ON 술어(A/B 측) — 폴백 매칭분 포함
+    absorbed_on_b: set[str] = set()
 
     for key in sorted(set(ga) | set(gb), key=lambda k: (sorted(k[0]), k[1])):
         tables, jtype = key
@@ -185,6 +190,7 @@ def _compare_join_graph(
             )
             continue
         # 같은 테이블쌍·타입 — ON 술어 차이만 비교
+        shared_on_all |= (pa & pb)
         dpa = sorted(pa - pb)
         dpb = sorted(pb - pa)
         dpa, dpb, param = _absorb_parameterized(dpa, dpb)
@@ -193,6 +199,8 @@ def _compare_join_graph(
         # IS NOT NULL`) 흡수 — qualify 폴백 시 A·B 컬럼 한정 상태가 어긋나는 노이즈. WHERE(_compare_
         # predicates)와 대칭. NULL≡'' 흡수는 이미 _canonical_expr 단계서 끝났고, 남는 한정자차만 제거.
         dpa, dpb, _qn = _absorb_qualifier_noise(dpa, dpb)
+        absorbed_on_a.update(x for x, _y in _qn)
+        absorbed_on_b.update(y for _x, y in _qn)
         dpa = _da(dpa, rename)
         if not dpa and not dpb:
             shared_cnt += 1
@@ -218,6 +226,12 @@ def _compare_join_graph(
     only_a = [_upper_disp(s) for s in only_a]
     only_b = [_upper_disp(s) for s in only_b]
     matched = not only_a and not only_b
+    # 조인 ON 의 null-체크가 한쪽만 '' 형(운영 IS NULL ↔ 분석 != '')이면 값 로직 동치이나 혼재 위험 → 제한적.
+    # 매칭된 ON = shared(양측 동일 canonical) ∪ 한정자-노이즈 흡수분(폴백 A↔B 한정 불일치).
+    null_empty = matched and (
+        _null_empty_flag(b.empty_form_preds, shared_on_all | absorbed_on_b)
+        or _null_empty_flag(a.empty_form_preds, shared_on_all | absorbed_on_a)
+    )
     param_note = (
         f" · 값만 다른 항목(날짜·코드 등) {param_cnt}개는 비교 제외" if param_cnt else ""
     )
@@ -227,16 +241,20 @@ def _compare_join_graph(
             if (shared_cnt or param_cnt)
             else "양쪽 모두 조인 없음"
         )
+        if null_empty:
+            expl += " · 조인 조건 NULL↔빈문자('') 처리 차이 동치 간주(제한적)"
     else:
         # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인만.
         expl = "테이블 연결 방식(JOIN)이 다릅니다" + param_note
     return DimensionResult(
         dimension=DimensionName.JOIN_GRAPH,
         matched=matched,
+        limited=null_empty,
         only_in_a=only_a,
         only_in_b=only_b,
         shared=[],
         explanation=expl,
+        caveat=_NULL_EMPTY_CAVEAT if null_empty else "",
     )
 
 
@@ -250,6 +268,12 @@ def _compare_predicates(
     oa, ob, _qnoise = _absorb_qualifier_noise(oa, ob)   # 한정자만 다른 동일 술어(노이즈) 흡수
     oa, ob, date_range = _absorb_date_range(oa, ob)     # 원시↔일추출 날짜범위(제한적) 흡수
     matched = not oa and not ob
+    # NULL↔빈문자('') 매칭(운영 IS NULL ↔ 분석 = '')은 값 로직 동치이나 혼재 인코딩 위험 → 제한적.
+    # '' 형 null-체크를 '매칭된 술어'(all_predicates − 최종 잔여; 한정자-흡수분 포함)에 대조해 폴백도 잡는다.
+    null_empty = matched and (
+        _null_empty_flag(b.empty_form_preds, set(b.all_predicates) - set(ob))
+        or _null_empty_flag(a.empty_form_preds, set(a.all_predicates) - set(oa))
+    )
     # 표시: 원문 WHERE/HAVING **절 순서** + **자연문법(컬럼 op 값·!=)** + 해소명(A측 운영명 역변환).
     disp_a = _pred_display_list(oa, a, rename)
     disp_b = _pred_display_list(ob, b)
@@ -264,6 +288,8 @@ def _compare_predicates(
         )
         if date_range:
             expl += " · 날짜 범위(원시↔일추출) 동치 간주(제한적)"
+        if null_empty:
+            expl += " · NULL↔빈문자('') 처리 차이 동치 간주(제한적)"
     else:
         # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
@@ -271,15 +297,20 @@ def _compare_predicates(
             [],
             "해당 쿼리 WHERE 절에서 하기 조건을 확인하세요",
         )
+    _caveats = []
+    if matched and date_range:
+        _caveats.append(_DATE_RANGE_CAVEAT)
+    if null_empty:
+        _caveats.append(_NULL_EMPTY_CAVEAT)
     return DimensionResult(
         dimension=DimensionName.PREDICATES,
         matched=matched,
-        limited=bool(matched and date_range),
+        limited=bool(matched and (date_range or null_empty)),
         only_in_a=disp_a,
         only_in_b=disp_b,
         shared=sh,
         explanation=expl,
-        caveat=_DATE_RANGE_CAVEAT if (matched and date_range) else "",
+        caveat="\n\n".join(_caveats),
     )
 
 

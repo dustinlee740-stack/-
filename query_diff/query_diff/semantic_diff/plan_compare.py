@@ -221,6 +221,34 @@ _BOUND_RE = re.compile(r"^(?P<lhs>.+?)\s*(?P<op><=|>=|<|>)\s*(?P<rhs>.+)$")
 _YM_LHS_RE = re.compile(r"^⟨YM:(?P<col>.+?):(?P<gran>\w+)⟩$")
 
 
+# --- NULL ↔ 빈문자('') 처리 차이 캐비엣: 값 로직 동치이되 혼재 인코딩 위험(제한적 판정) ---
+
+# A(운영, real NULL)와 B(분석, '' 형)가 흡수돼 매칭됐으나 데이터 인코딩 혼재 가능 → 제한적.
+_NULL_EMPTY_CAVEAT = (
+    "NULL/빈 문자열 처리 차이 — 값 로직은 동치로 간주\n"
+    "A : col IS NULL / IS NOT NULL (운영계 실제 NULL)\n"
+    "B : col = '' / != '' (분석계 빈 문자열)\n"
+    "※ 분석계는 컬럼에 따라 NULL 과 빈문자('')가 혼재될 수 있어, 빈문자 존재 시 결과 행이 달라질 수 있음\n"
+    "→ 실데이터 대사 필요"
+)
+
+
+def _is_null_check(pred: str) -> bool:
+    """canonical 술어가 `... IS NULL` / `... IS NOT NULL` 인지."""
+    return pred.endswith(" IS NULL") or pred.endswith(" IS NOT NULL")
+
+
+def _null_empty_flag(empty_form_preds, matched_canonicals) -> bool:
+    """'' 형 null-체크(= ''/!= '' → IS NULL/IS NOT NULL) 중 **매칭된**(matched_canonicals 에 든) 것이
+    있으면 True = 운영 real IS NULL ↔ 분석 '' 매칭(혼재 위험).
+
+    `matched_canonicals` 로 차원(WHERE vs JOIN)을 스코프한다. 카드재발급처럼 원형 AST 폴백으로 A(한정)↔
+    B(비한정) canonical 이 달라 `sh`(동일 canonical shared)엔 없고 `_absorb_qualifier_noise` 로 흡수된
+    경우도, 매칭집합(=all_predicates − 최종 잔여 / shared_on_all ∪ 한정자흡수분)에 들어오면 잡힌다."""
+    ms = set(matched_canonicals)
+    return any(p in ms for p in (empty_form_preds or []) if _is_null_check(p))
+
+
 def _range_bound(pred: str) -> tuple[str, str, bool, bool] | None:
     """경계 술어를 (base_col_key, kind['lower'|'upper'], ym, placeholder) 로 분류. 아니면 None.
 

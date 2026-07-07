@@ -193,6 +193,38 @@ def _is_tautology(pred: str) -> bool:
     return left.strip() == right.strip()
 
 
+def _is_empty_comparison(node: exp.Expression) -> bool:
+    """`col = ''` / `col != ''` / `col <> ''` (빈 문자열 리터럴과의 등치·부등)인지."""
+    if not isinstance(node, (exp.EQ, exp.NEQ)):
+        return False
+    for operand in (node.left, node.right):
+        if isinstance(operand, exp.Literal) and operand.is_string and operand.this == "":
+            return True
+    return False
+
+
+def _extract_empty_form_preds(select: exp.Select, alias_map: dict[str, str]) -> set[str]:
+    """이 select 의 WHERE/HAVING/JOIN ON 에서 '' 형 비교 술어의 canonical 모음.
+
+    canonical 은 `_canonical_expr` 흡수로 `col IS NULL`/`IS NOT NULL` 이 되어 매칭 키와 동일하다.
+    운영(A, real IS NULL)↔분석(B, '' 형)이 같은 canonical 로 매칭된 뒤 **'한쪽만 '' 형'** 을 판별해
+    NULL/빈문자 혼재 위험을 결정적으로 표기(_null_empty_flag)하기 위한 provenance."""
+    out: set[str] = set()
+    for clause in ("where", "having"):
+        node = select.args.get(clause)
+        if node is not None:
+            for p in _split_and(node.this):
+                if _is_empty_comparison(p):
+                    out.add(_canonical_expr(p, alias_map))
+    for join in select.args.get("joins", []) or []:
+        on_expr = join.args.get("on")
+        if on_expr is not None:
+            for part in _split_and(on_expr):
+                if _is_empty_comparison(part):
+                    out.add(_canonical_expr(part, alias_map))
+    return out
+
+
 def _extract_where_predicates(
     select: exp.Select, alias_map: dict[str, str]
 ) -> list[str]:
@@ -678,6 +710,7 @@ def build_logical_plan(
     seen_edge_keys: set[str] = set()
     pred_display: dict[str, str] = {}   # canonical → 표시용 자연형
     pred_order: dict[str, int] = {}     # canonical → 원문 등장 순서(전 스코프 누적)
+    empty_form: set[str] = set()        # '' 형에서 온 null-체크 canonical(NULL/빈문자 위험 판별용)
 
     # base/predicate/join/aggregate 는 전 스코프 합집합(CTE 관통)
     for sel in selects:
@@ -691,6 +724,7 @@ def build_logical_plan(
             where_preds.add(p)
         for p in _extract_having_predicates(sel, amap):
             having_preds.add(p)
+        empty_form |= _extract_empty_form_preds(sel, amap)
 
         # 표시용 provenance(절 순서·자연문법) — 비교 집합과 별개, 최초 등장 기준으로 누적.
         for canon, disp in _extract_pred_provenance(sel, amap):
@@ -741,6 +775,6 @@ def build_logical_plan(
         group_keys=group_keys,   # 쿼리 절 순서 보존(표시용) — 정렬 안 함
         aggregates=sorted(aggs),
         projections=projections,   # 쿼리 절 순서 보존(표시용) — group_keys 와 동일, 정렬 안 함
-
+        empty_form_preds=sorted(empty_form),
         limitations=list(limitations),
     )

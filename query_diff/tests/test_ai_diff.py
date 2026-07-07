@@ -254,10 +254,11 @@ def test_build_prompt_has_decision_rubric():
     assert "자기 차원" in prompt          # 자기 차원 위험이 있을 때만 limited=true
     assert "PROJECTIONS" in prompt        # nvl → PROJECTIONS 항상 ⚠
     assert "limited=true" in prompt
-    # NULL≡'' 정규화 규칙 + string-only 예외 + base 신뢰 (조인/필터 null-체크 재판정 방지)
+    # NULL/빈문자 처리 규칙: null-체크(A) vs '' 형(B) → 값 로직 동치이되 제한적(⚠)+caveat, 혼재 인코딩
     assert "NULL≡''" in prompt            # 운영 IS NULL ≡ 분석 = ''
     assert "빈 문자열" in prompt          # = '' null 표현
-    assert "string 타입" in prompt        # 빈 문자열 관례는 string 컬럼 한정
+    assert "혼재" in prompt               # real null/'' 혼재 인코딩
+    assert "동치로 간주" in prompt        # 값 로직 동치로 간주(하드 차이 아님)
     assert "재판정" in prompt             # base 매칭을 원본 SQL 로 재판정 금지
 
 

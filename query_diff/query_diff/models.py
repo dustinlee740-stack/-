@@ -216,6 +216,7 @@ class LogicalPlan(BaseModel):
     aggregates: list[tuple[str, str]] = Field(default_factory=list)  # (func, arg)
     projections: list[str] = Field(default_factory=list)           # non-aggregate
     limitations: list[str] = Field(default_factory=list)           # 정규화 불가 사유
+    empty_form_preds: list[str] = Field(default_factory=list)      # '' 형(= ''/!= '')에서 온 null-체크 canonical
 
 
 class DimensionResult(BaseModel):
