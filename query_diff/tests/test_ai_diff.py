@@ -350,52 +350,52 @@ def _mk(dim, matched, limited=False, **kw):
     return DimensionResult(dimension=dim, matched=matched, limited=limited, **kw)
 
 
-def test_finalize_rollup_rederives_and_pins_flags():
-    """Fix3+4+5: AI 롤업·limited·limitations 를 결정적으로 고정, matched·프로즈는 유지.
+def test_finalize_rollup_ods_pins_everything_to_base():
+    """Fix3+4+8+9: ODS 케이스는 뱃지·프로즈·verdict·issues·limitations 를 전부 결정적 base 로 고정.
 
-    이 A/B 재현: AI 가 (a) EQUIVALENT + 자유서술 issues, (b) PREDICATES.limited=True(잘못 자기귀속),
-    (c) PROJECTIONS.limited=False, (d) 자유서술 limitations 2건을 줘도 →
-    base.limited relay 로 PRED ✓, force 로 PROJ ⚠, base.limitations([])로 정규화제한 소멸,
-    _decide_verdict 로 LIMITED + ⚠ 2건. AI reason 유지.
-    """
+    AI 가 (a) EQUIVALENT + 자유서술 issues, (b) 자유서술 limitations, (c) 런별로 다른 caveat 프로즈,
+    (d) PROJECTIONS.limited=False 를 줘도 → base(PROJ limited=True[Fix8], PRED limited=False, limitations=[],
+    결정적 caveat)로 전부 덮여 LIMITED + ⚠ 2건 + base caveat + 결정적 reason. AI 프로즈 폐기."""
     from query_diff.ai_diff.cli_runner import _finalize_rollup
     from query_diff.models import SemanticDiff
 
     ai_dims = [
-        _mk(DimensionName.BASE_TABLES, True, True, caveat="ODS 집계 경유 · 대사 필요\n둘째줄무시"),
+        _mk(DimensionName.BASE_TABLES, True, True, caveat="AI 조인목록 불완전(런별 상이)"),
         _mk(DimensionName.JOIN_GRAPH, True, False),
-        _mk(DimensionName.PREDICATES, True, True, caveat="위험은 BASE_TABLES 소관"),  # AI 오귀속
+        _mk(DimensionName.PREDICATES, True, True, caveat="AI 오귀속"),
         _mk(DimensionName.GROUP_KEYS, True, False),
         _mk(DimensionName.AGGREGATES, True, False),
-        _mk(DimensionName.PROJECTIONS, True, False, caveat="nvl 치환 위험"),          # AI 누락
+        _mk(DimensionName.PROJECTIONS, True, False, caveat="AI nvl 변형"),
     ]
-    sd = SemanticDiff(verdict=SemanticVerdict.EQUIVALENT, reason="AI 풍부한 서술",
+    sd = SemanticDiff(verdict=SemanticVerdict.EQUIVALENT, reason="AI 런별 서술",
                       issues=["free1", "free2", "free3"],
-                      limitations=["AI 지어낸 정규화 제한1", "AI 지어낸 정규화 제한2"], dimensions=ai_dims)
-    # 결정적 base: PREDICATES.limited=False, BASE_TABLES.limited=True, limitations=[]
+                      limitations=["AI 지어낸 제한1", "AI 지어낸 제한2"], dimensions=ai_dims)
+    # 결정적 base(Fix 8 로 PROJ limited=True): PRED limited=False, limitations=[]
     base = SemanticDiff(
-        verdict=SemanticVerdict.DIVERGENT, limitations=[],
+        verdict=SemanticVerdict.LIMITED, limitations=[],
         dimensions=[
-            _mk(DimensionName.BASE_TABLES, True, True),
+            _mk(DimensionName.BASE_TABLES, True, True, caveat="BASE 결정 caveat"),
             _mk(DimensionName.JOIN_GRAPH, True, False),
-            _mk(DimensionName.PREDICATES, False, False),
+            _mk(DimensionName.PREDICATES, True, False, caveat="PRED 결정 caveat"),
             _mk(DimensionName.GROUP_KEYS, True, False),
             _mk(DimensionName.AGGREGATES, True, False),
-            _mk(DimensionName.PROJECTIONS, True, False),
+            _mk(DimensionName.PROJECTIONS, True, True, caveat="PROJ nvl 결정 caveat"),
         ],
     )
-    _finalize_rollup(sd, base, force_projections_limited=True)
+    _finalize_rollup(sd, base, is_ods=True)
     d = {x.dimension: x for x in sd.dimensions}
-    assert d[DimensionName.PREDICATES].limited is False     # Fix5: base relay → ✓ (AI 오귀속 제거)
-    assert d[DimensionName.PROJECTIONS].limited is True      # Fix5: nvl 강제 → ⚠
-    assert d[DimensionName.BASE_TABLES].limited is True      # base relay → ⚠
-    assert sd.limitations == []                              # Fix4: base 로 덮여 정규화제한 소멸
-    assert sd.verdict == SemanticVerdict.LIMITED             # Fix3: 플래그 재도출
-    assert sd.reason == "AI 풍부한 서술"                      # 서술 유지
-    assert len(sd.issues) == 2                               # ⚠ 2건(정규화 제한 없음)
+    assert d[DimensionName.PREDICATES].limited is False                # base relay → ✓
+    assert d[DimensionName.PROJECTIONS].limited is True                # base(Fix8) → ⚠
+    assert d[DimensionName.BASE_TABLES].caveat == "BASE 결정 caveat"    # Fix9: 프로즈 base 로 덮임
+    assert d[DimensionName.PROJECTIONS].caveat == "PROJ nvl 결정 caveat"
+    assert "AI" not in d[DimensionName.BASE_TABLES].caveat             # AI 프로즈 폐기
+    assert sd.limitations == []                                        # Fix4
+    assert sd.verdict == SemanticVerdict.LIMITED
+    assert sd.reason and "AI" not in sd.reason                         # 결정적 reason(AI 서술 아님)
+    assert len(sd.issues) == 2
     joined = " ".join(sd.issues)
     assert "읽는 테이블" in joined and "비집계 출력" in joined
-    assert "정규화 제한" not in joined and "둘째줄" not in joined
+    assert "정규화 제한" not in joined
 
 
 def test_finalize_rollup_ods_relays_matched_prevents_divergent():
@@ -431,7 +431,7 @@ def test_finalize_rollup_divergent_and_reason_fallback():
     base = SemanticDiff(verdict=SemanticVerdict.DIVERGENT, limitations=[],
                         dimensions=[_mk(DimensionName.PREDICATES, False, False)])
     sd = SemanticDiff(verdict=SemanticVerdict.EQUIVALENT, reason="", issues=[], dimensions=ai_dims)
-    _finalize_rollup(sd, base, force_projections_limited=False)
+    _finalize_rollup(sd, base, is_ods=False)
     assert sd.verdict == SemanticVerdict.DIVERGENT
     assert len(sd.issues) == 1 and sd.issues[0].startswith("✗")
     assert "A에만 상태 필터" in sd.issues[0]

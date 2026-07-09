@@ -32,7 +32,7 @@ from query_diff.models import (
     SemanticDiff,
     SemanticVerdict,
 )
-from query_diff.semantic_diff.ods_lineage import reconcile_ods_base
+from query_diff.semantic_diff.ods_lineage import reconcile_ods_base, resolve_ods_lineage
 from query_diff.semantic_diff.optimizer import _detect_limitations, normalize_query
 from query_diff.semantic_diff.planner import (
     POSITIONAL_AGG_MARK,
@@ -466,6 +466,35 @@ def _compare_aggregates(
     )
 
 
+def _ods_null_default_cols(b: LogicalPlan) -> list[str]:
+    """B가 읽는 ODS 테이블의 nvl(NULL→0) 출력 컬럼 중 **이 쿼리 출력에 포함**되는 것(원문 순서·중복 제거).
+
+    SELECT *(projections=['*']) → ODS nvl 컬럼 전체, 특정 컬럼 → 출력과 교집합(bare 비교).
+    게이트: `resolve_ods_lineage`=None(미설정/비-ODS) → 무시. nvl(NULL→0)은 A(원본 NULL) vs B(0) 값
+    차이를 낼 수 있는 PROJECTIONS 자기 차원 위험이며, 이 판정을 base 로 통일(프롬프트·AI 흩어짐 제거)."""
+    cols: list[str] = []
+    for t in b.base_tables:
+        lin = resolve_ods_lineage(t)
+        if lin is None:
+            continue
+        for c in lin.null_default_cols:
+            if c not in cols:
+                cols.append(c)
+    if not cols:
+        return []
+    if "*" in b.projections:
+        return cols
+    out_bare = {p.rsplit(".", 1)[-1].strip().lower() for p in b.projections}
+    return [c for c in cols if c.lower() in out_bare]
+
+
+def _ods_nvl_caveat(cols: list[str]) -> str:
+    return (
+        "ODS 적재 정의에서 다음 출력 컬럼이 nvl/coalesce 로 NULL→0 치환됨: " + ", ".join(cols)
+        + "\nA 는 원본 NULL 유지 → B 는 0 → 값 상이 가능 · 실데이터 대사 필요"
+    )
+
+
 def _compare_projections(
     a: LogicalPlan,
     b: LogicalPlan,
@@ -484,13 +513,17 @@ def _compare_projections(
     oa = _da(oa, rename)
     ym_present, ym_reliable = _ym_status(sh, op_an)
     ym_soft = ym_present and not ym_reliable
+    ods_nvl_cols = _ods_null_default_cols(b)   # ODS 적재 nvl(NULL→0) 출력 컬럼(결정적, 게이트)
     # 표시는 **원문 SELECT 식 그대로**(내부 토큰·정규화 CASE 미노출, 대문자 통일).
     disp_a = _orig_text(oa, raw_select_a, alias_a)
     disp_b = _orig_text(ob, raw_select_b, proj_alias_b or {})
     if matched:
-        expl = "출력 컬럼(SELECT) 모두 동일"
-        if ym_present and ym_reliable:
-            expl += " · 날짜 추출 관용구 인식(타입 검증)"
+        if ods_nvl_cols and not (ym_present and ym_reliable):
+            expl = "출력 컬럼(SELECT) 구조는 동일 · ODS 적재 nvl(NULL→0) 치환으로 값 상이 가능(제한적)"
+        else:
+            expl = "출력 컬럼(SELECT) 모두 동일"
+            if ym_present and ym_reliable:
+                expl += " · 날짜 추출 관용구 인식(타입 검증)"
     else:
         # A/B 목록은 하단 상세 블록(only_in_a/only_in_b)과 중복 — 헤드라인+안내만.
         expl = _diff_lines(
@@ -498,14 +531,16 @@ def _compare_projections(
             [],
             "해당 쿼리 SELECT 절에서 하기 출력을 확인하세요",
         )
-    caveat = (
-        _year_month_detail(sh, [raw_select_a], [raw_select_b], rename)[0]
-        if (matched and ym_soft) else ""
-    )
+    _caveats = []
+    if matched and ym_soft:
+        _caveats.append(_year_month_detail(sh, [raw_select_a], [raw_select_b], rename)[0])
+    if ods_nvl_cols:
+        _caveats.append(_ods_nvl_caveat(ods_nvl_cols))
+    caveat = "\n\n".join(c for c in _caveats if c)
     return DimensionResult(
         dimension=DimensionName.PROJECTIONS,
         matched=matched,
-        limited=bool(matched and ym_soft),
+        limited=bool(matched and (ym_soft or ods_nvl_cols)),
         only_in_a=disp_a,
         only_in_b=disp_b,
         shared=sh,

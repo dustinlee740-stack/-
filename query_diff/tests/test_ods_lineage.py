@@ -185,3 +185,33 @@ def test_ods_predicate_absorption_inert_without_config(monkeypatch):
     B = "select par_no from ods.my_ods"
     pred = _pred(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
     assert pred.matched is False and pred.only_in_a
+
+
+def _proj(diff):
+    return next(d for d in diff.dimensions if d.dimension == DimensionName.PROJECTIONS)
+
+
+def test_ods_projection_nvl_flagged(ods_dir):
+    """Fix8: select * 로 nvl ODS(nvl_ods: gm_tr_amt·dc_amt 가 nvl(...,0))를 읽으면 base PROJECTIONS 가
+    limited=True + 결정적 컬럼 caveat. `/execute` 자체가 nvl 위험을 완전 표기(AI 무관)."""
+    A = "select * from ias.ias_transaction"
+    B = "select * from ods.nvl_ods"
+    proj = _proj(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
+    assert proj.matched is True and proj.limited is True
+    assert "gm_tr_amt" in proj.caveat and "dc_amt" in proj.caveat
+    assert "NULL→0" in proj.caveat
+
+
+def test_ods_projection_no_nvl_clean(ods_dir):
+    """Fix8 오탐 방지: nvl 없는 ODS(my_ods)를 읽으면 PROJECTIONS ✓(limited=False)."""
+    A = "select * from ias.ias_transaction"
+    B = "select * from ods.my_ods"
+    assert _proj(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None)).limited is False
+
+
+def test_ods_projection_nvl_inert_without_config(monkeypatch):
+    """QD_ODS_DIR 미설정 → PROJECTIONS nvl 무동작(비-ODS 현행 ✓)."""
+    monkeypatch.delenv("QD_ODS_DIR", raising=False)
+    A = "select * from ias.ias_transaction"
+    B = "select * from ods.nvl_ods"
+    assert _proj(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None)).limited is False
