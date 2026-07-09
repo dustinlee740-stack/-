@@ -38,6 +38,7 @@ class OdsLineage:
     filters: list[str] = field(default_factory=list) # 적재/필터 조건(원문 근사)
     aggregated: bool = False                          # GROUP BY 존재
     null_default_cols: list[str] = field(default_factory=list)  # NULL→0(nvl/coalesce 0) 치환 출력 컬럼
+    passthrough_cols: list[str] = field(default_factory=list)   # 스파인 원천 컬럼 무변환 통과 출력 컬럼
 
 
 def _ods_dir() -> str | None:
@@ -206,6 +207,82 @@ def _zero_default_coalesce(proj: exp.Expression) -> exp.Coalesce | None:
     return None
 
 
+def _anchor_alias(select: exp.Select) -> str | None:
+    """Select 의 FROM 구동 앵커(스파인) 별칭. 서브쿼리/테이블의 alias, 없으면 테이블명(lower)."""
+    a = _from_anchor(select)
+    if a is None:
+        return None
+    alias = a.alias
+    if not alias and isinstance(a, exp.Table):
+        alias = a.name
+    return alias.lower() if alias else None
+
+
+def _resolve_passthrough(
+    select: exp.Expression, col: str, cte: dict[str, exp.Expression], depth: int
+) -> bool:
+    """`select` 의 출력 컬럼 `col` 이 **구동(스파인) 앵커의 원천 컬럼으로 무변환 통과**하면 True.
+
+    통과 판정: col 정의가 (a) `select *`(앵커 그대로) 또는 (b) 앵커 별칭의 bare Column 이어야 하며,
+    앵커를 따라(CTE/서브쿼리 하강, 비-CTE base 테이블 종단) 계속 통과여야 한다. Func/Case/Cast/Coalesce
+    또는 조인 테이블 소속 컬럼이면 False(값이 달라질 수 있어 상쇄 금지)."""
+    if depth > _MAX_DEPTH or not isinstance(select, exp.Select):
+        return False
+    anc_alias = _anchor_alias(select)
+    definition: exp.Expression | None = None
+    star = False
+    for p in select.expressions:
+        if isinstance(p, exp.Star):
+            star = True
+        elif (p.alias_or_name or "").lower() == col.lower():
+            definition = p.this if isinstance(p, exp.Alias) else p
+            break
+    if definition is not None:
+        if not isinstance(definition, exp.Column):
+            return False                              # 변환식 → 통과 아님
+        src = (definition.table or "").lower()
+        if src and src != anc_alias:
+            # 앵커가 아닌 소스: CTE 면 하강, 조인 base 테이블이면 통과 아님
+            if src in cte:
+                return _resolve_passthrough(cte[src], definition.name, cte, depth + 1)
+            return False
+        col = definition.name                          # 앵커 안에서 이 이름으로 이어짐
+    elif not star:
+        return False                                   # col 정의도 * 도 없음
+    # 앵커로 하강
+    anc = _from_anchor(select)
+    if isinstance(anc, exp.Table):
+        name = anc.name.lower()
+        if name in cte:
+            return _resolve_passthrough(cte[name], col, cte, depth + 1)
+        if name in ods_registry():
+            return False                               # 하위 ODS 는 별도 변환층 → 보수적으로 통과 아님
+        return True                                    # 비-CTE base 테이블 종단 = 스파인 통과
+    if isinstance(anc, exp.Subquery):
+        inner = anc.this
+        return _resolve_passthrough(inner, col, {**cte, **_cte_map(inner)}, depth + 1)
+    return False
+
+
+def _collect_passthrough_cols(tree: exp.Expression) -> list[str]:
+    """최상위 Select 출력 중 **스파인 원천 무변환 통과** 컬럼명(원문 순서·중복 제거).
+
+    통과 컬럼은 ODS 뷰 값이 원천과 동일 → 그 컬럼 필터는 A(원천)↔B(ODS) 동치로 상쇄 가능(plan_compare).
+    변환(nvl/CASE/cast)·조인 테이블 컬럼은 제외."""
+    sel = _outermost_select(tree)
+    if sel is None:
+        return []
+    cte = _cte_map(tree)
+    cols: list[str] = []
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Star):
+            continue
+        name = (proj.alias_or_name or "").strip()
+        if name and name not in cols and _resolve_passthrough(sel, name, cte, 0):
+            cols.append(name)
+    return cols
+
+
 def _collect_null_defaults(tree: exp.Expression) -> list[str]:
     """최상위 Select projection 중 NULL→0 치환되는 **출력 컬럼명**(원문 순서·중복 제거).
 
@@ -286,6 +363,7 @@ def _resolve_path(path: str, name: str, visited_key: tuple[str, ...], depth: int
     sources, joins, filters = _collect_report(tree, set(cte.keys()))
     aggregated = _path_has_group(tree, cte, visited, depth)   # 구동 경로 집계만(옆다리 lookup 제외)
     null_default_cols = _collect_null_defaults(tree)          # NULL→0 치환 출력 컬럼(결정적)
+    passthrough_cols = _collect_passthrough_cols(tree)        # 스파인 무변환 통과 출력 컬럼(결정적)
     chain = [name] + sorted(spine) if spine else [name]
     return OdsLineage(
         table=name,
@@ -296,6 +374,7 @@ def _resolve_path(path: str, name: str, visited_key: tuple[str, ...], depth: int
         filters=filters,
         aggregated=aggregated,
         null_default_cols=null_default_cols,
+        passthrough_cols=passthrough_cols,
     )
 
 

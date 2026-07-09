@@ -414,21 +414,41 @@ def _canon_unqualified(pred: str, dialect: str | None) -> str | None:
         return None
 
 
+def _pred_cols_subset(pred: str, allowed: set[str]) -> bool:
+    """술어가 참조하는 **모든 컬럼(basename, lower)이 `allowed` 에 속하면** True. 파싱 실패·컬럼 없음 → False.
+
+    통과 컬럼만으로 이뤄진 술어인지 확인용(변환 컬럼 하나라도 섞이면 상쇄 금지)."""
+    if "⟨" in pred:
+        return False
+    try:
+        node = sqlglot.parse_one(pred)
+    except Exception:
+        return False
+    cols = list(node.find_all(exp.Column))
+    return bool(cols) and all(c.name.lower() in allowed for c in cols)
+
+
 def _absorb_ods_predicates(
-    only_a: list[str], only_b: list[str], base_b: list[str]
+    only_a: list[str], only_b: list[str], base_a: list[str], base_b: list[str]
 ) -> tuple[list[str], list[str], list[str]]:
-    """B가 읽는 ODS 집계본의 **적재 정의 WHERE 필터**가 A 잔여 술어를 덮으면 흡수(PREDICATES).
+    """B가 읽는 ODS 집계본 관련 술어 흡수(PREDICATES). 두 경로 — 게이트: `resolve_ods_lineage`=None → 무동작.
 
-    `reconcile_ods_base`(BASE_TABLES)의 PREDICATES 판. 각 B base 테이블에 `resolve_ods_lineage`
-    (게이트: QD_ODS_DIR 미설정/비-ODS → None → 무동작); ODS 적재 필터를 A와 동일 canonical 로 만든 뒤
-    only_a 중 (한정자 제거 후) **완전 일치**하는 것만 제거한다. A에 없는 ODS 전용 필터(증분 윈도우
-    `sys_cre_dttm BETWEEN …` 등)는 건드리지 않아 커버리지 위험은 BASE_TABLES 소관으로 남는다. only_b 불변.
+    (1) **적재 필터 흡수**: A 잔여 술어가 ODS 적재 정의 WHERE(`lin.filters`)에 동일 존재 → 제거(mti/apv
+        pushdown). ODS 필터를 A canonical 과 같은 표기로 만들어(한정자 제거) 완전 일치분만.
+    (2) **통과 컬럼 쌍 상쇄**: B의 ODS 스파인 ⊆ A tables 일 때, A only_a ↔ B only_b 를 (한정자 제거
+        canonical 동일) AND (참조 컬럼 전부 `passthrough_cols` 소속)이면 쌍 상쇄
+        (`stlm_ods.nr_no` ≡ `ias_transaction.nr_no` — 무변환 통과 컬럼). 변환 컬럼(nvl/CASE)·조인 컬럼·
+        비대응(한쪽만) 술어는 상쇄 안 함 → ✗ 유지(실차이 보존).
 
-    보수적: 불명확/미일치 술어는 흡수 안 함 → only_a 잔존(✗). 거짓 흡수(실차이 은폐)보다 과대 표기 우선."""
-    if not only_a or not base_b:
+    A에 없는 ODS 전용 필터(증분 윈도우 등)는 미접촉 → 커버리지 위험은 BASE_TABLES 소관 유지.
+    보수적: 불명확/미일치는 상쇄 안 함(거짓 ✓=실차이 은폐 회피). 반환 (남은A, 남은B, caveats)."""
+    if not only_a:
         return only_a, only_b, []
     from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
+    sa = {t.lower() for t in base_a}
     ods_canon: set[str] = set()
+    passthrough: set[str] = set()
+    spine_ok = False
     for t in base_b:
         lin = resolve_ods_lineage(t)
         if lin is None:
@@ -437,17 +457,41 @@ def _absorb_ods_predicates(
             c = _canon_unqualified(f, "hive")
             if c:
                 ods_canon.add(c)
-    if not ods_canon:
-        return only_a, only_b, []
-    rem_a: list[str] = []
+        if lin.spine and lin.spine <= sa:
+            spine_ok = True
+            passthrough |= {c.lower() for c in lin.passthrough_cols}
     absorbed = False
+    # (1) ODS 적재 필터 pushdown 흡수
+    rem_a: list[str] = []
     for p in only_a:
         cp = _canon_unqualified(p, None)
         if cp is not None and cp in ods_canon:
             absorbed = True
         else:
             rem_a.append(p)
-    return rem_a, only_b, ([_ODS_PRED_CAVEAT] if absorbed else [])
+    rem_b = list(only_b)
+    # (2) 통과 컬럼 A↔B 쌍 상쇄(한정자만 다른 stlm_ods.col ≡ spine.col)
+    if spine_ok and passthrough and rem_a and rem_b:
+        b_index: dict[str, list[int]] = {}
+        for j, y in enumerate(rem_b):
+            ky = _canon_unqualified(y, None)
+            if ky and _pred_cols_subset(y, passthrough):
+                b_index.setdefault(ky, []).append(j)
+        used: set[int] = set()
+        keep_a: list[str] = []
+        for x in rem_a:
+            kx = _canon_unqualified(x, None)
+            hit: int | None = None
+            if kx and _pred_cols_subset(x, passthrough):
+                hit = next((j for j in b_index.get(kx, ()) if j not in used), None)
+            if hit is not None:
+                used.add(hit)
+                absorbed = True
+            else:
+                keep_a.append(x)
+        rem_a = keep_a
+        rem_b = [y for j, y in enumerate(rem_b) if j not in used]
+    return rem_a, rem_b, ([_ODS_PRED_CAVEAT] if absorbed else [])
 
 
 # --- 연-월(날짜추출) 관용구 캐비엣: 실제 추출식·입도 동적 생성 ---

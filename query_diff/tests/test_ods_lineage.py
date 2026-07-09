@@ -46,6 +46,16 @@ from ias.ias_transaction a
 left join dim.z b on a.k = b.k
 """
 
+# 통과(passthrough) 판정 ODS: par_no=원천 직결(통과), amt=nvl(변환), flag=CASE(변환), svc_nm=조인테이블.
+_PASS_ODS = """upsert into table ods.pass_ods
+select a.par_no,
+       nvl(a.amt, 0) as amt,
+       case when a.flag = '' then 'X' else a.flag end as flag,
+       s.svc_nm
+from (select * from ias.ias_transaction where mti_cd != '0120') a
+inner join dim.service s on a.svc_id = s.svc_id
+"""
+
 
 @pytest.fixture()
 def ods_dir(tmp_path, monkeypatch):
@@ -53,6 +63,7 @@ def ods_dir(tmp_path, monkeypatch):
     (tmp_path / "ODS_AGG_ODS.sql").write_text(_AGG_ODS, encoding="utf-8")
     (tmp_path / "ODS_MULTI_ODS.sql").write_text(_MULTI_ODS, encoding="utf-8")
     (tmp_path / "ODS_NVL_ODS.sql").write_text(_NVL_ODS, encoding="utf-8")
+    (tmp_path / "ODS_PASS_ODS.sql").write_text(_PASS_ODS, encoding="utf-8")
     monkeypatch.setenv("QD_ODS_DIR", str(tmp_path))
     return tmp_path
 
@@ -215,3 +226,46 @@ def test_ods_projection_nvl_inert_without_config(monkeypatch):
     A = "select * from ias.ias_transaction"
     B = "select * from ods.nvl_ods"
     assert _proj(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None)).limited is False
+
+
+def test_passthrough_cols_extraction(ods_dir):
+    """Fix10: 스파인 무변환 통과 컬럼만 추출 — par_no(통과), amt(nvl)·flag(CASE)·svc_nm(조인) 제외."""
+    from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
+    pc = resolve_ods_lineage("pass_ods").passthrough_cols
+    assert "par_no" in pc
+    assert "amt" not in pc and "flag" not in pc and "svc_nm" not in pc
+
+
+def test_ods_passthrough_predicate_cross_cancel(ods_dir):
+    """Fix11: A(원천 par_no 필터) ↔ B(ODS par_no 필터)는 통과 컬럼이라 한정자만 달라도 상쇄 → PRED matched."""
+    A = "select par_no from ias.ias_transaction where par_no = 'K'"
+    B = "select par_no from ods.pass_ods where par_no = 'K'"
+    r = compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None)
+    pred = _pred(r)
+    assert pred.matched is True and not pred.only_in_a and not pred.only_in_b
+    assert r.verdict != SemanticVerdict.DIVERGENT
+
+
+def test_ods_transformed_col_predicate_not_cancelled(ods_dir):
+    """Fix11 안전: 변환 컬럼(flag=CASE)은 값이 같아도 상쇄 금지 → ✗ 유지(실차이 보존)."""
+    A = "select par_no from ias.ias_transaction where flag = 'Y'"
+    B = "select par_no from ods.pass_ods where flag = 'Y'"
+    pred = _pred(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
+    assert pred.matched is False
+    assert any("FLAG" in x.upper() for x in pred.only_in_a)
+
+
+def test_ods_passthrough_predicate_unpaired_stays_diff(ods_dir):
+    """Fix11 안전: A만 통과컬럼 필터(B 무대응)면 상쇄 안 됨 → ✗ 유지(실차이)."""
+    A = "select par_no from ias.ias_transaction where par_no = 'K'"
+    B = "select par_no from ods.pass_ods"
+    pred = _pred(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
+    assert pred.matched is False and pred.only_in_a
+
+
+def test_ods_passthrough_cross_cancel_inert_without_config(monkeypatch):
+    """QD_ODS_DIR 미설정 → 통과 상쇄 무동작(비-ODS 현행 ✗)."""
+    monkeypatch.delenv("QD_ODS_DIR", raising=False)
+    A = "select par_no from ias.ias_transaction where par_no = 'K'"
+    B = "select par_no from ods.pass_ods where par_no = 'K'"
+    assert _pred(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None)).matched is False

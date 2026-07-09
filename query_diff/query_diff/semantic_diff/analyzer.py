@@ -273,7 +273,7 @@ def _compare_predicates(
     oa, ob, date_range = _absorb_date_range(oa, ob)     # 원시↔일추출 날짜범위(제한적) 흡수
     # ODS 적재 필터 흡수: B가 ODS 집계본을 읽고 A 잔여 술어가 그 적재 정의에 동일 존재 → 계보 흡수(✓).
     # 게이트: QD_ODS_DIR 미설정/비-ODS → 무동작. 증분 윈도우 등 A에 없는 ODS 필터는 BASE_TABLES 소관 유지.
-    oa, ob, ods_caveats = _absorb_ods_predicates(oa, ob, b.base_tables)
+    oa, ob, ods_caveats = _absorb_ods_predicates(oa, ob, a.base_tables, b.base_tables)
     matched = not oa and not ob
     # NULL↔빈문자('') 매칭(운영 IS NULL ↔ 분석 = '')은 값 로직 동치이나 혼재 인코딩 위험 → 제한적.
     # '' 형 null-체크를 '매칭된 술어'(all_predicates − 최종 잔여; 한정자-흡수분 포함)에 대조해 폴백도 잡는다.
