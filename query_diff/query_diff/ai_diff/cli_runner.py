@@ -37,15 +37,19 @@ def _limited(reason: str, error: str = "") -> SemanticDiff:
 
 
 def _finalize_rollup(
-    sd: SemanticDiff, base: SemanticDiff, force_projections_limited: bool = False
+    sd: SemanticDiff, base: SemanticDiff,
+    force_projections_limited: bool = False, is_ods: bool = False,
 ) -> SemanticDiff:
-    """AI 출력의 롤업(verdict·issues)·`limited` 플래그·`limitations` 를 **결정적으로 고정**.
+    """AI 출력의 롤업(verdict·issues)·`limited` 플래그·`limitations`(+ODS 시 `matched`)를 **결정적 고정**.
 
-    실행 간 흔들리던 세 입력을 결정적 값으로 못박고 나머지(matched·explanation·caveat 프로즈)만 AI 유지:
+    실행 간 흔들리던 입력을 결정적 값으로 못박고 나머지(explanation·caveat·reason 프로즈)만 AI 유지:
 
     - **limited(위험 소유)**: "그 차원이 데이터-의존 위험을 직접 소유하는가"는 객관 사실 → 각 차원을
       결정적 `base.limited` 로 relay(AI 가 다른 차원 소관 위험을 자기 차원에 붙이던 흔들림 차단).
       단 ODS nvl 은 base 가 모르므로 `force_projections_limited` 일 때 PROJECTIONS 만 True 강제(Fix 2 신호).
+    - **matched(ODS 케이스만)**: `is_ods` 면 `base.matched` 도 relay. base 는 ODS 스파인 치환(BASE_TABLES)·
+      적재 필터 흡수(PREDICATES, Fix 6)까지 결정적으로 처리하므로 권위 → AI 가 흡수된 필터를 ✗ 로 오판
+      (→DIVERGENT)해도 뱃지·verdict flip 불가. 비-ODS 는 AI matched 유지(base 가 못 잡는 판단 여지 보존).
     - **limitations**: AI 자유서술(데이터-의존 위험 프로즈 덤프)을 버리고 `base.limitations`(실제 sqlglot
       정규화 한계)로 고정 → "정규화 제한" 잡음 이슈 제거.
     - **verdict·issues**: 위로 고정된 플래그·limitations 로 `_decide_verdict` 재도출 → 개수·형식·verdict 가
@@ -55,6 +59,8 @@ def _finalize_rollup(
         bd = base_by_dim.get(d.dimension)
         if bd is not None:
             d.limited = bd.limited
+            if is_ods:
+                d.matched = bd.matched
         if d.dimension == DimensionName.PROJECTIONS and force_projections_limited:
             d.limited = True
     sd.limitations = list(base.limitations)
@@ -445,7 +451,11 @@ async def compare_via_cli(
                 f"result={snippet}",
             )
         sd = AiSemanticDiff.model_validate(structured).to_semantic_diff()
-        return _finalize_rollup(sd, base, force_projections_limited=bool(ods_null_defaults))
+        return _finalize_rollup(
+            sd, base,
+            force_projections_limited=bool(ods_null_defaults),
+            is_ods=bool(ods_defs),
+        )
     except Exception as e:
         return _limited("AI 비교 중 예기치 못한 오류가 발생했습니다.", str(e))
     finally:

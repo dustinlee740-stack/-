@@ -149,3 +149,39 @@ def test_null_default_cols_empty_for_plain_ods(ods_dir):
     """nvl/coalesce 없는 ODS 정의 → null_default_cols 빈 목록(오탐 없음)."""
     from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
     assert resolve_ods_lineage("my_ods").null_default_cols == []
+
+
+def _pred(diff):
+    return next(d for d in diff.dimensions if d.dimension == DimensionName.PREDICATES)
+
+
+def test_ods_predicate_absorption(ods_dir):
+    """Fix6: A의 WHERE 필터가 B(ods.my_ods) 적재 정의에 동일 존재 → PREDICATES 흡수(matched·비-limited),
+    DIVERGENT 아님. my_ods 적재부: `... where mti_cd != '0120' and apv_rs_rsp_cd in ('00','-1')`."""
+    A = "select par_no from ias.ias_transaction where mti_cd != '0120' and apv_rs_rsp_cd in ('00','-1')"
+    B = "select par_no from ods.my_ods"
+    r = compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None)
+    pred = _pred(r)
+    assert pred.matched is True and pred.limited is False   # 흡수 → ✓ (증분 위험은 BASE_TABLES 소관)
+    assert not pred.only_in_a
+    assert "흡수" in pred.caveat
+    assert r.verdict != SemanticVerdict.DIVERGENT           # 확정 실차이 아님
+
+
+def test_ods_predicate_absorption_partial(ods_dir):
+    """Fix6 보수성: ODS 정의에 대응 없는 A 필터는 흡수 안 됨 → only_in_a 잔존(✗). mti_cd 만 흡수."""
+    A = "select par_no from ias.ias_transaction where mti_cd != '0120' and extra_col = '9'"
+    B = "select par_no from ods.my_ods"
+    pred = _pred(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
+    assert pred.matched is False                            # extra_col 미대응 → 잔존
+    assert any("EXTRA_COL" in x.upper() for x in pred.only_in_a)
+    assert not any("MTI_CD" in x.upper() for x in pred.only_in_a)  # mti_cd 는 흡수됨
+
+
+def test_ods_predicate_absorption_inert_without_config(monkeypatch):
+    """QD_ODS_DIR 미설정 → 흡수 무동작(비-ODS 현행). A 필터는 only_in_a 로 남음."""
+    monkeypatch.delenv("QD_ODS_DIR", raising=False)
+    A = "select par_no from ias.ias_transaction where mti_cd != '0120'"
+    B = "select par_no from ods.my_ods"
+    pred = _pred(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
+    assert pred.matched is False and pred.only_in_a

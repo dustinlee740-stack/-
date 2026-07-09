@@ -380,6 +380,76 @@ def _absorb_date_range(
     return rem_a, rem_b, caveat
 
 
+# --- ODS 적재 필터 흡수: B가 ODS 집계본을 읽을 때 A 잔여 술어가 적재 정의에 존재 → 흡수 ---
+
+# PREDICATES 가 ODS 적재 필터 흡수로 matched 된 경우의 정보 caveat(✓ 유지 — limited=False).
+_ODS_PRED_CAVEAT = (
+    "필터 값 계보상 동치 — A 조건이 ODS 적재 정의(원천 서브쿼리)에 동일하게 존재해 흡수됨\n"
+    "증분 윈도우 커버리지·조인 매칭률 등 데이터-의존 위험은 BASE_TABLES(읽는 테이블) 차원 참조"
+)
+
+
+def _canon_unqualified(pred: str, dialect: str | None) -> str | None:
+    """술어 문자열을 **컬럼 한정자 제거 + canonical 표기**로. 파싱 실패/`⟨YM⟩` 토큰이면 None.
+
+    A `all_predicates`(이미 canonical) 와 ODS 적재 필터(raw hive)를 **같은 표기**로 수렴시켜 대조하기
+    위함. `_canonical_expr` 재사용(num-dequote·`<>`·피연산자/IN 정렬) → 두 소스가 동일 형식이 된다.
+    한정자를 떼는 이유: ODS 필터는 보통 비한정(`mti_cd`)이고 A canonical 은 한정(`...mti_cd`)이라."""
+    if "⟨" in pred:
+        return None
+    from query_diff.structure_diff.normalizer import _canonical_expr
+    try:
+        node = sqlglot.parse_one(pred, dialect=dialect) if dialect else sqlglot.parse_one(pred)
+    except Exception:
+        return None
+    if node is None:
+        return None
+    for col in node.find_all(exp.Column):
+        col.set("table", None)
+        col.set("db", None)
+        col.set("catalog", None)
+    try:
+        return _canonical_expr(node, {})
+    except Exception:
+        return None
+
+
+def _absorb_ods_predicates(
+    only_a: list[str], only_b: list[str], base_b: list[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """B가 읽는 ODS 집계본의 **적재 정의 WHERE 필터**가 A 잔여 술어를 덮으면 흡수(PREDICATES).
+
+    `reconcile_ods_base`(BASE_TABLES)의 PREDICATES 판. 각 B base 테이블에 `resolve_ods_lineage`
+    (게이트: QD_ODS_DIR 미설정/비-ODS → None → 무동작); ODS 적재 필터를 A와 동일 canonical 로 만든 뒤
+    only_a 중 (한정자 제거 후) **완전 일치**하는 것만 제거한다. A에 없는 ODS 전용 필터(증분 윈도우
+    `sys_cre_dttm BETWEEN …` 등)는 건드리지 않아 커버리지 위험은 BASE_TABLES 소관으로 남는다. only_b 불변.
+
+    보수적: 불명확/미일치 술어는 흡수 안 함 → only_a 잔존(✗). 거짓 흡수(실차이 은폐)보다 과대 표기 우선."""
+    if not only_a or not base_b:
+        return only_a, only_b, []
+    from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
+    ods_canon: set[str] = set()
+    for t in base_b:
+        lin = resolve_ods_lineage(t)
+        if lin is None:
+            continue
+        for f in lin.filters:
+            c = _canon_unqualified(f, "hive")
+            if c:
+                ods_canon.add(c)
+    if not ods_canon:
+        return only_a, only_b, []
+    rem_a: list[str] = []
+    absorbed = False
+    for p in only_a:
+        cp = _canon_unqualified(p, None)
+        if cp is not None and cp in ods_canon:
+            absorbed = True
+        else:
+            rem_a.append(p)
+    return rem_a, only_b, ([_ODS_PRED_CAVEAT] if absorbed else [])
+
+
 # --- 연-월(날짜추출) 관용구 캐비엣: 실제 추출식·입도 동적 생성 ---
 
 _GRAN_LABEL = {"YEAR": "연(YYYY)", "MONTH": "연-월(YYYYMM)", "DAY": "연-월-일(YYYYMMDD)"}

@@ -398,6 +398,30 @@ def test_finalize_rollup_rederives_and_pins_flags():
     assert "정규화 제한" not in joined and "둘째줄" not in joined
 
 
+def test_finalize_rollup_ods_relays_matched_prevents_divergent():
+    """Fix7: ODS 케이스(is_ods=True)에서 AI 가 PREDICATES.matched=False(✗)를 줘도 base.matched=True 면
+    matched 로 정정 → DIVERGENT flip 방지. 비-ODS(is_ods=False)면 AI matched 유지."""
+    from query_diff.ai_diff.cli_runner import _finalize_rollup
+    from query_diff.models import SemanticDiff
+
+    base = SemanticDiff(
+        verdict=SemanticVerdict.LIMITED, limitations=[],
+        dimensions=[_mk(DimensionName.PREDICATES, matched=True, limited=False)],
+    )
+    # is_ods=True → base.matched(True) relay → ✗ 소멸, DIVERGENT 아님
+    sd = SemanticDiff(verdict=SemanticVerdict.DIVERGENT, reason="r", issues=["x"],
+                      dimensions=[_mk(DimensionName.PREDICATES, matched=False, explanation="AI 오판")])
+    _finalize_rollup(sd, base, is_ods=True)
+    assert sd.dimensions[0].matched is True
+    assert sd.verdict != SemanticVerdict.DIVERGENT
+    # is_ods=False → AI matched(False) 유지 → DIVERGENT
+    sd2 = SemanticDiff(verdict=SemanticVerdict.DIVERGENT, reason="r", issues=["x"],
+                       dimensions=[_mk(DimensionName.PREDICATES, matched=False, explanation="진짜 차이")])
+    _finalize_rollup(sd2, base, is_ods=False)
+    assert sd2.dimensions[0].matched is False
+    assert sd2.verdict == SemanticVerdict.DIVERGENT
+
+
 def test_finalize_rollup_divergent_and_reason_fallback():
     """Fix3: 핵심 차원 ✗ → DIVERGENT + ✗ 이슈. 빈 reason 은 파생 reason 으로 폴백."""
     from query_diff.ai_diff.cli_runner import _finalize_rollup

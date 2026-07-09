@@ -45,8 +45,10 @@ from query_diff.semantic_diff.planner import (
 from query_diff.semantic_diff.plan_compare import (
     _absorb_date_range,
     _absorb_groupkey_grain,
+    _absorb_ods_predicates,
     _absorb_parameterized,
     _absorb_qualifier_noise,
+    _ODS_PRED_CAVEAT,
     _GROUPKEY_GRAIN_CAVEAT,
     _bare_cols,
     _da,
@@ -269,6 +271,9 @@ def _compare_predicates(
     oa, ob, param = _absorb_parameterized(oa, ob)
     oa, ob, _qnoise = _absorb_qualifier_noise(oa, ob)   # 한정자만 다른 동일 술어(노이즈) 흡수
     oa, ob, date_range = _absorb_date_range(oa, ob)     # 원시↔일추출 날짜범위(제한적) 흡수
+    # ODS 적재 필터 흡수: B가 ODS 집계본을 읽고 A 잔여 술어가 그 적재 정의에 동일 존재 → 계보 흡수(✓).
+    # 게이트: QD_ODS_DIR 미설정/비-ODS → 무동작. 증분 윈도우 등 A에 없는 ODS 필터는 BASE_TABLES 소관 유지.
+    oa, ob, ods_caveats = _absorb_ods_predicates(oa, ob, b.base_tables)
     matched = not oa and not ob
     # NULL↔빈문자('') 매칭(운영 IS NULL ↔ 분석 = '')은 값 로직 동치이나 혼재 인코딩 위험 → 제한적.
     # '' 형 null-체크를 '매칭된 술어'(all_predicates − 최종 잔여; 한정자-흡수분 포함)에 대조해 폴백도 잡는다.
@@ -283,11 +288,14 @@ def _compare_predicates(
         f" · 값만 다른 항목(날짜·코드 등) {len(param)}개는 비교 제외" if param else ""
     )
     if matched:
-        expl = (
-            f"조회 조건(WHERE/HAVING) {len(sh)}건 모두 동일{param_note}"
-            if sh or param
-            else "양쪽 모두 조회 조건 없음"
-        )
+        if ods_caveats and not (sh or param):
+            expl = "조회 조건이 ODS 적재 정의에 흡수됨 — 계보상 값 동치"
+        else:
+            expl = (
+                f"조회 조건(WHERE/HAVING) {len(sh)}건 모두 동일{param_note}"
+                if sh or param
+                else "양쪽 모두 조회 조건 없음"
+            )
         if date_range:
             expl += " · 날짜 범위(원시↔일추출) 동치 간주(제한적)"
         if null_empty:
@@ -304,6 +312,8 @@ def _compare_predicates(
         _caveats.append(_DATE_RANGE_CAVEAT)
     if null_empty:
         _caveats.append(_NULL_EMPTY_CAVEAT)
+    if matched and ods_caveats:
+        _caveats.extend(ods_caveats)   # ODS 흡수는 정보 caveat(✓ 유지 — limited 로 올리지 않음)
     return DimensionResult(
         dimension=DimensionName.PREDICATES,
         matched=matched,
