@@ -21,8 +21,9 @@ import tempfile
 from pathlib import Path
 
 from query_diff.ai_diff.schema import AI_SEMANTIC_DIFF_SCHEMA, AiSemanticDiff
-from query_diff.models import Dialect, SemanticDiff, SemanticVerdict
+from query_diff.models import Dialect, DimensionName, SemanticDiff, SemanticVerdict
 from query_diff.semantic_diff import compare_semantic
+from query_diff.semantic_diff.analyzer import _decide_verdict
 
 _DEFAULT_TIMEOUT = 300  # 초 (QD_AI_TIMEOUT 로 재정의)
 _DEFAULT_MODEL = "claude-sonnet-5"
@@ -33,6 +34,36 @@ _ODS_MAX_CHARS = 48000  # ODS 정의 임베드 총량 캡(다단계 ODS→ODS �
 
 def _limited(reason: str, error: str = "") -> SemanticDiff:
     return SemanticDiff(verdict=SemanticVerdict.LIMITED, reason=reason, error=error or reason)
+
+
+def _finalize_rollup(
+    sd: SemanticDiff, base: SemanticDiff, force_projections_limited: bool = False
+) -> SemanticDiff:
+    """AI 출력의 롤업(verdict·issues)·`limited` 플래그·`limitations` 를 **결정적으로 고정**.
+
+    실행 간 흔들리던 세 입력을 결정적 값으로 못박고 나머지(matched·explanation·caveat 프로즈)만 AI 유지:
+
+    - **limited(위험 소유)**: "그 차원이 데이터-의존 위험을 직접 소유하는가"는 객관 사실 → 각 차원을
+      결정적 `base.limited` 로 relay(AI 가 다른 차원 소관 위험을 자기 차원에 붙이던 흔들림 차단).
+      단 ODS nvl 은 base 가 모르므로 `force_projections_limited` 일 때 PROJECTIONS 만 True 강제(Fix 2 신호).
+    - **limitations**: AI 자유서술(데이터-의존 위험 프로즈 덤프)을 버리고 `base.limitations`(실제 sqlglot
+      정규화 한계)로 고정 → "정규화 제한" 잡음 이슈 제거.
+    - **verdict·issues**: 위로 고정된 플래그·limitations 로 `_decide_verdict` 재도출 → 개수·형식·verdict 가
+      뱃지의 순수 함수(헤드라인 한 줄 형식 자동 정합). AI 의 풍부한 `reason` 은 유지(비면 파생 폴백)."""
+    base_by_dim = {d.dimension: d for d in base.dimensions}
+    for d in sd.dimensions:
+        bd = base_by_dim.get(d.dimension)
+        if bd is not None:
+            d.limited = bd.limited
+        if d.dimension == DimensionName.PROJECTIONS and force_projections_limited:
+            d.limited = True
+    sd.limitations = list(base.limitations)
+    verdict, derived_reason, issues = _decide_verdict(sd.dimensions, sd.limitations)
+    sd.verdict = verdict
+    sd.issues = issues
+    if not (sd.reason or "").strip():
+        sd.reason = derived_reason
+    return sd
 
 
 def _find_claude() -> str | None:
@@ -109,7 +140,30 @@ def _ods_context(sql_a: str, sql_b: str) -> tuple[dict[str, str], bool]:
     return out, truncated
 
 
-def _build_prompt(sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=False) -> str:
+def _ods_null_defaults(sql_b: str) -> dict[str, list[str]]:
+    """B가 직접 읽는 ods.* 테이블의 NULL→0(nvl/coalesce 0) 치환 출력 컬럼(결정적 추출).
+
+    AI 가 raw ODS SQL 을 재파싱해 nvl 을 재발견하는 대신, 파이썬이 결정적으로 뽑은 이 목록을
+    프롬프트에 '고정 사실'로 주입해 PROJECTIONS(비집계 출력) 뱃지 흔들림을 없앤다."""
+    try:
+        from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
+    except Exception:
+        return {}
+    out: dict[str, list[str]] = {}
+    for m in _ODS_REF_RE.finditer(sql_b):
+        name = m.group(1).lower()
+        if name in out:
+            continue
+        lin = resolve_ods_lineage(name)
+        if lin and lin.null_default_cols:
+            out[name] = lin.null_default_cols
+    return out
+
+
+def _build_prompt(
+    sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=False, ods_null_defaults=None
+) -> str:
+    ods_null_defaults = ods_null_defaults or {}
     parts = [
         "너는 운영계(A)↔분석계(B) SQL 마이그레이션의 **의미 비교 판정자**다. 아래는 파이썬 엔진이 "
         "op↔an 정적 매핑(meta3 파생)으로 A를 변환한 뒤 낸 base 비교 결과와 원본 쿼리다. "
@@ -157,7 +211,7 @@ def _build_prompt(sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=F
         "  → 해당 차원 `only_in_*` 를 채우고 matched=false.\n"
         "\n"
         "[차원 플래그 귀속 규칙 — 위험을 매번 다른 차원에 붙이지 마라]\n"
-        "- ODS **적재 파이프라인** 위험(INNER JOIN·증분·nvl)은 **BASE_TABLES(읽는 테이블)** 차원에 귀속.\n"
+        "- ODS **적재 파이프라인** 위험(INNER JOIN·증분)은 **BASE_TABLES(읽는 테이블)** 차원에 귀속.\n"
         "- **JOIN_GRAPH(조인 그래프)** 는 *비교 대상 쿼리 자체*의 조인만 반영한다. 최상위 쿼리에 조인이 "
         "없으면(적재 정의 안의 조인이 있어도) 이 차원은 **매칭**이다.\n"
         "- nvl·NULL→0 은 **PROJECTIONS(비집계 출력)** 차원의 위험으로 귀속(caveat + limited=true).\n"
@@ -196,6 +250,17 @@ def _build_prompt(sql_a, sql_b, dia_a, dia_b, compact, ods_defs, ods_truncated=F
             "마라.\n"
             "  · **GROUP_KEYS / AGGREGATES**: 자기 위험 없음 → base 판정 유지(실차이 있으면 ✗, 없으면 ✓).\n"
         )
+        if ods_null_defaults:
+            fact = "; ".join(
+                f"{t}: {', '.join(cols)}" for t, cols in ods_null_defaults.items()
+            )
+            parts.append(
+                "  · **[결정적 추출 — raw SQL 재파싱 말고 이 목록을 그대로 신뢰하라]** B가 읽는 ODS "
+                "정의에서 다음 출력 컬럼이 nvl/coalesce 로 **NULL→0 치환**된다: " + fact + ". 이 목록이 "
+                "비어있지 않으므로 **PROJECTIONS(비집계 출력)** 를 **limited=true(⚠)** 로 두고 caveat 에 "
+                "이 컬럼들을 적어라(A는 원본 NULL 유지 → B는 0 → 값 상이 가능). base 가 출력 식/라벨 "
+                "자체 차이를 남긴 경우에만 ✗ 우선.\n"
+            )
     else:
         parts.append(
             "- **이 비교는 ODS 경유가 아니다**(위 [ODS 정의 SQL] 섹션 없음 = A·B 모두 테이블 직접조회). 따라서 "
@@ -325,8 +390,10 @@ async def compare_via_cli(
 
     compact = _compact(base)
     ods_defs, ods_truncated = _ods_context(sql_a, sql_b)
+    ods_null_defaults = _ods_null_defaults(sql_b) if ods_defs else {}
     prompt = _build_prompt(
-        sql_a, sql_b, dialect_a.value, dialect_b.value, compact, ods_defs, ods_truncated
+        sql_a, sql_b, dialect_a.value, dialect_b.value, compact, ods_defs, ods_truncated,
+        ods_null_defaults,
     )
     schema_json = json.dumps(AI_SEMANTIC_DIFF_SCHEMA, ensure_ascii=False)
     argv = _build_argv(claude_path, schema_json)
@@ -377,7 +444,8 @@ async def compare_via_cli(
                 f"is_error={envelope.get('is_error')} stop={envelope.get('stop_reason')} "
                 f"result={snippet}",
             )
-        return AiSemanticDiff.model_validate(structured).to_semantic_diff()
+        sd = AiSemanticDiff.model_validate(structured).to_semantic_diff()
+        return _finalize_rollup(sd, base, force_projections_limited=bool(ods_null_defaults))
     except Exception as e:
         return _limited("AI 비교 중 예기치 못한 오류가 발생했습니다.", str(e))
     finally:

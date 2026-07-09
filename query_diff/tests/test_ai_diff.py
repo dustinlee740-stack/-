@@ -319,6 +319,101 @@ def test_build_prompt_ods_fixed_result_subordinate_to_base():
     assert "올리지 마라" in p
 
 
+def test_build_prompt_injects_deterministic_null_defaults():
+    """Fix2: 파이썬이 결정적으로 뽑은 NULL→0 치환 컬럼 목록을 '고정 사실'로 프롬프트에 주입.
+
+    AI 가 raw ODS SQL 을 재파싱해 nvl 을 재발견하는 대신 이 목록을 신뢰 → PROJECTIONS 뱃지 고정.
+    목록이 비면(=B가 nvl 미적용) fact 블록 미포함.
+    """
+    from query_diff.ai_diff.cli_runner import _build_prompt
+
+    compact = {
+        "verdict": "LIMITED", "reason": "", "issues": [], "limitations": [], "dimensions": [],
+    }
+    ods_defs = {"stlm_ods": "insert into ods.stlm_ods select nvl(a.gm_tr_amt,0) from ias.x a"}
+    nd = {"stlm_ods": ["gm_tr_amt", "dc_amt"]}
+    p = _build_prompt("SELECT 1", "SELECT 1", "oracle", "hive", compact, ods_defs, False, nd)
+    assert "결정적 추출" in p
+    assert "NULL→0" in p
+    assert "gm_tr_amt" in p and "dc_amt" in p
+    assert "PROJECTIONS" in p and "limited=true" in p
+    # 목록 비면 fact 미포함
+    p0 = _build_prompt("SELECT 1", "SELECT 1", "oracle", "hive", compact, ods_defs, False, {})
+    assert "결정적 추출" not in p0
+    # ODS 아님(ods_defs 빈)이면 애초 고정결과 섹션 자체가 없어 fact 도 없음
+    p_no = _build_prompt("SELECT 1", "SELECT 1", "oracle", "hive", compact, {}, False, nd)
+    assert "결정적 추출" not in p_no
+
+
+def _mk(dim, matched, limited=False, **kw):
+    from query_diff.models import DimensionResult
+    return DimensionResult(dimension=dim, matched=matched, limited=limited, **kw)
+
+
+def test_finalize_rollup_rederives_and_pins_flags():
+    """Fix3+4+5: AI 롤업·limited·limitations 를 결정적으로 고정, matched·프로즈는 유지.
+
+    이 A/B 재현: AI 가 (a) EQUIVALENT + 자유서술 issues, (b) PREDICATES.limited=True(잘못 자기귀속),
+    (c) PROJECTIONS.limited=False, (d) 자유서술 limitations 2건을 줘도 →
+    base.limited relay 로 PRED ✓, force 로 PROJ ⚠, base.limitations([])로 정규화제한 소멸,
+    _decide_verdict 로 LIMITED + ⚠ 2건. AI reason 유지.
+    """
+    from query_diff.ai_diff.cli_runner import _finalize_rollup
+    from query_diff.models import SemanticDiff
+
+    ai_dims = [
+        _mk(DimensionName.BASE_TABLES, True, True, caveat="ODS 집계 경유 · 대사 필요\n둘째줄무시"),
+        _mk(DimensionName.JOIN_GRAPH, True, False),
+        _mk(DimensionName.PREDICATES, True, True, caveat="위험은 BASE_TABLES 소관"),  # AI 오귀속
+        _mk(DimensionName.GROUP_KEYS, True, False),
+        _mk(DimensionName.AGGREGATES, True, False),
+        _mk(DimensionName.PROJECTIONS, True, False, caveat="nvl 치환 위험"),          # AI 누락
+    ]
+    sd = SemanticDiff(verdict=SemanticVerdict.EQUIVALENT, reason="AI 풍부한 서술",
+                      issues=["free1", "free2", "free3"],
+                      limitations=["AI 지어낸 정규화 제한1", "AI 지어낸 정규화 제한2"], dimensions=ai_dims)
+    # 결정적 base: PREDICATES.limited=False, BASE_TABLES.limited=True, limitations=[]
+    base = SemanticDiff(
+        verdict=SemanticVerdict.DIVERGENT, limitations=[],
+        dimensions=[
+            _mk(DimensionName.BASE_TABLES, True, True),
+            _mk(DimensionName.JOIN_GRAPH, True, False),
+            _mk(DimensionName.PREDICATES, False, False),
+            _mk(DimensionName.GROUP_KEYS, True, False),
+            _mk(DimensionName.AGGREGATES, True, False),
+            _mk(DimensionName.PROJECTIONS, True, False),
+        ],
+    )
+    _finalize_rollup(sd, base, force_projections_limited=True)
+    d = {x.dimension: x for x in sd.dimensions}
+    assert d[DimensionName.PREDICATES].limited is False     # Fix5: base relay → ✓ (AI 오귀속 제거)
+    assert d[DimensionName.PROJECTIONS].limited is True      # Fix5: nvl 강제 → ⚠
+    assert d[DimensionName.BASE_TABLES].limited is True      # base relay → ⚠
+    assert sd.limitations == []                              # Fix4: base 로 덮여 정규화제한 소멸
+    assert sd.verdict == SemanticVerdict.LIMITED             # Fix3: 플래그 재도출
+    assert sd.reason == "AI 풍부한 서술"                      # 서술 유지
+    assert len(sd.issues) == 2                               # ⚠ 2건(정규화 제한 없음)
+    joined = " ".join(sd.issues)
+    assert "읽는 테이블" in joined and "비집계 출력" in joined
+    assert "정규화 제한" not in joined and "둘째줄" not in joined
+
+
+def test_finalize_rollup_divergent_and_reason_fallback():
+    """Fix3: 핵심 차원 ✗ → DIVERGENT + ✗ 이슈. 빈 reason 은 파생 reason 으로 폴백."""
+    from query_diff.ai_diff.cli_runner import _finalize_rollup
+    from query_diff.models import SemanticDiff
+
+    ai_dims = [_mk(DimensionName.PREDICATES, False, explanation="A에만 상태 필터\n상세")]
+    base = SemanticDiff(verdict=SemanticVerdict.DIVERGENT, limitations=[],
+                        dimensions=[_mk(DimensionName.PREDICATES, False, False)])
+    sd = SemanticDiff(verdict=SemanticVerdict.EQUIVALENT, reason="", issues=[], dimensions=ai_dims)
+    _finalize_rollup(sd, base, force_projections_limited=False)
+    assert sd.verdict == SemanticVerdict.DIVERGENT
+    assert len(sd.issues) == 1 and sd.issues[0].startswith("✗")
+    assert "A에만 상태 필터" in sd.issues[0]
+    assert sd.reason                                        # 빈 reason → 파생 폴백
+
+
 def _setup_ready(sql_a, sql_b):
     cid = client.post("/api/comparisons").json()["id"]
     client.put(f"/api/comparisons/{cid}/query-a", json={"sql_raw": sql_a, "dialect": "oracle"})

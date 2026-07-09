@@ -33,12 +33,26 @@ union all
 select b.k from other.tbl b
 """
 
+# NULL→0 치환 ODS: 최상위 select 에 nvl(x,0)·coalesce(y,0) 적용. 0 아닌 기본값/비-리터럴/비-0 은 제외.
+_NVL_ODS = """upsert into table ods.nvl_ods
+select a.par_no,
+       nvl(a.gm_tr_amt, 0) as gm_tr_amt,
+       coalesce(a.dc_amt, 0),
+       nvl(a.other_amt, 1) as other_amt,
+       nvl(a.txt, 'x') as txt,
+       nvl(a.chained, b.v) as chained,
+       a.plain
+from ias.ias_transaction a
+left join dim.z b on a.k = b.k
+"""
+
 
 @pytest.fixture()
 def ods_dir(tmp_path, monkeypatch):
     (tmp_path / "ODS_MY_ODS.sql").write_text(_MY_ODS, encoding="utf-8")
     (tmp_path / "ODS_AGG_ODS.sql").write_text(_AGG_ODS, encoding="utf-8")
     (tmp_path / "ODS_MULTI_ODS.sql").write_text(_MULTI_ODS, encoding="utf-8")
+    (tmp_path / "ODS_NVL_ODS.sql").write_text(_NVL_ODS, encoding="utf-8")
     monkeypatch.setenv("QD_ODS_DIR", str(tmp_path))
     return tmp_path
 
@@ -116,3 +130,22 @@ def test_spine_group_flagged_as_grain(ods_dir):
     B = "select mbr_id from ods.agg_ods"
     bt = _bt(compare_semantic(A, Dialect.ORACLE, B, Dialect.HIVE, op_an=None))
     assert bt.matched is True and "집계 단위 차이" in bt.caveat
+
+
+def test_null_default_cols_extraction(ods_dir):
+    """최상위 select 의 nvl/coalesce(...,0) 출력 컬럼만 결정적 추출 — 0 아닌/비-리터럴 기본값 제외.
+
+    - `nvl(a.gm_tr_amt, 0) as gm_tr_amt` → alias 'gm_tr_amt'
+    - `coalesce(a.dc_amt, 0)` (alias 없음) → 내부 컬럼 'dc_amt'
+    - `nvl(a.other_amt, 1)`(0 아님)·`nvl(a.txt, 'x')`(비수치)·`nvl(a.chained, b.v)`(비리터럴)·`a.plain`(nvl 없음) → 제외
+    """
+    from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
+    lin = resolve_ods_lineage("nvl_ods")
+    assert lin is not None
+    assert lin.null_default_cols == ["gm_tr_amt", "dc_amt"]
+
+
+def test_null_default_cols_empty_for_plain_ods(ods_dir):
+    """nvl/coalesce 없는 ODS 정의 → null_default_cols 빈 목록(오탐 없음)."""
+    from query_diff.semantic_diff.ods_lineage import resolve_ods_lineage
+    assert resolve_ods_lineage("my_ods").null_default_cols == []

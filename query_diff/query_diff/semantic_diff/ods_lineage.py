@@ -37,6 +37,7 @@ class OdsLineage:
     joins: list[str] = field(default_factory=list)   # "table(inner|left)" 요약
     filters: list[str] = field(default_factory=list) # 적재/필터 조건(원문 근사)
     aggregated: bool = False                          # GROUP BY 존재
+    null_default_cols: list[str] = field(default_factory=list)  # NULL→0(nvl/coalesce 0) 치환 출력 컬럼
 
 
 def _ods_dir() -> str | None:
@@ -173,6 +174,64 @@ def _split_and(node: exp.Expression) -> list[exp.Expression]:
     return [node]
 
 
+def _outermost_select(node: exp.Expression) -> exp.Select | None:
+    """정의 트리의 최상위 Select(= ODS 테이블 출력 컬럼을 내는 SELECT). UNION/Subquery 관통."""
+    if isinstance(node, exp.Select):
+        return node
+    if isinstance(node, exp.Union):
+        return _outermost_select(node.left)
+    if isinstance(node, exp.Subquery):
+        return _outermost_select(node.this)
+    return None
+
+
+def _is_zero_literal(e: exp.Expression | None) -> bool:
+    return (
+        isinstance(e, exp.Literal)
+        and bool(e.is_number)
+        and str(e.this).strip() in ("0", "0.0")
+    )
+
+
+def _zero_default_coalesce(proj: exp.Expression) -> exp.Coalesce | None:
+    """projection 식 트리에서 **마지막 인자가 리터럴 0** 인 COALESCE 를 찾음.
+
+    sqlglot(hive)은 `nvl(x, 0)`·`coalesce(x, 0)` 를 모두 `exp.Coalesce` 로 정규화한다.
+    기본값이 0 이 아니거나(예: nvl(x, 1)) 리터럴이 아닌 경우(nvl(a, b))는 제외."""
+    for c in proj.find_all(exp.Coalesce):
+        rest = c.args.get("expressions") or []
+        last = rest[-1] if rest else c.this
+        if _is_zero_literal(last):
+            return c
+    return None
+
+
+def _collect_null_defaults(tree: exp.Expression) -> list[str]:
+    """최상위 Select projection 중 NULL→0 치환되는 **출력 컬럼명**(원문 순서·중복 제거).
+
+    출력명 결정: alias 가 있으면 alias, 없으면 nvl/coalesce 내부 컬럼명(`nvl(ods.gm_tr_amt,0)`
+    → `gm_tr_amt`), 그 외엔 식 텍스트. A(원본)는 NULL 유지, B(ODS)는 0 → 값이 달라질 수 있는
+    PROJECTIONS(비집계 출력) 위험의 결정적 근거."""
+    sel = _outermost_select(tree)
+    if sel is None:
+        return []
+    cols: list[str] = []
+    for proj in sel.expressions:
+        c = _zero_default_coalesce(proj)
+        if c is None:
+            continue
+        if isinstance(proj, exp.Alias):
+            name = proj.alias
+        elif isinstance(c.this, exp.Column):
+            name = c.this.name
+        else:
+            name = proj.alias_or_name or c.this.sql(dialect="hive")
+        name = (name or "").strip()
+        if name and name not in cols:
+            cols.append(name)
+    return cols
+
+
 def _path_has_group(
     node: exp.Expression, cte: dict[str, exp.Expression], visited: set[str], depth: int
 ) -> bool:
@@ -226,6 +285,7 @@ def _resolve_path(path: str, name: str, visited_key: tuple[str, ...], depth: int
     spine = _spine(tree, cte, visited, depth)
     sources, joins, filters = _collect_report(tree, set(cte.keys()))
     aggregated = _path_has_group(tree, cte, visited, depth)   # 구동 경로 집계만(옆다리 lookup 제외)
+    null_default_cols = _collect_null_defaults(tree)          # NULL→0 치환 출력 컬럼(결정적)
     chain = [name] + sorted(spine) if spine else [name]
     return OdsLineage(
         table=name,
@@ -235,6 +295,7 @@ def _resolve_path(path: str, name: str, visited_key: tuple[str, ...], depth: int
         joins=joins,
         filters=filters,
         aggregated=aggregated,
+        null_default_cols=null_default_cols,
     )
 
 
