@@ -241,6 +241,69 @@ class SemanticDiff(BaseModel):
     error: Optional[str] = None      # 정규화 자체가 실패한 경우
 
 
+# --- 2차 판단: 실데이터 샘플 대조 (No.4/No.5 Row diff — 운영 A샘플 ↔ Hue 실행 B샘플) ---
+
+class ReconcileStatus(str, Enum):
+    MATCH = "MATCH"                # 샘플 일치 (참고 — 동치 증명 아님, 우연 일치 가능)
+    MISMATCH = "MISMATCH"          # 샘플 불일치 (실차이 근거)
+    PARTIAL = "PARTIAL"            # 일부 일치·일부 불일치
+    UNVERIFIABLE = "UNVERIFIABLE"  # 대조 불가 (샘플 미제공·조회 실패·CLI 부재 등)
+
+
+class FinalVerdict(str, Enum):
+    """1차(정적)+2차(실데이터)를 종합한 단일 최종 판정."""
+    SAME = "SAME"                  # 같은 결과로 판단
+    DIFFERENT = "DIFFERENT"        # 다른 결과로 판단
+    INCONCLUSIVE = "INCONCLUSIVE"  # 결론 유보 (근거 상충·미검증)
+
+
+class Confidence(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class Attribution(str, Enum):
+    """차이 귀인(flow.md No.6) — 차이가 있을 때 그 원인."""
+    QUERY = "QUERY"      # 쿼리(구조) 차이 기인
+    DATA = "DATA"        # 원천 데이터 차이 기인 (분석계 미적재·스냅샷 등)
+    UNKNOWN = "UNKNOWN"  # 판단 보류 / 해당 없음
+
+
+class RowMismatch(BaseModel):
+    key: str = ""            # 매칭 키 값 (예: "20250501|BANK01")
+    column: str = ""         # 불일치 컬럼 (해소명)
+    value_a: str = ""        # 운영(A) 값
+    value_b: str = ""        # 분석(B) 값
+    likely_cause: str = ""   # 추정 원인 (집계 그레인/NULL·''/날짜포맷·반올림/조인 카디널리티 등)
+
+
+class DataReconcileDiff(BaseModel):
+    """2차 판단 결과. B(분석계)를 Hue에서 실행한 샘플과 사용자 제공 A(운영계) 샘플의 대조.
+
+    **참고 신호이지 동치 증명이 아니다**: 일치=약한 긍정(우연 일치 가능), 불일치=강한 실차이 근거.
+    """
+    status: ReconcileStatus
+    headline: str = ""       # 좌측 헤드라인 한 줄
+    row_count_a: Optional[int] = None
+    row_count_b: Optional[int] = None
+    matched_keys: int = 0
+    mismatches: list[RowMismatch] = Field(default_factory=list)
+    only_in_a: list[str] = Field(default_factory=list)   # A(운영)에만 있는 키
+    only_in_b: list[str] = Field(default_factory=list)   # B(분석)에만 있는 키
+    caveats: list[str] = Field(default_factory=list)     # 우연일치·그레인·표본유계 등 주의
+    binds_used: dict[str, str] = Field(default_factory=dict)  # 실제 대입한 바인드값
+    b_csv_path: Optional[str] = None       # 산출된 B 결과 CSV 경로(아티팩트)
+    a_sample_name: Optional[str] = None    # 업로드된 A 샘플 파일명
+    sample_bounded: bool = False           # B가 ORDER BY+LIMIT 유계 표본이면 True
+    error: Optional[str] = None
+    # 종합 판정(1차+2차 통합) — 2차 서브프로세스가 1차 결과까지 받아 추론
+    final_verdict: Optional[FinalVerdict] = None
+    final_confidence: Optional[Confidence] = None
+    final_reason: str = ""                 # 1·2차 근거를 종합한 한두 줄 추론
+    attribution: Optional[Attribution] = None
+
+
 class ComparisonRequest(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     title: str = ""
@@ -252,6 +315,11 @@ class ComparisonRequest(BaseModel):
     matching_keys: list[MatchingKey] = Field(default_factory=list)
     structure_diff: Optional[StructureDiff] = None
     semantic_diff: Optional[SemanticDiff] = None
+    # 2차 판단(실데이터 대조) — 입력(A샘플·바인드)과 결과(data_reconcile)
+    data_reconcile: Optional[DataReconcileDiff] = None
+    sample_a_csv: Optional[str] = None        # 사용자 업로드 운영(A) 결과 CSV 원문
+    sample_a_filename: Optional[str] = None
+    sample_binds: dict[str, str] = Field(default_factory=dict)  # B 실행에 대입할 바인드값
 
 
 # --- API 요청/응답 스키마 ---
@@ -266,6 +334,13 @@ class QueryInputUpdate(BaseModel):
 
 class SummaryUpdate(BaseModel):
     metrics: list[DiffMetric]
+
+
+class SampleAUpdate(BaseModel):
+    """운영(A) 결과 샘플 업로드 — 프런트가 CSV 를 클라이언트에서 읽어 텍스트로 전송."""
+    csv: Optional[str] = None
+    filename: Optional[str] = None
+    binds: Optional[dict[str, str]] = None
 
 
 class WikiExtractRequest(BaseModel):

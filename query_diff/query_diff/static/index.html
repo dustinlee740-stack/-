@@ -233,6 +233,25 @@
   </div>
 </div>
 
+<!-- 2차 대사용 운영(A) 결과 샘플 -->
+<div id="sampleASection" style="margin:8px 12px 0;padding:12px 14px;background:#161628;border:1px solid #2a2a44;border-radius:8px;">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <span style="font-size:13px;font-weight:600;color:#c0c0e0;">2차 대사 · 운영(A) 결과 샘플</span>
+    <span style="font-size:11px;color:#8080a0;">CSV 업로드 시, AI 비교에서 분석계(B)를 Hue로 실행해 자동 대조합니다 (참고 신호 · 동치 증명 아님).</span>
+  </div>
+  <div style="display:flex;gap:16px;margin-top:10px;flex-wrap:wrap;align-items:flex-start;">
+    <div>
+      <input type="file" id="sampleAFile" accept=".csv,.txt" style="font-size:12px;color:#c0c0d0;">
+      <span id="sampleAName" style="font-size:11px;color:#80c080;margin-left:6px;"></span>
+      <span id="sampleAClear" style="display:none;color:#f08080;cursor:pointer;margin-left:6px;font-size:12px;">✕</span>
+    </div>
+    <div style="flex:1;min-width:240px;">
+      <label style="font-size:11px;color:#a0a0c0;display:block;margin-bottom:3px;">바인드값 (선택 · 한 줄에 <code>이름=값</code>) — B를 A샘플과 동일 조건으로 실행</label>
+      <textarea id="sampleABinds" rows="2" placeholder="start_dt=20250501&#10;end_dt=20260601" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;"></textarea>
+    </div>
+  </div>
+</div>
+
 <!-- 하단 버튼 -->
 <div class="bottom-bar">
   <button class="btn" id="btnValidate">검증</button>
@@ -255,7 +274,7 @@
 <!-- 구조 비교 결과 모달 -->
 <div class="modal-overlay hidden" id="resultModal">
   <div class="modal" style="width:1180px;max-width:94vw;">
-    <h3>구조 비교 결과 (Phase 1)</h3>
+    <h3>쿼리 비교 결과 (1차 정적 · 2차 실데이터)</h3>
     <div id="resultContent"></div>
     <div class="modal-actions">
       <button class="btn btn-sm" id="btnCloseResultModal">닫기</button>
@@ -553,14 +572,78 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
   }
 });
 
-// --- AI 비교 실행 (개인·로컬: claude -p 구독 경로) ---
+// --- 2차 대사용 운영(A) 샘플 상태 ---
+let sampleACsv = null;
+let sampleAFileName = null;
+
+(function initSampleA() {
+  const f = document.getElementById('sampleAFile');
+  const nameEl = document.getElementById('sampleAName');
+  const clr = document.getElementById('sampleAClear');
+  if (!f) return;
+  f.addEventListener('change', () => {
+    const file = f.files && f.files[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) { showToast('A 샘플 CSV가 너무 큽니다(최대 2MB).'); f.value = ''; return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      sampleACsv = String(reader.result || '');
+      sampleAFileName = file.name;
+      nameEl.textContent = file.name + ' (' + Math.round(file.size / 1024) + ' KB)';
+      clr.style.display = 'inline';
+    };
+    reader.readAsText(file);
+  });
+  clr.addEventListener('click', () => {
+    sampleACsv = null; sampleAFileName = null;
+    f.value = ''; nameEl.textContent = ''; clr.style.display = 'none';
+  });
+})();
+
+function parseBinds() {
+  const t = (document.getElementById('sampleABinds')?.value || '').trim();
+  if (!t) return {};
+  const out = {};
+  t.split(/\r?\n/).forEach(line => {
+    const i = line.indexOf('=');
+    if (i > 0) {
+      const k = line.slice(0, i).trim();
+      const v = line.slice(i + 1).trim();
+      if (k) out[k] = v;
+    }
+  });
+  return out;
+}
+
+// --- AI 비교 실행 (개인·로컬: claude -p 구독 경로) + 2차 실데이터 대사 ---
 document.getElementById('btnExecuteAI').addEventListener('click', async () => {
   if (!comparisonId) { showToast('먼저 검증을 실행해주세요.', { kind: 'info' }); return; }
   const btn = document.getElementById('btnExecuteAI');
   const orig = btn.textContent;
   btn.disabled = true;
-  btn.textContent = '🤖 AI 비교 중… (수십 초)';
+  btn.textContent = '🤖 AI 비교 중… (1차→2차, 수십 초~)';
   try {
+    // 2차 대사 입력(운영 A 샘플 + 바인드값) 선반영.
+    // 레이스 방지: FileReader onload 지연과 무관하게 **클릭 시점에 파일을 직접 읽는다**(await file.text()).
+    const fileEl = document.getElementById('sampleAFile');
+    const file = fileEl && fileEl.files && fileEl.files[0];
+    let csv = sampleACsv, fname = sampleAFileName;
+    if (file) {
+      if (file.size > 2 * 1024 * 1024) {
+        showToast('A 샘플 CSV가 너무 큽니다(최대 2MB). 샘플 없이 진행합니다.');
+      } else {
+        csv = await file.text();
+        fname = file.name;
+      }
+    }
+    const binds = parseBinds();
+    if (csv || Object.keys(binds).length) {
+      await fetch(`${API}/api/comparisons/${comparisonId}/sample-a`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ csv, filename: fname, binds }),
+      });
+    }
     const res = await fetch(`${API}/api/comparisons/${comparisonId}/execute-ai`, { method: 'POST' });
     if (res.ok) {
       const data = await res.json();
@@ -622,6 +705,58 @@ const VERDICT_STYLE = {
   LIMITED:    { label: '제한적 판정', bg: '#5a4a1a', fg: '#ffd060', border: '#d09030' },
 };
 
+const RECON_STYLE = {
+  MATCH:        { label: '샘플 일치 (참고)', bg: '#1a4a2a', fg: '#a0e0b0', border: '#40c070' },
+  MISMATCH:     { label: '샘플 불일치 (실차이 근거)', bg: '#5a1a1a', fg: '#ff9090', border: '#f05060' },
+  PARTIAL:      { label: '일부 일치', bg: '#5a4a1a', fg: '#ffd060', border: '#d09030' },
+  UNVERIFIABLE: { label: '대조 불가', bg: '#33334a', fg: '#b0b0c8', border: '#6060a0' },
+};
+
+// --- 종합 판정(1차 정적 + 2차 실데이터 통합) ---
+const FINAL_STYLE = {
+  SAME:         { label: '같음', bg: '#12351f', fg: '#a0e0b0', border: '#40c070' },
+  DIFFERENT:    { label: '다름', bg: '#3a1414', fg: '#ff9090', border: '#f05060' },
+  INCONCLUSIVE: { label: '불확정', bg: '#3a3210', fg: '#ffd060', border: '#d09030' },
+};
+const CONF_LABEL = { HIGH: '높음', MEDIUM: '보통', LOW: '낮음' };
+const ATTR_LABEL = { QUERY: '쿼리(구조) 차이 기인', DATA: '원천 데이터 차이 기인', UNKNOWN: '' };
+
+// 2차 결과가 있으면 그 종합 판정을, 없으면(=/execute 등 2차 미수행) 1차에서 파생.
+function deriveFinal(sem, dr) {
+  if (dr && dr.final_verdict) {
+    return { verdict: dr.final_verdict, confidence: dr.final_confidence,
+             reason: dr.final_reason, attribution: dr.attribution };
+  }
+  const map = { EQUIVALENT: 'SAME', DIVERGENT: 'DIFFERENT', LIMITED: 'INCONCLUSIVE' };
+  return {
+    verdict: map[sem?.verdict] || 'INCONCLUSIVE',
+    confidence: 'LOW',
+    reason: '실데이터 대사(2차) 미수행 — 정적(1차) 판정만 반영했습니다. 🤖 AI로 비교로 실행하면 2차 대사가 수행됩니다.',
+    attribution: 'UNKNOWN',
+  };
+}
+
+function renderFinalBanner(sem, dr) {
+  const f = deriveFinal(sem, dr);
+  const st = FINAL_STYLE[f.verdict] || FINAL_STYLE.INCONCLUSIVE;
+  const conf = CONF_LABEL[f.confidence] || '';
+  const semLabel = sem ? (VERDICT_STYLE[sem.verdict]?.label || sem.verdict) : '—';
+  const drLabel = dr ? (RECON_STYLE[dr.status]?.label || dr.status) : '미수행';
+  const attr = (f.verdict === 'DIFFERENT' && ATTR_LABEL[f.attribution]) ? ATTR_LABEL[f.attribution] : '';
+  return `<div style="padding:16px 18px;background:${st.bg};border:1px solid ${st.border};border-left:5px solid ${st.border};border-radius:8px;margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <span style="font-size:12px;color:#c0c0d0;">종합 판정</span>
+      <span style="font-size:20px;font-weight:700;color:${st.fg};">${st.label}</span>
+      ${conf ? `<span style="font-size:11px;padding:2px 8px;border:1px solid ${st.border};border-radius:10px;color:${st.fg};">확신 ${conf}</span>` : ''}
+      ${attr ? `<span style="font-size:11px;padding:2px 8px;background:rgba(0,0,0,0.25);border-radius:10px;color:#e0dccc;">${escapeHtml(attr)}</span>` : ''}
+    </div>
+    ${f.reason ? `<div style="font-size:13px;color:#e6e2d4;margin-top:8px;line-height:1.6;">${escapeHtml(f.reason)}</div>` : ''}
+    <div style="font-size:11px;color:#9090a8;margin-top:10px;">
+      1차(정적): <b style="color:#c0c0d0;">${escapeHtml(semLabel)}</b>  ·  2차(실데이터): <b style="color:#c0c0d0;">${escapeHtml(drLabel)}</b>
+    </div>
+  </div>`;
+}
+
 const DIM_LABEL = {
   BASE_TABLES: '읽는 테이블',
   JOIN_GRAPH:  '조인 그래프',
@@ -639,12 +774,17 @@ function showComparisonResult(req) {
   const container = document.getElementById('resultContent');
   const sem = req?.semantic_diff;
   const struct = req?.structure_diff;
+  const dr = req?.data_reconcile;
 
   const tabBar = `
     <div style="display:flex;gap:4px;margin-bottom:14px;border-bottom:1px solid #303050;">
       <button class="result-tab" data-tab="semantic"
         style="padding:8px 16px;background:none;border:none;border-bottom:2px solid transparent;color:#a0a0c0;cursor:pointer;font-size:13px;">
-        의미 비교 <span style="font-size:10px;color:#707090;">(같은 데이터?)</span>
+        1차 의미 비교 <span style="font-size:10px;color:#707090;">(정적 · 같은 데이터?)</span>
+      </button>
+      <button class="result-tab" data-tab="reconcile"
+        style="padding:8px 16px;background:none;border:none;border-bottom:2px solid transparent;color:#a0a0c0;cursor:pointer;font-size:13px;">
+        2차 실데이터 대사 <span style="font-size:10px;color:#707090;">(Hue 실행 대조)</span>
       </button>
       <button class="result-tab" data-tab="structure"
         style="padding:8px 16px;background:none;border:none;border-bottom:2px solid transparent;color:#a0a0c0;cursor:pointer;font-size:13px;">
@@ -654,7 +794,7 @@ function showComparisonResult(req) {
     <div id="resultTabBody"></div>
   `;
 
-  container.innerHTML = tabBar;
+  container.innerHTML = renderFinalBanner(sem, dr) + tabBar;
 
   const tabButtons = container.querySelectorAll('.result-tab');
   const body = container.querySelector('#resultTabBody');
@@ -669,6 +809,8 @@ function showComparisonResult(req) {
     body.innerHTML = '';
     if (activeResultTab === 'semantic') {
       renderSemanticInto(body, sem);
+    } else if (activeResultTab === 'reconcile') {
+      renderReconcileInto(body, dr, req.id);
     } else {
       renderStructureInto(body, struct);
     }
@@ -746,6 +888,85 @@ function renderSemanticInto(body, sem) {
   }
 
   // 가로 2단: 좌=요약 / 우=차원별 비교
+  body.innerHTML = `<div class="result-cols">
+    <div>${summaryHtml}</div>
+    <div class="result-detail-col">${detailHtml}</div>
+  </div>`;
+}
+
+function renderReconcileInto(body, dr, reqId) {
+  if (!dr) {
+    body.innerHTML = `<div class="status-err" style="padding:20px;">2차 대사 결과가 없습니다.<br>
+      <span style="font-size:12px;color:#a0a0b8;">운영(A) 결과 샘플 CSV를 업로드하고 🤖 AI로 비교를 실행하면 분석계(B)를 Hue로 실행해 자동 대조합니다. (비활성화 시 <code>QD_RECON_ENABLED=0</code>)</span></div>`;
+    return;
+  }
+  const st = RECON_STYLE[dr.status] || RECON_STYLE.UNVERIFIABLE;
+  const bindStr = (dr.binds_used && Object.keys(dr.binds_used).length)
+    ? Object.entries(dr.binds_used).map(([k, v]) => `${k}=${v}`).join(', ') : '';
+
+  // 좌측: 판정 요약
+  let summaryHtml = `<div style="padding:14px;background:${st.bg};border-left:4px solid ${st.border};border-radius:6px;">
+    <div style="font-size:15px;font-weight:600;color:${st.fg};">2차 판정: ${st.label}</div>
+    ${dr.headline ? `<div style="font-size:12px;margin-top:6px;line-height:1.6;color:#e0dccc;">${escapeHtml(dr.headline)}</div>` : ''}
+    <div style="font-size:12px;margin-top:10px;color:#c8c4b8;line-height:1.8;">
+      <div>운영(A) 행수: ${dr.row_count_a ?? '—'} · 분석(B) 행수: ${dr.row_count_b ?? '—'} · 일치 키: ${dr.matched_keys ?? 0}</div>
+      ${bindStr ? `<div>바인드: <span style="font-family:monospace;color:#d0d0e0;">${escapeHtml(bindStr)}</span></div>` : ''}
+      ${dr.sample_bounded ? `<div style="color:#ffd060;">⚠ B 표본이 LIMIT 로 유계 — 전량이 아닐 수 있음</div>` : ''}
+      ${dr.a_sample_name ? `<div>A 샘플: ${escapeHtml(dr.a_sample_name)}</div>` : ''}
+    </div>
+  </div>`;
+
+  // UNVERIFIABLE 는 '결과 없음'이 아니라 '대조를 못 한 상태' — 사유·조치를 또렷이 안내.
+  if (dr.status === 'UNVERIFIABLE') {
+    summaryHtml += `<div style="margin-top:10px;padding:10px 12px;background:#23233a;border-left:3px solid #6060a0;border-radius:4px;font-size:12px;color:#c0c0d8;line-height:1.7;">
+      <div style="font-weight:600;margin-bottom:4px;">대조를 못 한 상태입니다 (결과 없음이 아님)</div>
+      위 헤드라인/오류에서 사유를 확인하세요. 흔한 경우:<br>
+      · 운영(A) 결과 샘플 CSV 미첨부 → 하단 '운영(A) 결과 샘플'에 CSV 업로드 후 다시 🤖 AI로 비교<br>
+      · B쿼리의 <code>\${변수}</code> 미해결 → '바인드값' 칸에 <code>이름=값</code> 입력<br>
+      · Hue 실행 오류 → B쿼리가 분석계에서 실행 가능한지 확인
+    </div>`;
+  }
+
+  if (dr.caveats && dr.caveats.length) {
+    summaryHtml += `<div style="margin-top:12px;padding:10px 12px;background:#2a2410;border-left:3px solid #ffd060;border-radius:4px;font-size:12px;color:#ffd9a0;line-height:1.7;">
+      <div style="font-weight:600;margin-bottom:4px;">해석 주의 (비대칭)</div>
+      ${dr.caveats.map(c => `<div>· ${escapeHtml(c)}</div>`).join('')}
+    </div>`;
+  }
+  if (dr.error) {
+    summaryHtml += `<div style="padding:10px;background:#3a1a1a;border-left:3px solid #f05060;border-radius:4px;margin-top:12px;font-size:12px;color:#ffb0b0;">⚠ ${escapeHtml(dr.error)}</div>`;
+  }
+  if (dr.b_csv_path) {
+    summaryHtml += `<div style="margin-top:12px;"><a href="${API}/api/comparisons/${reqId}/sample-b.csv" style="font-size:12px;color:#80c0ff;">⬇ 분석계(B) 실행 결과 CSV 내려받기</a></div>`;
+  }
+
+  // 우측: 불일치 상세 + A만/B만 키
+  let detailHtml = '';
+  const ms = dr.mismatches || [];
+  detailHtml += `<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c0c0e0;">값 불일치 상세 (${ms.length})</div>`;
+  if (ms.length) {
+    detailHtml += `<div style="display:flex;flex-direction:column;gap:8px;">`;
+    ms.forEach(m => {
+      detailHtml += `<div style="padding:10px 12px;background:#2a1a20;border-left:3px solid #f05060;border-radius:4px;font-size:12px;">
+        <div style="font-family:monospace;color:#d0d0e0;">${escapeHtml(m.key || '(키 없음)')}${m.column ? ' · ' + escapeHtml(m.column) : ''}</div>
+        <div style="display:grid;grid-template-columns:40px 1fr;gap:6px;margin-top:6px;font-family:monospace;">
+          <div style="color:#80a0c0;">A:</div><div style="color:#c0d0e0;">${escapeHtml(m.value_a)}</div>
+          <div style="color:#c0a080;">B:</div><div style="color:#e0d0c0;">${escapeHtml(m.value_b)}</div>
+        </div>
+        ${m.likely_cause ? `<div style="margin-top:6px;color:#ffd9a0;">추정 원인: ${escapeHtml(m.likely_cause)}</div>` : ''}
+      </div>`;
+    });
+    detailHtml += `</div>`;
+  } else {
+    detailHtml += `<div style="font-size:12px;color:#80a890;padding:8px 0;">값 불일치 항목 없음.</div>`;
+  }
+  if ((dr.only_in_a?.length) || (dr.only_in_b?.length)) {
+    detailHtml += `<div style="margin-top:12px;display:grid;grid-template-columns:70px 1fr;gap:6px;font-family:monospace;font-size:11px;">
+      ${dr.only_in_a?.length ? `<div style="color:#80a0c0;">A만 키:</div><div style="color:#c0d0e0;white-space:pre-line;">${dr.only_in_a.map(escapeHtml).join('\n')}</div>` : ''}
+      ${dr.only_in_b?.length ? `<div style="color:#c0a080;">B만 키:</div><div style="color:#e0d0c0;white-space:pre-line;">${dr.only_in_b.map(escapeHtml).join('\n')}</div>` : ''}
+    </div>`;
+  }
+
   body.innerHTML = `<div class="result-cols">
     <div>${summaryHtml}</div>
     <div class="result-detail-col">${detailHtml}</div>

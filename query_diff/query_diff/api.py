@@ -7,13 +7,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
+import tempfile
 
 from query_diff.models import (
     AcknowledgeRequest,
     ComparisonRequest,
     ComparisonStatus,
+    DataReconcileDiff,
     DiffSummary,
     QueryInputUpdate,
+    ReconcileStatus,
+    SampleAUpdate,
     SemanticDiff,
     StructureDiff,
     SummaryUpdate,
@@ -44,6 +48,19 @@ def _op_an_map() -> OpAnMap | None:
     except Exception as e:  # 아티팩트 부재/손상 시 매핑 없이 진행
         _log.warning("op_an_map 로드 실패 — 스키마 매핑 미적용으로 진행: %s", e)
         return None
+
+
+# 2차 대조 산출물(B 결과 CSV) 보관 베이스. 요청 id 별 하위 폴더에 저장 → 다운로드 서빙.
+_RECON_ARTIFACT_BASE = os.environ.get(
+    "QD_RECON_ARTIFACT_DIR", os.path.join(tempfile.gettempdir(), "query_diff_recon")
+)
+_SAMPLE_A_MAX_BYTES = 2 * 1024 * 1024  # 업로드 A 샘플 CSV 상한(2MB)
+
+
+def _recon_artifact_dir(req_id: str) -> str:
+    d = os.path.join(_RECON_ARTIFACT_BASE, req_id)
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 app = FastAPI(title="Query Diff Module", version="0.1.0")
@@ -159,6 +176,37 @@ def update_summary(req_id: str, body: SummaryUpdate):
 
     req.summary = DiffSummary(metrics=body.metrics)
     return store.update(req)
+
+
+# --- 2차 판단: 운영(A) 샘플 업로드 & 분석(B) 샘플 다운로드 ---
+
+@app.put("/api/comparisons/{req_id}/sample-a", response_model=ComparisonRequest)
+def update_sample_a(req_id: str, body: SampleAUpdate):
+    """운영(A) 결과 샘플 CSV(+선택 바인드값) 보관. 2차 대조에서 B 실행 결과와 대조된다."""
+    req = store.get(req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
+    if body.csv is not None:
+        if len(body.csv.encode("utf-8")) > _SAMPLE_A_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="A 샘플 CSV가 너무 큽니다(최대 2MB).")
+        req.sample_a_csv = body.csv
+    if body.filename is not None:
+        req.sample_a_filename = body.filename
+    if body.binds is not None:
+        req.sample_binds = {str(k): str(v) for k, v in body.binds.items()}
+    return store.update(req)
+
+
+@app.get("/api/comparisons/{req_id}/sample-b.csv")
+def download_sample_b(req_id: str):
+    """2차 대조에서 Hue 로 실행해 저장한 B(분석계) 결과 CSV 아티팩트를 내려받는다."""
+    req = store.get(req_id)
+    if not req or not req.data_reconcile or not req.data_reconcile.b_csv_path:
+        raise HTTPException(status_code=404, detail="B 샘플 CSV가 없습니다.")
+    path = req.data_reconcile.b_csv_path
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="B 샘플 CSV 파일을 찾을 수 없습니다.")
+    return FileResponse(path, media_type="text/csv", filename="b_sample.csv")
 
 
 # --- 검증 ---
@@ -293,6 +341,44 @@ async def execute_ai_comparison(req_id: str):
             reason="AI 의미 비교 중 예기치 못한 오류가 발생했습니다.",
             error=str(e),
         )
+
+    # 2차 판단(실데이터 대조) — ODS/제한적 게이트 없이 활성화 시 모든 경우 동작.
+    # B(분석계)를 Hue(MCP)로 실행해 업로드된 A(운영계) 샘플과 대조하고, 1차와 종합해 최종 판정.
+    recon_enabled = os.environ.get("QD_RECON_ENABLED", "1") != "0"
+    has_b = bool((req.query_b.sql_raw or "").strip())
+    if recon_enabled and has_b:
+        try:
+            from query_diff.ai_diff import reconcile_via_cli  # 지연 임포트
+            from query_diff.ai_diff.cli_runner import _compact
+
+            base_semantic = _compact(req.semantic_diff) if req.semantic_diff else None
+            _log.info(
+                "2차 대사 실행 (req=%s, A샘플=%s, binds=%d)",
+                req.id, "있음" if (req.sample_a_csv or "").strip() else "없음",
+                len(req.sample_binds or {}),
+            )
+            req.data_reconcile = await reconcile_via_cli(
+                req.query_b.sql_raw,
+                req.query_b.dialect,
+                req.sample_a_csv,
+                req.sample_a_filename,
+                req.sample_binds,
+                op_an=op_an,
+                out_dir=_recon_artifact_dir(req.id),
+                base_semantic=base_semantic,
+            )
+            _log.info("2차 대사 결과 (req=%s): status=%s final=%s",
+                      req.id, req.data_reconcile.status,
+                      req.data_reconcile.final_verdict)
+        except Exception as e:
+            req.data_reconcile = DataReconcileDiff(
+                status=ReconcileStatus.UNVERIFIABLE,
+                headline="2차 대조 중 예기치 못한 오류가 발생했습니다.",
+                error=str(e),
+            )
+            _log.warning("2차 대사 예외 (req=%s): %s", req.id, e)
+    else:
+        _log.info("2차 대사 건너뜀 (req=%s): enabled=%s has_b=%s", req.id, recon_enabled, has_b)
 
     req.status = ComparisonStatus.DONE
     store.update(req)
