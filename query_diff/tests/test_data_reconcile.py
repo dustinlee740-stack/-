@@ -312,6 +312,103 @@ def test_build_prompt_has_synthesis_rubric_and_base():
     assert "attribution" in p
 
 
+# --- 컬럼 정합 검증(업로드 파일이 쿼리 결과인지) ---
+
+def test_output_columns_and_csv_header():
+    from query_diff.ai_diff.data_reconcile import _output_columns, _csv_header
+    assert _output_columns("SELECT bank_cd, SUM(org_amt) AS org_amt FROM t GROUP BY bank_cd",
+                           "oracle") == ["bank_cd", "org_amt"]
+    assert _output_columns("SELECT * FROM t", "oracle") is None       # * → 확정 불가
+    assert _output_columns("!!! not sql", "oracle") is None            # 파싱 실패
+    assert _csv_header("BANK_CD,ORG_AMT\nBANK01,5000") == ["bank_cd", "org_amt"]  # 대소문자 정규화
+    assert _csv_header("﻿a;b\n1;2") == ["a", "b"]                       # BOM + 세미콜론
+    assert _csv_header("") is None
+
+
+def test_reconcile_column_mismatch_short_circuits(monkeypatch):
+    """A쿼리는 org_amt 산출, 업로드 CSV는 tr_amt → 결정적 단락: UNVERIFIABLE + INCONCLUSIVE(SAME 아님)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)  # 게이트가 먼저 단락돼야
+    q_a = "SELECT bank_cd, SUM(org_amt) AS org_amt FROM ias.tx GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(
+        "SELECT bank_cd, SUM(org_amt) AS org_amt FROM b GROUP BY bank_cd", Dialect.HIVE,
+        "bank_cd,tr_amt\nBANK01,5000\n", "a.csv", None,
+        sql_a=q_a, dialect_a=Dialect.ORACLE,
+    ))
+    assert dr.status == ReconcileStatus.UNVERIFIABLE
+    assert dr.final_verdict == FinalVerdict.INCONCLUSIVE     # 절대 SAME 아님
+    assert dr.error == "sample columns do not match query output columns"
+    assert "org_amt" in dr.final_reason and "tr_amt" in dr.final_reason
+
+
+def test_reconcile_column_match_proceeds_past_gate(monkeypatch):
+    """컬럼이 일치하면 게이트를 통과해 CLI 경로로 진행(여기선 claude 부재 → 다른 사유의 UNVERIFIABLE)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)
+    q_a = "SELECT bank_cd, SUM(org_amt) AS org_amt FROM ias.tx GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(
+        "SELECT bank_cd, SUM(org_amt) AS org_amt FROM b GROUP BY bank_cd", Dialect.HIVE,
+        "bank_cd,org_amt\nBANK01,5000\n", "a.csv", None,
+        sql_a=q_a, dialect_a=Dialect.ORACLE,
+    ))
+    assert dr.status == ReconcileStatus.UNVERIFIABLE
+    assert "claude CLI" in (dr.error or "")                  # 컬럼 단락 아님(게이트 통과)
+
+
+def test_column_mismatch_detects_extra_column():
+    """엄격 집합 동일: 쿼리는 org_amt만 내는데 파일에 여분 tr_amt → 미스매치(extra)."""
+    from query_diff.ai_diff.data_reconcile import _column_provenance_mismatch, _named_output_cols
+    q = "SELECT bank_cd, SUM(org_amt) AS org_amt FROM t GROUP BY bank_cd"
+    mm = _column_provenance_mismatch(q, "oracle", "bank_cd,org_amt,tr_amt\nBANK01,5000,1000\n")
+    assert mm is not None
+    _q, _h, missing, extra = mm
+    assert missing == [] and extra == ["tr_amt"]
+    # 정확히 일치 → None
+    assert _column_provenance_mismatch(q, "oracle", "bank_cd,org_amt\nBANK01,5000\n") is None
+    # 무별칭 집계 → complete=False → 여분 검사 생략(오탐 방지)
+    assert _named_output_cols("SELECT bank_cd, SUM(org_amt) FROM t GROUP BY bank_cd", "oracle")[1] is False
+    assert _column_provenance_mismatch("SELECT bank_cd, SUM(org_amt) FROM t GROUP BY bank_cd",
+                                       "oracle", "bank_cd,org_amt,tr_amt\n1,2,3") is None
+
+
+def test_reconcile_extra_column_short_circuits(monkeypatch):
+    """A쿼리 org_amt + 파일에 여분 tr_amt → 결정적 단락: UNVERIFIABLE + INCONCLUSIVE, 여분 컬럼 명시."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)
+    q_a = "SELECT bank_cd, SUM(org_amt) AS org_amt FROM ias.tx GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(
+        "SELECT bank_cd, SUM(org_amt) AS org_amt FROM b GROUP BY bank_cd", Dialect.HIVE,
+        "bank_cd,org_amt,tr_amt\nBANK01,5000,1000\n", "a.csv", None,
+        sql_a=q_a, dialect_a=Dialect.ORACLE,
+    ))
+    assert dr.status == ReconcileStatus.UNVERIFIABLE
+    assert dr.final_verdict == FinalVerdict.INCONCLUSIVE
+    assert dr.error == "sample columns do not match query output columns"
+    assert "tr_amt" in dr.headline                           # 여분 컬럼 명시
+
+
+def test_build_prompt_has_column_consistency():
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "bank_cd,tr_amt\n1,2", "a.csv", {}, [], "/tmp/b.csv",
+                      "", ["bank_cd", "org_amt"], ["bank_cd", "tr_amt"])
+    assert "[컬럼 정합성]" in p
+    assert "org_amt" in p and "tr_amt" in p
+    assert "동치(SAME)로 판정하지 말고" in p
+
+
+def test_execute_ai_column_mismatch_not_same(monkeypatch):
+    """엔드포인트: A쿼리 org_amt + 업로드 tr_amt → data_reconcile 이 INCONCLUSIVE(동치 아님)."""
+    from query_diff.ai_diff import cli_runner
+    monkeypatch.setattr(cli_runner, "_find_claude", lambda: None)      # 1차 빠름
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)
+    monkeypatch.delenv("QD_RECON_ENABLED", raising=False)
+    cid = _setup_ready("SELECT bank_cd, SUM(org_amt) AS org_amt FROM ias.tx GROUP BY bank_cd",
+                       "SELECT bank_cd, SUM(org_amt) AS org_amt FROM b GROUP BY bank_cd")
+    client.put(f"/api/comparisons/{cid}/sample-a",
+               json={"csv": "bank_cd,tr_amt\nBANK01,5000\n", "filename": "a.csv", "binds": {}})
+    dr = client.post(f"/api/comparisons/{cid}/execute-ai").json()["data_reconcile"]
+    assert dr["status"] == "UNVERIFIABLE"
+    assert dr["final_verdict"] == "INCONCLUSIVE"             # false 동치 차단
+    assert dr["error"] == "sample columns do not match query output columns"
+
+
 def test_execute_ai_data_reconcile_has_final(monkeypatch):
     """엔드포인트: 2차가 UNVERIFIABLE 이어도 final_verdict 는 1차 승계로 채워짐."""
     from query_diff.ai_diff import cli_runner

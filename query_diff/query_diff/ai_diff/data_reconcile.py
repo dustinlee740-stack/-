@@ -23,6 +23,8 @@ import re
 import tempfile
 from pathlib import Path
 
+import sqlglot
+
 from query_diff.ai_diff.cli_runner import (
     _extract_structured,
     _find_claude,
@@ -54,6 +56,108 @@ _HUE_TOOLS = (
 
 # Hue 스타일 변수: ${name} 또는 ${name=default}
 _BIND_RE = re.compile(r"\$\{([A-Za-z_]\w*)(?:=([^}]*))?\}")
+
+_CLEAN_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _norm_col(c: str) -> str:
+    """컬럼명 정규화 — 따옴표/백틱/공백 제거 후 소문자."""
+    return (c or "").strip().strip('"').strip("'").strip("`").strip().lower()
+
+
+def _named_output_cols(sql: str, dialect: str) -> tuple[list[str], bool] | None:
+    """쿼리 최종 SELECT 출력 컬럼 → (깨끗한 식별자 컬럼[소문자], complete).
+
+    `complete` = **모든 프로젝션**이 깨끗한 식별자로 이름지어졌는가(= 여분 컬럼 판정 신뢰 가능).
+    `SUM(x)`(무별칭, 이름 '')·`COUNT(*)`(무별칭, 이름 '*') 등이 섞이면 False → 파일의 '여분' 판정은
+    오탐 위험이라 생략해야 한다. **완전성은 `named_selects`(무별칭 컬럼을 조용히 누락)가 아니라
+    실제 프로젝션 목록 `tree.selects` 로 판단한다.** 파싱 실패 / bare `*`·`t.*` / 깨끗한 식별자 0개 → None.
+    """
+    from sqlglot import expressions as exp
+
+    from query_diff.validation_service import _preprocess_sql
+
+    try:
+        tree = sqlglot.parse_one(_preprocess_sql((sql or "").rstrip().rstrip(";")),
+                                 dialect=dialect or None)
+    except Exception:
+        return None
+    if tree is None:
+        return None
+
+    selects = None
+    try:
+        selects = list(tree.selects)
+    except Exception:
+        selects = None
+
+    if selects:
+        # bare star 프로젝션(`*`, `t.*`)만 확정 불가로 본다. `COUNT(*)` 는 star-select 아님.
+        for s in selects:
+            if isinstance(s, exp.Star) or (isinstance(s, exp.Column) and (s.alias_or_name or "") == "*"):
+                return None
+        names = [(s.alias_or_name or "") for s in selects]
+        clean = [_norm_col(n) for n in names if _CLEAN_IDENT_RE.match(n.strip())]
+        if not clean:
+            return None
+        return clean, len(clean) == len(selects)
+
+    # 폴백(UNION 등 `.selects` 없음): named_selects 로 이름만, 완전성은 신뢰 불가 → complete=False
+    try:
+        names = list(tree.named_selects)
+    except Exception:
+        return None
+    if not names or any("*" in (n or "") for n in names):
+        return None
+    clean = [_norm_col(n) for n in names if _CLEAN_IDENT_RE.match((n or "").strip())]
+    if not clean:
+        return None
+    return clean, False
+
+
+def _output_columns(sql: str, dialect: str) -> list[str] | None:
+    """쿼리 출력 컬럼(깨끗한 식별자, 소문자) 목록 — 프롬프트 표시용. 확정 불가 시 None."""
+    r = _named_output_cols(sql, dialect)
+    return r[0] if r else None
+
+
+def _sniff_delim(line: str) -> str:
+    """헤더 줄에서 구분자 추정 — 필드 수가 가장 많은 것(콤마 우선)."""
+    return max((",", ";", "\t"), key=lambda d: line.count(d))
+
+
+def _csv_header(csv_text: str) -> list[str] | None:
+    """CSV 첫 줄 헤더 컬럼(정규화). 비어있으면 None."""
+    text = (csv_text or "").lstrip("﻿").strip()
+    if not text:
+        return None
+    first = text.splitlines()[0]
+    cols = [_norm_col(c) for c in first.split(_sniff_delim(first))]
+    cols = [c for c in cols if c]
+    return cols or None
+
+
+def _column_provenance_mismatch(
+    sql_a: str, dialect_a: str, sample_a_csv: str,
+) -> tuple[list[str], list[str], list[str], list[str]] | None:
+    """업로드 A 샘플이 A쿼리의 결과인지 컬럼명으로 검증(**엄격 집합 동일**).
+
+    반환: (query_cols, header_cols, missing, extra) — 미스매치일 때만. 검사 불가/정합이면 None.
+      · missing = 쿼리 출력 ∖ 파일  (쿼리가 내는 컬럼이 파일에 없음) — 항상 검사.
+      · extra   = 파일 ∖ 쿼리 출력  (파일에 쿼리가 안 내는 여분 컬럼) — **complete 일 때만**.
+        (무별칭 식 등으로 쿼리 출력 컬럼을 완전히 파악 못하면 여분 판정은 오탐 위험 → 생략.)
+    """
+    parsed = _named_output_cols(sql_a, dialect_a)
+    hcols = _csv_header(sample_a_csv)
+    if not parsed or not hcols:
+        return None  # 확정 불가 → 검사 생략(LLM 2중 방어에 위임)
+    qcols, complete = parsed
+    hset, qset = set(hcols), set(qcols)
+    missing = [c for c in qcols if c not in hset]
+    extra = [c for c in hcols if c not in qset] if complete else []
+    if missing or extra:
+        return qcols, hcols, missing, extra
+    return None
 
 
 def _unverifiable(headline: str, error: str = "", **kw) -> DataReconcileDiff:
@@ -174,6 +278,8 @@ def _build_prompt(
     col_hints: list[str],
     b_csv_path: str,
     base_summary: str = "",
+    a_query_cols: list[str] | None = None,
+    a_csv_cols: list[str] | None = None,
 ) -> str:
     a_csv = (sample_a_csv or "").strip()
     a_truncated = len(a_csv) > _A_CSV_CAP
@@ -183,6 +289,8 @@ def _build_prompt(
 
     bind_lines = "\n".join(f"  - {k} = {v!r}" for k, v in binds.items()) or "  (없음)"
     hint_lines = "\n".join(f"  - {h}" for h in col_hints) or "  (제공된 매핑 힌트 없음 — 필요 시 hue_describe_table 로 컬럼 확인)"
+    qcol_s = ", ".join(a_query_cols) if a_query_cols else "(식별 불가)"
+    hcol_s = ", ".join(a_csv_cols) if a_csv_cols else "(헤더 없음)"
 
     parts = [
         "너는 query_diff 의 **2차 판단(실데이터 샘플 대조)** 검토자다. 1차(정적 AST 비교)는 이미 끝났다.\n",
@@ -211,6 +319,17 @@ def _build_prompt(
             "[운영 A 샘플] 제공되지 않음. → 대조 불가. B만 실행해 결과 표본을 확인하고 "
             "status=UNVERIFIABLE 로, headline 에 '운영 샘플 미제공 — B측 실행 결과만 표시' 를 남겨라.\n\n"
         )
+
+    parts.append(
+        "[컬럼 정합성] — A샘플은 **A쿼리의 실행 결과**여야 한다(컬럼 집합이 정확히 일치).\n"
+        f"  · A쿼리 출력 컬럼: {qcol_s}\n"
+        f"  · A샘플 CSV 헤더:  {hcol_s}\n"
+        "규칙: 두 컬럼 집합이 **정확히 같지 않으면**(쿼리에 없는 여분 컬럼이 파일에 있거나, 쿼리 출력 "
+        "컬럼이 파일에 없거나, 이름이 다르거나 — 예: 쿼리는 org_amt만 내는데 파일에 tr_amt가 더 있음) "
+        "그 파일은 이 쿼리의 결과가 아니다. 겹치는 컬럼 값이 우연히 같아도 **동치(SAME)로 판정하지 말고**, "
+        "status=UNVERIFIABLE + 컬럼 불일치 사유를 headline/final_reason 에 남겨라. "
+        "(op↔an 은 A↔B 정렬용일 뿐, A샘플↔A쿼리 정합과는 무관하다.)\n\n"
+    )
 
     parts.extend((
         "[절차]\n"
@@ -262,18 +381,59 @@ async def reconcile_via_cli(
     op_an=None,
     out_dir: str | None = None,
     base_semantic: dict | None = None,
+    sql_a: str = "",
+    dialect_a: Dialect | None = None,
 ) -> DataReconcileDiff:
     """B(분석계)를 Hue 에서 실행해 A(운영계) 샘플과 대조하고, 1차(정적)와 종합해 단일 최종 판정을 낸다.
 
-    `base_semantic` 은 1차 결과의 compact dict(`cli_runner._compact`). 실패는 모두 UNVERIFIABLE 로 반환.
+    `base_semantic` 은 1차 결과의 compact dict(`cli_runner._compact`). `sql_a`/`dialect_a` 는 업로드
+    A샘플이 A쿼리의 결과인지(컬럼) 검증하는 데 쓴다. 실패는 모두 UNVERIFIABLE 로 반환.
     """
     base_final = _final_from_base(base_semantic)  # AI 불가 시 1차 승계용(종합 배너 비지 않게)
+    resolved_binds = _resolve_binds(sql_b, binds)
+    dialect_a_s = dialect_a.value if dialect_a else ""
+
+    # 결정적 컬럼 정합 게이트 — 업로드 A샘플이 A쿼리의 결과가 아니면(출력 컬럼명 불일치) 즉시 단락.
+    # claude/값 일치와 무관하게, 컬럼이 다르면 대조 자체가 무의미하므로 동치(SAME)로 보지 않는다.
+    if (sample_a_csv or "").strip() and sql_a:
+        mm = _column_provenance_mismatch(sql_a, dialect_a_s, sample_a_csv)
+        if mm:
+            qcols, hcols, missing, extra = mm
+            diff_bits = []
+            if missing:
+                diff_bits.append(f"파일에 없는 쿼리 출력 컬럼: {', '.join(missing)}")
+            if extra:
+                diff_bits.append(f"쿼리에 없는 파일의 여분 컬럼: {', '.join(extra)}")
+            diff_s = " · ".join(diff_bits)
+            return DataReconcileDiff(
+                status=ReconcileStatus.UNVERIFIABLE,
+                headline=f"샘플 컬럼 불일치 — {diff_s}",
+                final_verdict=FinalVerdict.INCONCLUSIVE,
+                final_confidence=Confidence.LOW,
+                final_reason=(
+                    f"업로드한 운영(A) 샘플 컬럼[{', '.join(hcols)}]이 A쿼리 출력 컬럼"
+                    f"[{', '.join(qcols)}]과 정확히 일치하지 않습니다({diff_s}). 이 파일은 해당 쿼리의 "
+                    "결과가 아니므로(컬럼 집합이 다르면 서로 다른 데이터) 값이 우연히 같아도 동치로 볼 수 "
+                    "없습니다. A쿼리 출력과 컬럼이 정확히 일치하는 결과 파일을 업로드하세요."
+                ),
+                attribution=Attribution.UNKNOWN,
+                caveats=[
+                    "컬럼 집합이 다르면 서로 다른 데이터입니다 — 값 일치는 무의미합니다.",
+                    "2차 대조가 유효하려면 업로드 샘플이 A쿼리의 출력 컬럼과 정확히 일치해야 합니다.",
+                ],
+                binds_used=resolved_binds,
+                a_sample_name=sample_a_name,
+                error="sample columns do not match query output columns",
+            )
+
     claude_path = _find_claude()
     if not claude_path:
-        return _unverifiable("2차 대조 사용 불가 — claude CLI 미설치(또는 PATH에 없음)", **base_final)
+        return _unverifiable("2차 대조 사용 불가 — claude CLI 미설치(또는 PATH에 없음)",
+                             binds_used=resolved_binds, a_sample_name=sample_a_name, **base_final)
 
-    resolved_binds = _resolve_binds(sql_b, binds)
     col_hints = _column_map_hints(op_an, sql_b)
+    a_query_cols = _output_columns(sql_a, dialect_a_s) if sql_a else None
+    a_csv_cols = _csv_header(sample_a_csv) if (sample_a_csv or "").strip() else None
 
     art_dir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="qd_recon_art_"))
     try:
@@ -285,6 +445,7 @@ async def reconcile_via_cli(
     prompt = _build_prompt(
         sql_b, dialect_b.value, sample_a_csv or "", sample_a_name,
         resolved_binds, col_hints, b_csv_path, _format_base(base_semantic),
+        a_query_cols, a_csv_cols,
     )
     schema_json = json.dumps(AI_DATA_RECONCILE_SCHEMA, ensure_ascii=False)
     argv = _build_argv(claude_path, schema_json)

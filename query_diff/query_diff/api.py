@@ -371,6 +371,8 @@ async def execute_ai_comparison(req_id: str):
                 op_an=op_an,
                 out_dir=_recon_artifact_dir(req.id),
                 base_semantic=base_semantic,
+                sql_a=req.query_a.sql_raw,
+                dialect_a=req.query_a.dialect,
             )
             _log.info("2차 대사 결과 (req=%s): status=%s final=%s",
                       req.id, req.data_reconcile.status,
