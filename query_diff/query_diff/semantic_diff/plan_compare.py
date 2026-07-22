@@ -109,17 +109,21 @@ def _diff_sets_by_column(
 
 _LIT_RE = re.compile(r"'[^']*'|\b\d+(?:\.\d+)?\b")
 _INLIST_RE = re.compile(r"\(\?(?:, \?)*\)")
+# Oracle 바인드 파라미터 `:name`·`:1` (따옴표 밖). 앞이 단어문자/콜론이면 제외 —
+# 시간형 `'12:34:56'`(따옴표라 `_LIT_RE` 가 먼저 `?`)·Postgres 캐스트 `x::text` 오손 방지.
+_BIND_PARAM_RE = re.compile(r"(?<![\w:]):\w+")
 
 
 def _shape(s: str) -> str:
-    """리터럴·플레이스홀더를 `?`로, IN 목록을 `(?)`로 정규화한 형태."""
+    """리터럴·플레이스홀더·바인드파라미터를 `?`로, IN 목록을 `(?)`로 정규화한 형태."""
     s = _LIT_RE.sub("?", s)
     s = _INLIST_RE.sub("(?)", s)
+    s = _BIND_PARAM_RE.sub("?", s)   # Oracle 바인드 `:name` → `?` (Hue `${}` 는 이미 __PLACEHOLDER__)
     return s
 
 
 def _has_placeholder(s: str) -> bool:
-    return "__PLACEHOLDER__" in s or "${" in s
+    return "__PLACEHOLDER__" in s or "${" in s or bool(_BIND_PARAM_RE.search(s))
 
 
 def _is_datelike(lit: str) -> bool:

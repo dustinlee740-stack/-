@@ -199,12 +199,14 @@ def _setup_ready(sql_a, sql_b):
 def test_sample_a_upload_endpoint():
     cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")
     r = client.put(f"/api/comparisons/{cid}/sample-a",
-                   json={"csv": _A_CSV, "filename": "a.csv", "binds": {"start_dt": "20250501"}})
+                   json={"csv": _A_CSV, "filename": "a.csv",
+                         "binds_a": {"nr_number": "K"}, "binds_b": {"start_dt": "20250501"}})
     assert r.status_code == 200
     body = r.json()
     assert body["sample_a_csv"] == _A_CSV
     assert body["sample_a_filename"] == "a.csv"
-    assert body["sample_binds"] == {"start_dt": "20250501"}
+    assert body["sample_binds_a"] == {"nr_number": "K"}
+    assert body["sample_binds_b"] == {"start_dt": "20250501"}
 
 
 def test_sample_a_csv_download_endpoint():
@@ -226,25 +228,25 @@ def test_sample_a_clear_via_explicit_null():
     """파일 제거 → 프런트가 csv=null PUT → 서버가 이전 샘플을 비운다(재실행 시 stale 사용 금지)."""
     cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")
     client.put(f"/api/comparisons/{cid}/sample-a",
-               json={"csv": _A_CSV, "filename": "a.csv", "binds": {"start_dt": "20250501"}})
+               json={"csv": _A_CSV, "filename": "a.csv", "binds_b": {"start_dt": "20250501"}})
     assert client.get(f"/api/comparisons/{cid}").json()["sample_a_csv"] == _A_CSV
     # 명시적 null → clear
     client.put(f"/api/comparisons/{cid}/sample-a",
-               json={"csv": None, "filename": None, "binds": {}})
+               json={"csv": None, "filename": None, "binds_b": {}})
     body = client.get(f"/api/comparisons/{cid}").json()
     assert body["sample_a_csv"] is None
     assert body["sample_a_filename"] is None
-    assert body["sample_binds"] == {}
+    assert body["sample_binds_b"] == {}
 
 
 def test_sample_a_omitted_field_unchanged():
     """명시 안 한 필드는 불변(부분 업데이트 보존) — null 명시와 구분."""
     cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")
     client.put(f"/api/comparisons/{cid}/sample-a", json={"csv": _A_CSV, "filename": "a.csv"})
-    client.put(f"/api/comparisons/{cid}/sample-a", json={"binds": {"x": "1"}})  # csv 생략
+    client.put(f"/api/comparisons/{cid}/sample-a", json={"binds_b": {"x": "1"}})  # csv 생략
     body = client.get(f"/api/comparisons/{cid}").json()
     assert body["sample_a_csv"] == _A_CSV          # 생략 → 불변
-    assert body["sample_binds"] == {"x": "1"}
+    assert body["sample_binds_b"] == {"x": "1"}
 
 
 def test_execute_ai_kill_switch_skips_reconcile(monkeypatch):
@@ -474,7 +476,7 @@ def test_execute_ai_column_mismatch_not_same(monkeypatch):
     cid = _setup_ready("SELECT bank_cd, SUM(org_amt) AS org_amt FROM ias.tx GROUP BY bank_cd",
                        "SELECT bank_cd, SUM(org_amt) AS org_amt FROM b GROUP BY bank_cd")
     client.put(f"/api/comparisons/{cid}/sample-a",
-               json={"csv": "bank_cd,tr_amt\nBANK01,5000\n", "filename": "a.csv", "binds": {}})
+               json={"csv": "bank_cd,tr_amt\nBANK01,5000\n", "filename": "a.csv", "binds_b": {}})
     dr = client.post(f"/api/comparisons/{cid}/execute-ai").json()["data_reconcile"]
     assert dr["status"] == "UNVERIFIABLE"
     assert dr["final_verdict"] == "INCONCLUSIVE"             # false 동치 차단
@@ -491,3 +493,36 @@ def test_execute_ai_data_reconcile_has_final(monkeypatch):
     dr = client.post(f"/api/comparisons/{cid}/execute-ai").json()["data_reconcile"]
     assert dr["status"] == "UNVERIFIABLE"
     assert dr["final_verdict"] == "INCONCLUSIVE"   # 1차 LIMITED 승계
+
+
+# --- 바인드값 A/B 분리 + 1차 값 치환(라운드12) ---
+
+def test_apply_binds_substitution():
+    """_apply_binds: Oracle `:name`·Hue `${name}` 를 제공값으로 치환(따옴표/숫자/미제공 처리)."""
+    from query_diff.validation_service import _apply_binds
+    assert _apply_binds("x = :p", {"p": "'K'"}) == "x = 'K'"          # :name, 따옴표값
+    assert _apply_binds("x = :p", {"p": "K"}) == "x = 'K'"            # :name, 무따옴표 → 인용
+    assert _apply_binds("x = '${p}'", {"p": "'K'"}) == "x = 'K'"      # ${} 따옴표 안, 값따옴표 제거
+    assert _apply_binds("x = '${p}'", {"p": "K"}) == "x = 'K'"        # ${} 따옴표 안
+    assert _apply_binds("dt >= :d", {"d": "20250101"}) == "dt >= 20250101"   # 숫자 bare
+    assert _apply_binds("x = :p and y = '${q}'", {}) == "x = :p and y = '${q}'"  # 미제공 → 원문
+    assert _apply_binds("x::text = :p", {"p": "5"}) == "x::text = 5"  # 캐스트 보존
+
+
+def test_execute_binds_substituted_in_first_pass():
+    """/execute 1차: A `:p`·B `${q}` 를 각 바인드값으로 치환 후 비교.
+    동일값 → PREDICATES matched, 다른값 → 상이(사용자 목적)."""
+    def _pred(cid):
+        sem = client.post(f"/api/comparisons/{cid}/execute").json()["semantic_diff"]
+        return next(d for d in sem["dimensions"] if d["dimension"] == "PREDICATES")["matched"]
+
+    # 같은 베이스 테이블 t — 한정자/ODS 개입 없이 값 치환 자체를 검증
+    cid = _setup_ready("SELECT c FROM t WHERE k = :p", "SELECT c FROM t WHERE k = '${q}'")
+    client.put(f"/api/comparisons/{cid}/sample-a",
+               json={"binds_a": {"p": "'X'"}, "binds_b": {"q": "'X'"}})
+    assert _pred(cid) is True          # 동일 값 → 일치
+
+    cid2 = _setup_ready("SELECT c FROM t WHERE k = :p", "SELECT c FROM t WHERE k = '${q}'")
+    client.put(f"/api/comparisons/{cid2}/sample-a",
+               json={"binds_a": {"p": "'X'"}, "binds_b": {"q": "'Y'"}})
+    assert _pred(cid2) is False         # 다른 값 → 상이

@@ -83,6 +83,56 @@ def _preprocess_sql(sql: str) -> str:
     return _TEMPLATE_VAR_RE.sub(_replace_var, sql)
 
 
+# Oracle 바인드 파라미터 `:name`·`:1` (따옴표 밖). 앞이 단어문자/콜론이면 제외 —
+# 시간형 `'12:34:56'`(따옴표 안이라 아래 in_quotes 로 걸러짐)·Postgres 캐스트 `x::text` 오손 방지.
+_ORACLE_BIND_RE = re.compile(r"(?<![\w:]):(\w+)")
+
+
+def _bind_value(raw: str, in_quotes: bool) -> str:
+    """바인드 대입값 포맷 — 제공값의 바깥 따옴표 1겹을 벗기고 문맥별로 재인용.
+
+    따옴표 안(`'${x}'`·리터럴 문맥)이면 bare 삽입, 밖이면 숫자는 bare·문자열은 `'…'`.
+    → 사용자가 `'KMN…'`/`KMN…` 어느 쪽으로 입력해도 정상 SQL 이 된다.
+    """
+    v = str(raw).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1]
+    if v.lstrip("-").isdigit():
+        return v
+    return v if in_quotes else f"'{v}'"
+
+
+def _apply_binds(sql: str, binds: dict[str, str] | None) -> str:
+    """제공된 바인드값을 SQL 에 **치환**한다(1차 비교를 값-인식으로).
+
+    - Hue `${name}`/`${name=default}` **및** Oracle `:name` 지원.
+    - **제공된 이름만** 치환하고 나머지는 원문 유지 → 엔진 `_preprocess_sql` 이 미제공 `${}`→
+      placeholder, `:name`→구조 인식(라운드10/11)으로 폴백 처리.
+    - 문자열 리터럴 안/밖은 앞부분 작은따옴표 패리티로 판단(`_preprocess_sql` 과 동일 방식).
+    """
+    binds = {str(k): str(v) for k, v in (binds or {}).items()}
+    if not binds:
+        return sql
+
+    def _tmpl(m: re.Match) -> str:
+        name = m.group(1)
+        if name not in binds:
+            return m.group(0)
+        in_q = sql[: m.start()].count("'") % 2 == 1
+        return _bind_value(binds[name], in_q)
+
+    out = _TEMPLATE_VAR_RE.sub(_tmpl, sql)
+
+    def _ora(m: re.Match) -> str:
+        name = m.group(1)
+        if name not in binds:
+            return m.group(0)
+        in_q = out[: m.start()].count("'") % 2 == 1
+        return _bind_value(binds[name], in_q)
+
+    return _ORACLE_BIND_RE.sub(_ora, out)
+
+
 def _count_nodes(tree: exp.Expression, node_type: type) -> int:
     return len(list(tree.find_all(node_type)))
 

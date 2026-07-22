@@ -319,7 +319,9 @@ class ComparisonRequest(BaseModel):
     data_reconcile: Optional[DataReconcileDiff] = None
     sample_a_csv: Optional[str] = None        # 사용자 업로드 운영(A) 결과 CSV 원문
     sample_a_filename: Optional[str] = None
-    sample_binds: dict[str, str] = Field(default_factory=dict)  # B 실행에 대입할 바인드값
+    # 1차 비교 값 치환용 바인드값(A는 `:name`, B는 `${name}`). B는 2차 Hue 실행에도 사용.
+    sample_binds_a: dict[str, str] = Field(default_factory=dict)  # A(운영) 쿼리 바인드값
+    sample_binds_b: dict[str, str] = Field(default_factory=dict)  # B(분석) 쿼리 바인드값
 
 
 # --- API 요청/응답 스키마 ---
@@ -340,7 +342,8 @@ class SampleAUpdate(BaseModel):
     """운영(A) 결과 샘플 업로드 — 프런트가 CSV 를 클라이언트에서 읽어 텍스트로 전송."""
     csv: Optional[str] = None
     filename: Optional[str] = None
-    binds: Optional[dict[str, str]] = None
+    binds_a: Optional[dict[str, str]] = None   # A(운영) 쿼리 바인드값(`:name`)
+    binds_b: Optional[dict[str, str]] = None   # B(분석) 쿼리 바인드값(`${name}`)
 
 
 class WikiExtractRequest(BaseModel):

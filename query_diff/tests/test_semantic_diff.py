@@ -160,6 +160,26 @@ class TestSemanticDivergent:
         preds2 = next(d for d in r2.dimensions if d.dimension.value == "PREDICATES")
         assert not preds2.matched
 
+    def test_oracle_bind_vs_hue_bind_filter_absorbed(self):
+        """A Oracle 바인드(:p) ↔ B Hue 바인드(${q}) 필터는 둘 다 파라미터로 인식·흡수.
+
+        `_shape`·`_has_placeholder` 가 `:name` 을 파라미터로 정규화(라운드10 한정자 무시와 결합).
+        """
+        a = "SELECT SUM(x) FROM t1 WHERE k = :p"
+        b = "SELECT SUM(x) FROM t2 WHERE k = '${q}'"
+        r = compare_semantic(a, Dialect.ORACLE, b, Dialect.HIVE)
+        preds = next(d for d in r.dimensions if d.dimension.value == "PREDICATES")
+        assert preds.matched, (preds.only_in_a, preds.only_in_b)
+
+    def test_shape_bind_param_normalization(self):
+        """_shape 가 Oracle 바인드 `:name` 을 `?` 로 정규화하되, 따옴표 시간·캐스트는 보존."""
+        from query_diff.semantic_diff.plan_compare import _shape, _has_placeholder
+        assert _shape(":nr_number = nr_no") == "? = nr_no"
+        assert _has_placeholder(":nr_number = nr_no")
+        assert _shape("a = '12:34:56'") == "a = ?"          # 따옴표 시간 → 리터럴
+        assert _shape("x::text = y") == "x::text = y"        # Postgres 캐스트 보존
+        assert not _has_placeholder("status = 'A'")           # 리터럴은 파라미터 아님
+
     def test_different_join_type(self):
         a = "SELECT * FROM a LEFT JOIN b ON a.id = b.aid"
         b = "SELECT * FROM a INNER JOIN b ON a.id = b.aid"

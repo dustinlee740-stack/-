@@ -255,9 +255,15 @@
       <span id="sampleAName" style="font-size:11px;color:#80c080;margin-left:6px;"></span>
       <span id="sampleAClear" style="display:none;color:#f08080;cursor:pointer;margin-left:6px;font-size:12px;">✕</span>
     </div>
-    <div style="flex:1;min-width:240px;">
-      <label style="font-size:11px;color:#a0a0c0;display:block;margin-bottom:3px;">바인드값 (선택 · 한 줄에 <code>이름=값</code>) — B를 A샘플과 동일 조건으로 실행</label>
-      <textarea id="sampleABinds" rows="2" placeholder="start_dt=20250501&#10;end_dt=20260601" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;"></textarea>
+    <div style="flex:1;min-width:320px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div>
+        <label style="font-size:11px;color:#a0a0c0;display:block;margin-bottom:3px;">A쿼리(운영계) 바인드값 <span style="color:#8080a0;">· <code>:name</code> · 한 줄에 <code>이름=값</code></span></label>
+        <textarea id="sampleBindsA" rows="2" placeholder="nr_number=KMN0000424460824" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;"></textarea>
+      </div>
+      <div>
+        <label style="font-size:11px;color:#a0a0c0;display:block;margin-bottom:3px;">B쿼리(분석계) 바인드값 <span style="color:#8080a0;">· <code>${name}</code> · 1차 치환 + 2차 실행</span></label>
+        <textarea id="sampleBindsB" rows="2" placeholder="nr_no=KMN0000424460824&#10;start_dt=20250501" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;"></textarea>
+      </div>
     </div>
   </div>
 </div>
@@ -610,8 +616,8 @@ let sampleAFileName = null;
   });
 })();
 
-function parseBinds() {
-  const t = (document.getElementById('sampleABinds')?.value || '').trim();
+function parseBinds(elId) {
+  const t = (document.getElementById(elId)?.value || '').trim();
   if (!t) return {};
   const out = {};
   t.split(/\r?\n/).forEach(line => {
@@ -648,11 +654,12 @@ document.getElementById('btnExecuteAI').addEventListener('click', async () => {
         fname = file.name;
       }
     }
-    const binds = parseBinds();
+    const binds_a = parseBinds('sampleBindsA');
+    const binds_b = parseBinds('sampleBindsB');
     await fetch(`${API}/api/comparisons/${comparisonId}/sample-a`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ csv, filename: fname, binds }),
+      body: JSON.stringify({ csv, filename: fname, binds_a, binds_b }),
     });
     const res = await fetch(`${API}/api/comparisons/${comparisonId}/execute-ai`, { method: 'POST' });
     if (res.ok) {

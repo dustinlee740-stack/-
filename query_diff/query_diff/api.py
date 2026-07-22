@@ -30,12 +30,21 @@ from query_diff.store import store
 from query_diff.structure_diff import compare_structures
 from query_diff.structure_diff.comparator import recompute_state
 from query_diff.structure_diff.schema_mapping import OpAnMap, load_op_an_map
-from query_diff.validation_service import validate_query_input
+from query_diff.validation_service import _apply_binds, validate_query_input
 from query_diff.wiki_service import extract_sql_blocks_from_html, extract_sql_from_url
 
 import logging
 
 _log = logging.getLogger("query_diff.api")
+
+
+def _bound_query(query, binds: dict[str, str] | None):
+    """제공된 바인드값을 SQL 에 치환한 QueryInput 사본(1차 비교를 값-인식으로).
+
+    바인드가 없으면 원본 그대로 반환(불필요한 복사 회피)."""
+    if not binds or not (query.sql_raw or "").strip():
+        return query
+    return query.model_copy(update={"sql_raw": _apply_binds(query.sql_raw, binds)})
 
 
 def _op_an_map() -> OpAnMap | None:
@@ -197,8 +206,10 @@ def update_sample_a(req_id: str, body: SampleAUpdate):
         req.sample_a_csv = body.csv  # None → 제거
     if "filename" in fields:
         req.sample_a_filename = body.filename
-    if "binds" in fields:
-        req.sample_binds = {str(k): str(v) for k, v in (body.binds or {}).items()}
+    if "binds_a" in fields:
+        req.sample_binds_a = {str(k): str(v) for k, v in (body.binds_a or {}).items()}
+    if "binds_b" in fields:
+        req.sample_binds_b = {str(k): str(v) for k, v in (body.binds_b or {}).items()}
     return store.update(req)
 
 
@@ -283,9 +294,12 @@ def execute_comparison(req_id: str):
     # 차이 요약(metrics)은 선택 입력. 비어 있어도 비교 실행을 막지 않는다.
 
     op_an = _op_an_map()
+    # 1차 비교를 값-인식으로: 입력된 바인드값을 A(`:name`)·B(`${name}`) SQL 에 치환(엔진 무변경).
+    qa = _bound_query(req.query_a, req.sample_binds_a)
+    qb = _bound_query(req.query_b, req.sample_binds_b)
     req.status = ComparisonStatus.COMPARING
     try:
-        req.structure_diff = compare_structures(req.query_a, req.query_b, op_an=op_an)
+        req.structure_diff = compare_structures(qa, qb, op_an=op_an)
     except Exception as e:
         req.status = ComparisonStatus.ERROR
         store.update(req)
@@ -295,10 +309,10 @@ def execute_comparison(req_id: str):
     # SemanticDiff.error 에 사유를 담아 반환한다.
     try:
         req.semantic_diff = compare_semantic(
-            req.query_a.sql_raw,
-            req.query_a.dialect,
-            req.query_b.sql_raw,
-            req.query_b.dialect,
+            qa.sql_raw,
+            qa.dialect,
+            qb.sql_raw,
+            qb.dialect,
             op_an=op_an,
         )
     except Exception as e:
@@ -334,9 +348,12 @@ async def execute_ai_comparison(req_id: str):
         raise HTTPException(status_code=400, detail="검증 완료 상태에서만 실행할 수 있습니다.")
 
     op_an = _op_an_map()
+    # 1차(구조·의미) 비교를 값-인식으로: 입력된 바인드값을 A(`:name`)·B(`${name}`) SQL 에 치환.
+    qa = _bound_query(req.query_a, req.sample_binds_a)
+    qb = _bound_query(req.query_b, req.sample_binds_b)
     req.status = ComparisonStatus.COMPARING
     try:
-        req.structure_diff = compare_structures(req.query_a, req.query_b, op_an=op_an)
+        req.structure_diff = compare_structures(qa, qb, op_an=op_an)
     except Exception as e:
         req.status = ComparisonStatus.ERROR
         store.update(req)
@@ -346,10 +363,10 @@ async def execute_ai_comparison(req_id: str):
         from query_diff.ai_diff import compare_via_cli  # 지연 임포트
 
         req.semantic_diff = await compare_via_cli(
-            req.query_a.sql_raw,
-            req.query_a.dialect,
-            req.query_b.sql_raw,
-            req.query_b.dialect,
+            qa.sql_raw,
+            qa.dialect,
+            qb.sql_raw,
+            qb.dialect,
             op_an=op_an,
         )
     except Exception as e:
@@ -372,16 +389,16 @@ async def execute_ai_comparison(req_id: str):
 
             base_semantic = _compact(req.semantic_diff) if req.semantic_diff else None
             _log.info(
-                "2차 대사 실행 (req=%s, A샘플=%s, binds=%d)",
+                "2차 대사 실행 (req=%s, A샘플=%s, B바인드=%d)",
                 req.id, "있음" if (req.sample_a_csv or "").strip() else "없음",
-                len(req.sample_binds or {}),
+                len(req.sample_binds_b or {}),
             )
             req.data_reconcile = await reconcile_via_cli(
                 req.query_b.sql_raw,
                 req.query_b.dialect,
                 req.sample_a_csv,
                 req.sample_a_filename,
-                req.sample_binds,
+                req.sample_binds_b,
                 op_an=op_an,
                 out_dir=_recon_artifact_dir(req.id),
                 base_semantic=base_semantic,
@@ -426,7 +443,11 @@ def run_structure_diff(req_id: str):
         )
 
     try:
-        diff = compare_structures(req.query_a, req.query_b, op_an=_op_an_map())
+        diff = compare_structures(
+            _bound_query(req.query_a, req.sample_binds_a),
+            _bound_query(req.query_b, req.sample_binds_b),
+            op_an=_op_an_map(),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"구조 비교 실패: {e}")
 
@@ -487,11 +508,13 @@ def run_semantic_diff(req_id: str):
             detail="두 쿼리 모두 검증(validate)이 성공한 상태여야 합니다.",
         )
 
+    qa = _bound_query(req.query_a, req.sample_binds_a)
+    qb = _bound_query(req.query_b, req.sample_binds_b)
     diff = compare_semantic(
-        req.query_a.sql_raw,
-        req.query_a.dialect,
-        req.query_b.sql_raw,
-        req.query_b.dialect,
+        qa.sql_raw,
+        qa.dialect,
+        qb.sql_raw,
+        qb.dialect,
         op_an=_op_an_map(),
     )
     req.semantic_diff = diff
