@@ -363,10 +363,53 @@ def test_column_mismatch_detects_extra_column():
     assert missing == [] and extra == ["tr_amt"]
     # 정확히 일치 → None
     assert _column_provenance_mismatch(q, "oracle", "bank_cd,org_amt\nBANK01,5000\n") is None
-    # 무별칭 집계 → complete=False → 여분 검사 생략(오탐 방지)
-    assert _named_output_cols("SELECT bank_cd, SUM(org_amt) FROM t GROUP BY bank_cd", "oracle")[1] is False
-    assert _column_provenance_mismatch("SELECT bank_cd, SUM(org_amt) FROM t GROUP BY bank_cd",
+    # 이름 못 정하는 집계 식(SUM(a+b)) 섞임 → complete=False → 여분 검사 생략(오탐 방지)
+    assert _named_output_cols("SELECT bank_cd, SUM(org_amt + tr_amt) FROM t GROUP BY bank_cd",
+                              "oracle")[1] is False
+    assert _column_provenance_mismatch("SELECT bank_cd, SUM(org_amt + tr_amt) FROM t GROUP BY bank_cd",
                                        "oracle", "bank_cd,org_amt,tr_amt\n1,2,3") is None
+
+
+def test_unaliased_single_col_aggregate_identified():
+    """라운드6: 무별칭 단일-컬럼 집계는 인자 컬럼명을 출력 컬럼으로 유도(별칭 없이도 대조 가능).
+
+    `sum(org_amt)` → 출력 컬럼 `org_amt`(complete=True). `sum(a.org_amt)` 한정자 제거. 반면
+    `count(*)`·`sum(a+b)`·`sum(distinct x)` 는 유도 불가(보수적 식별불가/complete=False 유지).
+    """
+    from query_diff.ai_diff.data_reconcile import (
+        _column_provenance_mismatch, _named_output_cols, _output_columns,
+    )
+    # 사용자 케이스: 무별칭 단일 집계 → 식별 가능
+    assert _output_columns("SELECT sum(org_amt) FROM ias.tx", "oracle") == ["org_amt"]
+    assert _named_output_cols("SELECT sum(org_amt) FROM ias.tx", "oracle") == (["org_amt"], True)
+    assert _named_output_cols("SELECT bank_cd, sum(org_amt) FROM t GROUP BY bank_cd",
+                              "oracle") == (["bank_cd", "org_amt"], True)
+    assert _output_columns("SELECT max(a.org_amt) FROM ias.tx a", "oracle") == ["org_amt"]
+    # 유도 불가(보수적) → None 또는 complete=False
+    assert _output_columns("SELECT count(*) FROM t", "oracle") is None
+    assert _named_output_cols("SELECT bank_cd, sum(a + b) FROM t GROUP BY bank_cd",
+                              "oracle")[1] is False
+    # provenance: 무별칭 sum(org_amt) 기준 — CSV org_amt 정합 / tr_amt 누락 / 여분 tr_amt 차단
+    q = "SELECT sum(org_amt) FROM ias.tx"
+    assert _column_provenance_mismatch(q, "oracle", "org_amt\n5000\n") is None
+    mm_missing = _column_provenance_mismatch(q, "oracle", "tr_amt\n5000\n")
+    assert mm_missing is not None and mm_missing[2] == ["org_amt"]   # missing
+    mm_extra = _column_provenance_mismatch(q, "oracle", "org_amt,tr_amt\n5000,1000\n")
+    assert mm_extra is not None and mm_extra[3] == ["tr_amt"]        # extra(이제 complete=True)
+
+
+def test_reconcile_unaliased_aggregate_proceeds_past_gate(monkeypatch):
+    """라운드6 사용자 시나리오: 무별칭 sum(org_amt) + CSV org_amt → 컬럼 단락 아님(게이트 통과)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)
+    dr = asyncio.run(reconcile_via_cli(
+        "SELECT sum(gm_tr_amt) FROM ods.stlm_ods WHERE nr_no = 'K'", Dialect.HIVE,
+        "org_amt\n5000\n", "a.csv", None,
+        sql_a="SELECT sum(org_amt) FROM ias.ias_transaction WHERE nr_number = 'K'",
+        dialect_a=Dialect.ORACLE,
+    ))
+    assert dr.status == ReconcileStatus.UNVERIFIABLE
+    assert dr.error != "sample columns do not match query output columns"  # 컬럼 단락 아님
+    assert "claude CLI" in (dr.error or "")                                 # 게이트 통과 후 CLI 부재
 
 
 def test_reconcile_extra_column_short_circuits(monkeypatch):

@@ -382,8 +382,13 @@ def _agg_findings(
     # 순환 회피용 지연 import (comparator→planner)
     from query_diff.semantic_diff.planner import POSITIONAL_AGG_MARK
 
-    oa = sorted(set(a.aggregates) - set(b.aggregates))
-    ob = sorted(set(b.aggregates) - set(a.aggregates))
+    # 매칭은 semantic `_compare_aggregates`·projections 와 **동일하게** 테이블 한정자를 무시한다
+    # (`_bare` 를 인자에만 적용): A=`ias_transaction.gm_tr_amt`, B=`stlm_ods.gm_tr_amt` 처럼 컬럼은
+    # 같고 접두사만 다른 noise 를 흡수해 오탐(AGG_ARGUMENT_MISMATCH)을 막는다. 표시는 원문 인자 유지.
+    a_keys = {(f, _bare(g)) for f, g in a.aggregates}
+    b_keys = {(f, _bare(g)) for f, g in b.aggregates}
+    oa = sorted((f, g) for f, g in set(a.aggregates) if (f, _bare(g)) not in b_keys)
+    ob = sorted((f, g) for f, g in set(b.aggregates) if (f, _bare(g)) not in a_keys)
     findings: list[DiffFinding] = []
     used_b: set[int] = set()
 
@@ -447,20 +452,24 @@ def _agg_findings(
             impact="비교할 집계 지표 자체가 대응되지 않습니다.",
         ))
 
-    # 4) 매칭된 위치 기반(최신 1건) 집계 — 관용구 동치 간주, 확인 권장(WARNING 안내)
-    shared_pos = sorted(
-        (f, g) for f, g in (set(a.aggregates) & set(b.aggregates))
-        if POSITIONAL_AGG_MARK in f
+    # 4) 매칭된 위치 기반(최신 1건) 집계 — 관용구 동치 간주, 확인 권장(WARNING 안내).
+    #    한정자 무시 교집합(`(func, _bare(arg))`)으로 접두사 차이에도 NULL정렬 캐비엇이 계속 발화되게
+    #    하고, A·B 표시 스니펫은 각 측 원문 인자로 따로 만든다.
+    b_pos = {(f, _bare(g)): (f, g) for f, g in b.aggregates if POSITIONAL_AGG_MARK in f}
+    shared_pos_a = sorted(
+        (f, g) for f, g in a.aggregates
+        if POSITIONAL_AGG_MARK in f and (f, _bare(g)) in b_pos
     )
-    if shared_pos:
+    shared_pos_b = [b_pos[(f, _bare(g))] for f, g in shared_pos_a]
+    if shared_pos_a:
         findings.append(DiffFinding(
             clause=ClauseType.SELECT,
             rule_id="POSITIONAL_AGG_SOFT_MATCH",
             severity=Severity.WARNING,
-            a_snippet=_da_disp(shared_pos),
-            b_snippet=_db_disp(shared_pos),
+            a_snippet=_da_disp(shared_pos_a),
+            b_snippet=_db_disp(shared_pos_b),
             description=(
-                f"정렬 기반 최신 1건 집계 {len(shared_pos)}건을 관용구"
+                f"정렬 기반 최신 1건 집계 {len(shared_pos_a)}건을 관용구"
                 "(Oracle KEEP ↔ Hive 윈도우+CASE)로 동치 간주했습니다."
             ),
             impact=(

@@ -65,13 +65,35 @@ def _norm_col(c: str) -> str:
     return (c or "").strip().strip('"').strip("'").strip("`").strip().lower()
 
 
+def _proj_output_name(s) -> str:
+    """프로젝션의 출력 컬럼명. 별칭 우선, **무별칭 단일-컬럼 집계는 인자 컬럼명 유도**.
+
+    운영 쿼리가 `sum(org_amt)` 처럼 무별칭 집계면 sqlglot `alias_or_name` = '' 이라 출력명을
+    못 읽는다. 이때 인자가 단일 컬럼(`SUM(org_amt)`·`MAX(a.org_amt)`)이면 그 컬럼명(`org_amt`)을
+    출력명으로 유도한다(A 운영컬럼끼리 비교 → op↔an 혼선 없음). `COUNT(*)`·`SUM(a+b)`·
+    `SUM(distinct x)` 처럼 단일 bare 컬럼이 아니면 유도하지 않고 '' 반환(보수적 식별불가 유지).
+    """
+    from sqlglot import expressions as exp
+
+    if isinstance(s, exp.Alias):
+        return s.alias_or_name or ""
+    if isinstance(s, exp.AggFunc):
+        arg = s.this
+        if isinstance(arg, exp.Column) and (arg.name or "") and arg.name != "*":
+            return arg.name
+        return ""
+    return s.alias_or_name or ""
+
+
 def _named_output_cols(sql: str, dialect: str) -> tuple[list[str], bool] | None:
     """쿼리 최종 SELECT 출력 컬럼 → (깨끗한 식별자 컬럼[소문자], complete).
 
     `complete` = **모든 프로젝션**이 깨끗한 식별자로 이름지어졌는가(= 여분 컬럼 판정 신뢰 가능).
-    `SUM(x)`(무별칭, 이름 '')·`COUNT(*)`(무별칭, 이름 '*') 등이 섞이면 False → 파일의 '여분' 판정은
-    오탐 위험이라 생략해야 한다. **완전성은 `named_selects`(무별칭 컬럼을 조용히 누락)가 아니라
-    실제 프로젝션 목록 `tree.selects` 로 판단한다.** 파싱 실패 / bare `*`·`t.*` / 깨끗한 식별자 0개 → None.
+    무별칭 단일-컬럼 집계(`SUM(org_amt)`)는 인자 컬럼명을 유도해 이름을 갖는다(`_proj_output_name`).
+    `COUNT(*)`·`SUM(a+b)`·`SUM(distinct x)` 등 이름 못 정하는 프로젝션이 섞이면 complete=False →
+    파일의 '여분' 판정은 오탐 위험이라 생략한다. **완전성은 `named_selects`(무별칭 컬럼을 조용히
+    누락)가 아니라 실제 프로젝션 목록 `tree.selects` 로 판단한다.** 파싱 실패 / bare `*`·`t.*` /
+    깨끗한 식별자 0개 → None.
     """
     from sqlglot import expressions as exp
 
@@ -96,7 +118,7 @@ def _named_output_cols(sql: str, dialect: str) -> tuple[list[str], bool] | None:
         for s in selects:
             if isinstance(s, exp.Star) or (isinstance(s, exp.Column) and (s.alias_or_name or "") == "*"):
                 return None
-        names = [(s.alias_or_name or "") for s in selects]
+        names = [_proj_output_name(s) for s in selects]
         clean = [_norm_col(n) for n in names if _CLEAN_IDENT_RE.match(n.strip())]
         if not clean:
             return None

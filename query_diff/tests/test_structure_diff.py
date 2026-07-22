@@ -150,6 +150,15 @@ class TestSelectRules:
         d = compare_structures(a, b)
         assert any(f.rule_id == "AGG_ARGUMENT_MISMATCH" for f in d.findings)
 
+    def test_agg_qualifier_noise_no_finding(self):
+        """같은 집계 컬럼이 다른 테이블에서 와 접두사만 다르면(t1.amt↔t2.amt)
+        집계 오탐(AGG_ARGUMENT_MISMATCH/AGG_FUNCTION_MISMATCH)을 내지 않는다.
+        테이블명 비번역 설계의 한정자 noise 흡수 — semantic 엔진과 동일."""
+        a = _qi("SELECT SUM(amt) FROM t1", Dialect.ORACLE)
+        b = _qi("SELECT SUM(amt) FROM t2", Dialect.HIVE)
+        d = compare_structures(a, b)
+        assert not [f for f in d.findings if f.rule_id.startswith("AGG_")]
+
     def test_projection_diff_info(self):
         a = _qi("SELECT a, b, SUM(x) FROM t GROUP BY a, b", Dialect.ORACLE)
         b = _qi("SELECT a, c, SUM(x) FROM t GROUP BY a, c", Dialect.HIVE)

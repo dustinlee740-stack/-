@@ -105,6 +105,26 @@ class TestSemanticDivergent:
         aggs = next(d for d in r.dimensions if d.dimension.value == "AGGREGATES")
         assert not aggs.matched
 
+    def test_aggregate_qualifier_noise_absorbed(self):
+        """집계식 매칭은 테이블 한정자를 무시(projections·group_keys 와 동일).
+
+        같은 집계 컬럼(amt)이 서로 다른 테이블(t1↔t2)에서 오면 canonical 인자가
+        `t1.amt`↔`t2.amt` 로 접두사만 달라진다. 테이블명은 번역하지 않는 설계이므로
+        이 접두사 차이는 noise — 집계식 차원은 matched 여야 한다(오탐 방지).
+        전체 판정은 base_tables 차이로 DIVERGENT 지만 집계식 자체는 일치.
+        """
+        a = "SELECT SUM(amt) FROM t1"
+        b = "SELECT SUM(amt) FROM t2"
+        r = compare_semantic(a, Dialect.ORACLE, b, Dialect.HIVE)
+        aggs = next(d for d in r.dimensions if d.dimension.value == "AGGREGATES")
+        assert aggs.matched, (aggs.only_in_a, aggs.only_in_b)
+        # 진짜 컬럼 차이는 여전히 상이(회귀 가드)
+        a2 = "SELECT SUM(amt) FROM t1"
+        b2 = "SELECT SUM(fee) FROM t2"
+        r2 = compare_semantic(a2, Dialect.ORACLE, b2, Dialect.HIVE)
+        aggs2 = next(d for d in r2.dimensions if d.dimension.value == "AGGREGATES")
+        assert not aggs2.matched
+
     def test_different_join_type(self):
         a = "SELECT * FROM a LEFT JOIN b ON a.id = b.aid"
         b = "SELECT * FROM a INNER JOIN b ON a.id = b.aid"

@@ -50,6 +50,7 @@ from query_diff.semantic_diff.plan_compare import (
     _absorb_qualifier_noise,
     _ODS_PRED_CAVEAT,
     _GROUPKEY_GRAIN_CAVEAT,
+    _bare,
     _bare_cols,
     _da,
     _DATE_RANGE_CAVEAT,
@@ -421,12 +422,22 @@ def _compare_aggregates(
     raw_select_a: _RawSrc | None = None,
     raw_select_b: _RawSrc | None = None,
 ) -> DimensionResult:
-    # tuple(func, arg) → 문자열 표현으로 집합 비교
-    def _fmt(pairs: list[tuple[str, str]]) -> list[str]:
-        return [f"{f}({g})" for f, g in pairs]
+    # (함수, 인자) → 표시 문자열 `FUNC(인자)`. 매칭은 projections·group_keys 와 **동일하게**
+    # 테이블 한정자를 무시한다(`_bare` 를 **인자에만** 적용) — A=`ias_transaction.gm_tr_amt`,
+    # B=`stlm_ods.gm_tr_amt` 처럼 컬럼(gm_tr_amt)은 같고 접두사만 다른 noise 를 흡수(테이블명 비번역 설계).
+    # `_bare` 는 `(`·공백이 있으면 원문 반환하므로 `FUNC(...)` 전체가 아닌 인자 g 에만 적용해야 한다.
+    # 키=한정자 제거본, 값=원문 한정자 유지(표시는 이후 `_da`·`_orig_text` 로 원문/대문자). planner 정렬 순서 보존.
+    def _keymap(pairs: list[tuple[str, str]]) -> dict[str, str]:
+        m: dict[str, str] = {}
+        for f, g in pairs:
+            m.setdefault(f"{f}({_bare(g)})", f"{f}({g})")
+        return m
 
-    sa, sb = _fmt(a.aggregates), _fmt(b.aggregates)
-    matched, oa, ob, sh = _diff_sets(sa, sb)
+    ma, mb = _keymap(a.aggregates), _keymap(b.aggregates)
+    oa = [ma[k] for k in ma if k not in mb]
+    ob = [mb[k] for k in mb if k not in ma]
+    sh = [ma[k] for k in ma if k in mb]
+    matched = not oa and not ob
     oa = _da(oa, rename)
     # 표시는 **원문 집계식 그대로**(내부 토큰 MAX⟨KEEP_…⟩ 미노출, 대문자 통일).
     disp_a = _orig_text(oa, raw_select_a)
