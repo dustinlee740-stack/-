@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 import os
 import tempfile
 
@@ -212,6 +212,20 @@ def download_sample_b(req_id: str):
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="B 샘플 CSV 파일을 찾을 수 없습니다.")
     return FileResponse(path, media_type="text/csv", filename="b_sample.csv")
+
+
+@app.get("/api/comparisons/{req_id}/sample-a.csv")
+def download_sample_a(req_id: str):
+    """업로드된 운영(A) 결과 샘플 CSV 원문(`sample_a_csv`)을 내려받는다(2차 대조 표시용)."""
+    req = store.get(req_id)
+    if not req or not (req.sample_a_csv or "").strip():
+        raise HTTPException(status_code=404, detail="A 샘플 CSV가 없습니다.")
+    fn = req.sample_a_filename or "a_sample.csv"
+    return Response(
+        content=req.sample_a_csv,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fn}"'},
+    )
 
 
 # --- 검증 ---

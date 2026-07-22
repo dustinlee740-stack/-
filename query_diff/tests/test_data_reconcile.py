@@ -207,6 +207,21 @@ def test_sample_a_upload_endpoint():
     assert body["sample_binds"] == {"start_dt": "20250501"}
 
 
+def test_sample_a_csv_download_endpoint():
+    """GET /sample-a.csv — 저장된 A 샘플 원문 서빙(2차 대조 화면 A|B 표 렌더용). 없으면 404."""
+    cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")
+    # 업로드 전 → 404
+    assert client.get(f"/api/comparisons/{cid}/sample-a.csv").status_code == 404
+    client.put(f"/api/comparisons/{cid}/sample-a", json={"csv": _A_CSV, "filename": "a.csv"})
+    r = client.get(f"/api/comparisons/{cid}/sample-a.csv")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert r.text == _A_CSV
+    # 제거 후 → 404
+    client.put(f"/api/comparisons/{cid}/sample-a", json={"csv": None})
+    assert client.get(f"/api/comparisons/{cid}/sample-a.csv").status_code == 404
+
+
 def test_sample_a_clear_via_explicit_null():
     """파일 제거 → 프런트가 csv=null PUT → 서버가 이전 샘플을 비운다(재실행 시 stale 사용 금지)."""
     cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")

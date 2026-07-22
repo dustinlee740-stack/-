@@ -112,6 +112,16 @@
   .result-cols { display: grid; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
   .result-detail-col { max-height: 70vh; overflow-y: auto; padding-right: 4px; }
   @media (max-width: 820px) { .result-cols { grid-template-columns: 1fr; } .result-detail-col { max-height: none; } }
+  /* 2차 대조: A|B 샘플 데이터 좌/우 (result-cols 우측 열 안에서 상단 정렬) */
+  .sample-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 820px) { .sample-cols { grid-template-columns: 1fr; } }
+  .sample-hd { font-size: 13px; font-weight: 600; color: #c0c0e0; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .sample-box { max-height: 60vh; overflow: auto; border: 1px solid #2a2a40; border-radius: 6px; background: #16161f; }
+  .sample-tbl { border-collapse: collapse; font-size: 12px; font-family: monospace; width: 100%; }
+  .sample-tbl th, .sample-tbl td { border: 1px solid #30304a; padding: 4px 8px; text-align: left; white-space: nowrap; }
+  .sample-tbl th { background: #23233a; color: #c0c0e0; position: sticky; top: 0; }
+  .sample-tbl td { color: #d0d4e0; }
+  .sample-empty { padding: 16px; font-size: 12px; color: #8890a8; }
 </style>
 </head>
 <body>
@@ -936,41 +946,71 @@ function renderReconcileInto(body, dr, reqId) {
   if (dr.error) {
     summaryHtml += `<div style="padding:10px;background:#3a1a1a;border-left:3px solid #f05060;border-radius:4px;margin-top:12px;font-size:12px;color:#ffb0b0;">⚠ ${escapeHtml(dr.error)}</div>`;
   }
-  if (dr.b_csv_path) {
-    summaryHtml += `<div style="margin-top:12px;"><a href="${API}/api/comparisons/${reqId}/sample-b.csv" style="font-size:12px;color:#80c0ff;">⬇ 분석계(B) 실행 결과 CSV 내려받기</a></div>`;
-  }
-
-  // 우측: 불일치 상세 + A만/B만 키
-  let detailHtml = '';
-  const ms = dr.mismatches || [];
-  detailHtml += `<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c0c0e0;">값 불일치 상세 (${ms.length})</div>`;
-  if (ms.length) {
-    detailHtml += `<div style="display:flex;flex-direction:column;gap:8px;">`;
-    ms.forEach(m => {
-      detailHtml += `<div style="padding:10px 12px;background:#2a1a20;border-left:3px solid #f05060;border-radius:4px;font-size:12px;">
-        <div style="font-family:monospace;color:#d0d0e0;">${escapeHtml(m.key || '(키 없음)')}${m.column ? ' · ' + escapeHtml(m.column) : ''}</div>
-        <div style="display:grid;grid-template-columns:40px 1fr;gap:6px;margin-top:6px;font-family:monospace;">
-          <div style="color:#80a0c0;">A:</div><div style="color:#c0d0e0;">${escapeHtml(m.value_a)}</div>
-          <div style="color:#c0a080;">B:</div><div style="color:#e0d0c0;">${escapeHtml(m.value_b)}</div>
-        </div>
-        ${m.likely_cause ? `<div style="margin-top:6px;color:#ffd9a0;">추정 원인: ${escapeHtml(m.likely_cause)}</div>` : ''}
-      </div>`;
-    });
-    detailHtml += `</div>`;
-  } else {
-    detailHtml += `<div style="font-size:12px;color:#80a890;padding:8px 0;">값 불일치 항목 없음.</div>`;
-  }
-  if ((dr.only_in_a?.length) || (dr.only_in_b?.length)) {
-    detailHtml += `<div style="margin-top:12px;display:grid;grid-template-columns:70px 1fr;gap:6px;font-family:monospace;font-size:11px;">
-      ${dr.only_in_a?.length ? `<div style="color:#80a0c0;">A만 키:</div><div style="color:#c0d0e0;white-space:pre-line;">${dr.only_in_a.map(escapeHtml).join('\n')}</div>` : ''}
-      ${dr.only_in_b?.length ? `<div style="color:#c0a080;">B만 키:</div><div style="color:#e0d0c0;white-space:pre-line;">${dr.only_in_b.map(escapeHtml).join('\n')}</div>` : ''}
-    </div>`;
-  }
+  // 레이아웃: 좌측 = 판정 요약 + 해석주의 / 우측 = A(운영) · B(분석) 샘플 데이터 좌·우
+  const aDl = dr.a_sample_name ? `<a href="${API}/api/comparisons/${reqId}/sample-a.csv" style="font-size:11px;color:#80c0ff;font-weight:400;">⬇ CSV</a>` : '';
+  const bDl = dr.b_csv_path ? `<a href="${API}/api/comparisons/${reqId}/sample-b.csv" style="font-size:11px;color:#80c0ff;font-weight:400;">⬇ CSV</a>` : '';
+  const sampleHtml = `<div class="sample-cols">
+    <div>
+      <div class="sample-hd"><span>A쿼리(운영계) 샘플 데이터</span>${aDl}</div>
+      <div id="reconSampleA" class="sample-box"><div class="sample-empty">불러오는 중…</div></div>
+    </div>
+    <div>
+      <div class="sample-hd"><span>B쿼리(분석계) 샘플 데이터</span>${bDl}</div>
+      <div id="reconSampleB" class="sample-box"><div class="sample-empty">불러오는 중…</div></div>
+    </div>
+  </div>`;
 
   body.innerHTML = `<div class="result-cols">
     <div>${summaryHtml}</div>
-    <div class="result-detail-col">${detailHtml}</div>
+    <div>${sampleHtml}</div>
   </div>`;
+
+  // 샘플 CSV 를 비동기로 받아 표로 렌더(탭 전환 레이스 대비 isConnected 가드)
+  const fillSample = (elId, url, emptyMsg) => {
+    const el = body.querySelector('#' + elId);
+    if (!el) return;
+    fetch(url)
+      .then(r => r.ok ? r.text() : Promise.reject(new Error(String(r.status))))
+      .then(text => { if (el.isConnected) el.innerHTML = csvToTable(text); })
+      .catch(() => { if (el.isConnected) el.innerHTML = `<div class="sample-empty">${emptyMsg}</div>`; });
+  };
+  fillSample('reconSampleA', `${API}/api/comparisons/${reqId}/sample-a.csv`,
+             '운영(A) 샘플 없음 — 하단 업로더에서 CSV 를 첨부하세요.');
+  fillSample('reconSampleB', `${API}/api/comparisons/${reqId}/sample-b.csv`,
+             '분석계(B) 샘플 없음 — B 실행 실패·미다운로드(위 헤드라인/오류 참조).');
+}
+
+// CSV 텍스트 → HTML 표(구분자 스니핑, 기본 따옴표 처리, cap 행). 표시 전용.
+function csvToTable(text, cap = 200) {
+  const raw = (text || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n').trim();
+  if (!raw) return `<div class="sample-empty">비어 있음</div>`;
+  const lines = raw.split('\n');
+  const delim = [',', ';', '\t'].reduce((a, d) =>
+    (lines[0].split(d).length > lines[0].split(a).length ? d : a), ',');
+  const parseLine = (line) => {
+    const out = []; let cur = '', q = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) {
+        if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+        else if (c === '"') q = false;
+        else cur += c;
+      } else if (c === '"') q = true;
+      else if (c === delim) { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out;
+  };
+  const header = parseLine(lines[0]);
+  const rows = lines.slice(1).filter(l => l.length).map(parseLine);
+  const shown = rows.slice(0, cap);
+  const th = header.map(h => `<th>${escapeHtml(h)}</th>`).join('');
+  const trs = shown.map(cells =>
+    `<tr>${header.map((_, i) => `<td>${escapeHtml(cells[i] ?? '')}</td>`).join('')}</tr>`).join('');
+  const more = rows.length > cap
+    ? `<div class="sample-empty">…외 ${rows.length - cap}행 (전체는 CSV 내려받기)</div>` : '';
+  return `<table class="sample-tbl"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>${more}`;
 }
 
 function renderStructureInto(body, diff) {
