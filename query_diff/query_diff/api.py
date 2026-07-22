@@ -182,18 +182,23 @@ def update_summary(req_id: str, body: SummaryUpdate):
 
 @app.put("/api/comparisons/{req_id}/sample-a", response_model=ComparisonRequest)
 def update_sample_a(req_id: str, body: SampleAUpdate):
-    """운영(A) 결과 샘플 CSV(+선택 바인드값) 보관. 2차 대조에서 B 실행 결과와 대조된다."""
+    """운영(A) 결과 샘플 CSV(+선택 바인드값) 보관. 2차 대조에서 B 실행 결과와 대조된다.
+
+    **명시된 필드만** 반영하되(생략 → 불변), **명시된 null 은 clear** 로 처리한다
+    (`model_fields_set`). 프런트가 파일 제거 시 `csv: null` 을 보내 이전 샘플을 비울 수 있게 한다.
+    """
     req = store.get(req_id)
     if not req:
         raise HTTPException(status_code=404, detail="비교 요청을 찾을 수 없습니다.")
-    if body.csv is not None:
-        if len(body.csv.encode("utf-8")) > _SAMPLE_A_MAX_BYTES:
+    fields = body.model_fields_set
+    if "csv" in fields:
+        if body.csv is not None and len(body.csv.encode("utf-8")) > _SAMPLE_A_MAX_BYTES:
             raise HTTPException(status_code=413, detail="A 샘플 CSV가 너무 큽니다(최대 2MB).")
-        req.sample_a_csv = body.csv
-    if body.filename is not None:
+        req.sample_a_csv = body.csv  # None → 제거
+    if "filename" in fields:
         req.sample_a_filename = body.filename
-    if body.binds is not None:
-        req.sample_binds = {str(k): str(v) for k, v in body.binds.items()}
+    if "binds" in fields:
+        req.sample_binds = {str(k): str(v) for k, v in (body.binds or {}).items()}
     return store.update(req)
 
 

@@ -624,10 +624,12 @@ document.getElementById('btnExecuteAI').addEventListener('click', async () => {
   btn.textContent = '🤖 AI 비교 중… (1차→2차, 수십 초~)';
   try {
     // 2차 대사 입력(운영 A 샘플 + 바인드값) 선반영.
-    // 레이스 방지: FileReader onload 지연과 무관하게 **클릭 시점에 파일을 직접 읽는다**(await file.text()).
+    // 파일 입력(#sampleAFile)이 **단일 진실원천** — 클릭 시점에 거기서만 읽는다.
+    //  · 레이스 방지: FileReader onload 지연과 무관(await file.text()).
+    //  · 제거 반영: 파일이 없으면 csv=null 로 **항상 PUT** → 서버의 이전 샘플을 비운다(가드 없음).
     const fileEl = document.getElementById('sampleAFile');
     const file = fileEl && fileEl.files && fileEl.files[0];
-    let csv = sampleACsv, fname = sampleAFileName;
+    let csv = null, fname = null;
     if (file) {
       if (file.size > 2 * 1024 * 1024) {
         showToast('A 샘플 CSV가 너무 큽니다(최대 2MB). 샘플 없이 진행합니다.');
@@ -637,13 +639,11 @@ document.getElementById('btnExecuteAI').addEventListener('click', async () => {
       }
     }
     const binds = parseBinds();
-    if (csv || Object.keys(binds).length) {
-      await fetch(`${API}/api/comparisons/${comparisonId}/sample-a`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ csv, filename: fname, binds }),
-      });
-    }
+    await fetch(`${API}/api/comparisons/${comparisonId}/sample-a`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv, filename: fname, binds }),
+    });
     const res = await fetch(`${API}/api/comparisons/${comparisonId}/execute-ai`, { method: 'POST' });
     if (res.ok) {
       const data = await res.json();

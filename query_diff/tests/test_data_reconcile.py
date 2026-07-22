@@ -207,6 +207,31 @@ def test_sample_a_upload_endpoint():
     assert body["sample_binds"] == {"start_dt": "20250501"}
 
 
+def test_sample_a_clear_via_explicit_null():
+    """파일 제거 → 프런트가 csv=null PUT → 서버가 이전 샘플을 비운다(재실행 시 stale 사용 금지)."""
+    cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")
+    client.put(f"/api/comparisons/{cid}/sample-a",
+               json={"csv": _A_CSV, "filename": "a.csv", "binds": {"start_dt": "20250501"}})
+    assert client.get(f"/api/comparisons/{cid}").json()["sample_a_csv"] == _A_CSV
+    # 명시적 null → clear
+    client.put(f"/api/comparisons/{cid}/sample-a",
+               json={"csv": None, "filename": None, "binds": {}})
+    body = client.get(f"/api/comparisons/{cid}").json()
+    assert body["sample_a_csv"] is None
+    assert body["sample_a_filename"] is None
+    assert body["sample_binds"] == {}
+
+
+def test_sample_a_omitted_field_unchanged():
+    """명시 안 한 필드는 불변(부분 업데이트 보존) — null 명시와 구분."""
+    cid = _setup_ready("SELECT a FROM t", "SELECT a FROM t")
+    client.put(f"/api/comparisons/{cid}/sample-a", json={"csv": _A_CSV, "filename": "a.csv"})
+    client.put(f"/api/comparisons/{cid}/sample-a", json={"binds": {"x": "1"}})  # csv 생략
+    body = client.get(f"/api/comparisons/{cid}").json()
+    assert body["sample_a_csv"] == _A_CSV          # 생략 → 불변
+    assert body["sample_binds"] == {"x": "1"}
+
+
 def test_execute_ai_kill_switch_skips_reconcile(monkeypatch):
     """QD_RECON_ENABLED=0 이면 2차 미수행 → data_reconcile is None (현행 1차만)."""
     from query_diff.ai_diff import cli_runner
