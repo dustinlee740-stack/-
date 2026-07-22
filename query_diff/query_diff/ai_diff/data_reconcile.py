@@ -47,6 +47,7 @@ _A_CSV_CAP = 20000              # A 샘플 CSV 임베드 총량 캡(문자)
 _COL_HINTS_CAP = 120            # op↔an 컬럼 힌트 줄 수 캡
 
 # Kona-hue MCP 툴 화이트리스트(공백 구분 단일 인자).
+# (구 `_CLEAN_IDENT_RE` 는 accept-token 매칭으로 대체되어 제거됨)
 _HUE_TOOLS = (
     "mcp__Kona-hue-MCP__hue_run_query "
     "mcp__Kona-hue-MCP__hue_download_query "
@@ -57,43 +58,71 @@ _HUE_TOOLS = (
 # Hue 스타일 변수: ${name} 또는 ${name=default}
 _BIND_RE = re.compile(r"\$\{([A-Za-z_]\w*)(?:=([^}]*))?\}")
 
-_CLEAN_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
-
 
 def _norm_col(c: str) -> str:
     """컬럼명 정규화 — 따옴표/백틱/공백 제거 후 소문자."""
     return (c or "").strip().strip('"').strip("'").strip("`").strip().lower()
 
 
-def _proj_output_name(s) -> str:
-    """프로젝션의 출력 컬럼명. 별칭 우선, **무별칭 단일-컬럼 집계는 인자 컬럼명 유도**.
+def _norm_tok(s: str) -> str:
+    """토큰 정규화 — 따옴표/백틱 제거 + **모든 공백 제거** + 소문자.
 
-    운영 쿼리가 `sum(org_amt)` 처럼 무별칭 집계면 sqlglot `alias_or_name` = '' 이라 출력명을
-    못 읽는다. 이때 인자가 단일 컬럼(`SUM(org_amt)`·`MAX(a.org_amt)`)이면 그 컬럼명(`org_amt`)을
-    출력명으로 유도한다(A 운영컬럼끼리 비교 → op↔an 혼선 없음). `COUNT(*)`·`SUM(a+b)`·
-    `SUM(distinct x)` 처럼 단일 bare 컬럼이 아니면 유도하지 않고 '' 반환(보수적 식별불가 유지).
+    집계 표현식 헤더 비교용(`SUM( org_amt )` ≡ `sum(org_amt)`). `_norm_col` 은 내부 공백을
+    보존하므로 표현식 원문 비교에는 이쪽을 쓴다.
+    """
+    return re.sub(r"\s+", "", (s or "").strip().strip('"').strip("'").strip("`")).lower()
+
+
+def _accept_tokens(s) -> tuple[set[str] | None, str, bool]:
+    """프로젝션 → (허용 토큰 집합, 표시명, reliable).
+
+    업로드 CSV 헤더가 A쿼리 결과인지 판별할 때, 무별칭 집계의 "컬럼명"은 export 툴마다 다르다
+    (Impala/Hive/Oracle → **표현식 원문** `count(org_amt)`; 사용자 별칭/수기 → **인자 컬럼** `org_amt`).
+    그래서 단일 이름이 아니라 **허용 토큰 집합**(둘 다 수용)을 돌려준다.
+      · `Alias` → {별칭}(reliable)
+      · `Column`(name≠'*') → {컬럼}(reliable)
+      · `AggFunc(단일 Column)` → {`func(col)` 원문, `col` 인자}(reliable)
+      · `AggFunc(*)`(=`count(*)`) → {`func(*)`}(reliable)
+      · `AggFunc(식)`/기타 복합식 → 토큰은 매칭에 쓰되 **unreliable**(complete=False 로 여분 판정
+        억제 — 표현식 헤더를 예측 못해 오탐날 위험, 라운드4 원칙 유지)
+      · bare `*`/`t.*` → (None, '*', False)  → 호출부가 전체 검사 skip
+    표시명은 소문자 표현식 원문/별칭/컬럼(프롬프트·단락 메시지용).
     """
     from sqlglot import expressions as exp
 
+    if isinstance(s, exp.Star) or (isinstance(s, exp.Column) and (s.alias_or_name or "") == "*"):
+        return None, "*", False
     if isinstance(s, exp.Alias):
-        return s.alias_or_name or ""
+        a = _norm_col(s.alias_or_name)
+        return ({a} if a else None), a, bool(a)
+    if isinstance(s, exp.Column):
+        c = _norm_col(s.name)
+        return ({c} if c else None), c, bool(c)
     if isinstance(s, exp.AggFunc):
+        fname = (s.sql_name() or type(s).__name__).lower()
         arg = s.this
-        if isinstance(arg, exp.Column) and (arg.name or "") and arg.name != "*":
-            return arg.name
-        return ""
-    return s.alias_or_name or ""
+        toks: set[str] = set()
+        if isinstance(arg, exp.Star):
+            argtext, reliable = "*", True
+        elif isinstance(arg, exp.Column) and (arg.name or "") and arg.name != "*":
+            argtext, reliable = arg.name.lower(), True
+            toks.add(_norm_tok(arg.name))          # 인자 컬럼 형(사용자 별칭/수기 export)
+        else:
+            argtext = _norm_tok(arg.sql()) if arg is not None else ""
+            reliable = False                        # 집계식/DISTINCT 등 → 여분 판정 억제
+        expr = f"{fname}({argtext})"
+        toks.add(_norm_tok(expr))                   # 표현식 원문 형(실 SQL export)
+        return (toks or None), expr, reliable
+    # 기타 식(스칼라 함수·CASE·산술 등) → 예측 어려움: 토큰은 두되 unreliable
+    t = _norm_tok(s.sql())
+    return ({t} if t else None), (s.sql() or "").strip().lower(), False
 
 
-def _named_output_cols(sql: str, dialect: str) -> tuple[list[str], bool] | None:
-    """쿼리 최종 SELECT 출력 컬럼 → (깨끗한 식별자 컬럼[소문자], complete).
+def _output_projections(sql: str, dialect: str) -> list[tuple[set[str] | None, str, bool]] | None:
+    """쿼리 최종 SELECT 프로젝션 → [(허용토큰, 표시명, reliable)…].
 
-    `complete` = **모든 프로젝션**이 깨끗한 식별자로 이름지어졌는가(= 여분 컬럼 판정 신뢰 가능).
-    무별칭 단일-컬럼 집계(`SUM(org_amt)`)는 인자 컬럼명을 유도해 이름을 갖는다(`_proj_output_name`).
-    `COUNT(*)`·`SUM(a+b)`·`SUM(distinct x)` 등 이름 못 정하는 프로젝션이 섞이면 complete=False →
-    파일의 '여분' 판정은 오탐 위험이라 생략한다. **완전성은 `named_selects`(무별칭 컬럼을 조용히
-    누락)가 아니라 실제 프로젝션 목록 `tree.selects` 로 판단한다.** 파싱 실패 / bare `*`·`t.*` /
-    깨끗한 식별자 0개 → None.
+    bare `*`/`t.*` 가 하나라도 있으면(출력 컬럼 확정 불가) None → 검사 전체 skip. 파싱 실패/None 도
+    None. **완전성은 `named_selects`(무별칭 조용히 누락)가 아니라 실제 프로젝션 `tree.selects` 로 판단.**
     """
     from sqlglot import expressions as exp
 
@@ -107,40 +136,27 @@ def _named_output_cols(sql: str, dialect: str) -> tuple[list[str], bool] | None:
     if tree is None:
         return None
 
-    selects = None
     try:
         selects = list(tree.selects)
     except Exception:
         selects = None
+    if not selects:
+        return None
 
-    if selects:
-        # bare star 프로젝션(`*`, `t.*`)만 확정 불가로 본다. `COUNT(*)` 는 star-select 아님.
-        for s in selects:
-            if isinstance(s, exp.Star) or (isinstance(s, exp.Column) and (s.alias_or_name or "") == "*"):
-                return None
-        names = [_proj_output_name(s) for s in selects]
-        clean = [_norm_col(n) for n in names if _CLEAN_IDENT_RE.match(n.strip())]
-        if not clean:
-            return None
-        return clean, len(clean) == len(selects)
-
-    # 폴백(UNION 등 `.selects` 없음): named_selects 로 이름만, 완전성은 신뢰 불가 → complete=False
-    try:
-        names = list(tree.named_selects)
-    except Exception:
-        return None
-    if not names or any("*" in (n or "") for n in names):
-        return None
-    clean = [_norm_col(n) for n in names if _CLEAN_IDENT_RE.match((n or "").strip())]
-    if not clean:
-        return None
-    return clean, False
+    projs: list[tuple[set[str] | None, str, bool]] = []
+    for s in selects:
+        toks, disp, reliable = _accept_tokens(s)
+        if toks is None and disp == "*":
+            return None                              # bare star → 확정 불가, 전체 skip
+        projs.append((toks, disp, reliable))
+    return projs or None
 
 
 def _output_columns(sql: str, dialect: str) -> list[str] | None:
-    """쿼리 출력 컬럼(깨끗한 식별자, 소문자) 목록 — 프롬프트 표시용. 확정 불가 시 None."""
-    r = _named_output_cols(sql, dialect)
-    return r[0] if r else None
+    """쿼리 출력 컬럼 표시명 목록 — 프롬프트 표시용. 무별칭 집계는 표현식 원문(`sum(org_amt)`).
+    확정 불가(bare `*`/파싱 실패) 시 None."""
+    projs = _output_projections(sql, dialect)
+    return [disp for (_t, disp, _r) in projs] if projs else None
 
 
 def _sniff_delim(line: str) -> str:
@@ -162,23 +178,37 @@ def _csv_header(csv_text: str) -> list[str] | None:
 def _column_provenance_mismatch(
     sql_a: str, dialect_a: str, sample_a_csv: str,
 ) -> tuple[list[str], list[str], list[str], list[str]] | None:
-    """업로드 A 샘플이 A쿼리의 결과인지 컬럼명으로 검증(**엄격 집합 동일**).
+    """업로드 A 샘플이 A쿼리의 결과인지 컬럼명으로 검증(accept-token 매칭).
 
-    반환: (query_cols, header_cols, missing, extra) — 미스매치일 때만. 검사 불가/정합이면 None.
-      · missing = 쿼리 출력 ∖ 파일  (쿼리가 내는 컬럼이 파일에 없음) — 항상 검사.
-      · extra   = 파일 ∖ 쿼리 출력  (파일에 쿼리가 안 내는 여분 컬럼) — **complete 일 때만**.
-        (무별칭 식 등으로 쿼리 출력 컬럼을 완전히 파악 못하면 여분 판정은 오탐 위험 → 생략.)
+    각 프로젝션은 표현식 원문(`count(org_amt)`)·인자컬럼(`org_amt`)·별칭 등 **여러 형태**로 export
+    될 수 있어, 프로젝션별 허용 토큰 집합(`_accept_tokens`) 중 하나라도 CSV 헤더에 있으면 매칭으로 본다.
+
+    반환: (query_displays, header_cols, missing, extra) — 미스매치일 때만. 검사 불가/정합이면 None.
+      · missing = reliable 프로젝션 중 **허용 토큰이 CSV 헤더집합과 교집합 0** 인 것(표시명).
+      · extra   = CSV 헤더 중 **어떤 프로젝션 토큰과도 안 맞는 것** — **모든 프로젝션 reliable 일 때만**.
+        (집계식/복합식 등 표현식 헤더를 예측 못하면 여분 판정은 오탐 위험 → 생략.)
     """
-    parsed = _named_output_cols(sql_a, dialect_a)
+    projs = _output_projections(sql_a, dialect_a)
     hcols = _csv_header(sample_a_csv)
-    if not parsed or not hcols:
+    if not projs or not hcols:
         return None  # 확정 불가 → 검사 생략(LLM 2중 방어에 위임)
-    qcols, complete = parsed
-    hset, qset = set(hcols), set(qcols)
-    missing = [c for c in qcols if c not in hset]
-    extra = [c for c in hcols if c not in qset] if complete else []
+
+    identifiable = [(toks, disp, rel) for (toks, disp, rel) in projs if toks]
+    if not identifiable:
+        return None
+    complete = all(toks and rel for (toks, disp, rel) in projs)
+    hnorm = {_norm_tok(h) for h in hcols}
+    union: set[str] = set()
+    for toks, _disp, _rel in identifiable:
+        union |= toks
+
+    # missing: reliable 프로젝션이 CSV 어디에도 대응 안 됨(unreliable 은 강제 안 함)
+    missing = [disp for (toks, disp, rel) in identifiable if rel and not (toks & hnorm)]
+    # extra: CSV 헤더가 어떤 토큰과도 안 맞음(완전 파악 시에만)
+    extra = [h for h in hcols if _norm_tok(h) not in union] if complete else []
+    qdisplays = [disp for (_t, disp, _r) in identifiable]
     if missing or extra:
-        return qcols, hcols, missing, extra
+        return qdisplays, hcols, missing, extra
     return None
 
 
