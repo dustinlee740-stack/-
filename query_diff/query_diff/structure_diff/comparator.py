@@ -29,6 +29,7 @@ from query_diff.semantic_diff.plan_compare import (
     _absorb_qualifier_noise,
     _bare,
     _bare_cols,
+    _strip_qualifiers,
     _da,
     _DATE_RANGE_CAVEAT,
     _detranslate,
@@ -382,13 +383,14 @@ def _agg_findings(
     # 순환 회피용 지연 import (comparator→planner)
     from query_diff.semantic_diff.planner import POSITIONAL_AGG_MARK
 
-    # 매칭은 semantic `_compare_aggregates`·projections 와 **동일하게** 테이블 한정자를 무시한다
-    # (`_bare` 를 인자에만 적용): A=`ias_transaction.gm_tr_amt`, B=`stlm_ods.gm_tr_amt` 처럼 컬럼은
-    # 같고 접두사만 다른 noise 를 흡수해 오탐(AGG_ARGUMENT_MISMATCH)을 막는다. 표시는 원문 인자 유지.
-    a_keys = {(f, _bare(g)) for f, g in a.aggregates}
-    b_keys = {(f, _bare(g)) for f, g in b.aggregates}
-    oa = sorted((f, g) for f, g in set(a.aggregates) if (f, _bare(g)) not in b_keys)
-    ob = sorted((f, g) for f, g in set(b.aggregates) if (f, _bare(g)) not in a_keys)
+    # 매칭은 semantic `_compare_aggregates` 와 **동일하게** 테이블 한정자를 무시한다
+    # (`_strip_qualifiers` 를 인자에 적용 — CASE·산술 등 복합식 안까지 AST 로 제거): A=`ias_transaction.x`,
+    # B=`stlm_ods.x` 처럼 컬럼은 같고 접두사만 다른 noise 를 흡수해 오탐(AGG_ARGUMENT_MISMATCH)을 막는다.
+    # 표시는 원문 인자 유지.
+    a_keys = {(f, _strip_qualifiers(g)) for f, g in a.aggregates}
+    b_keys = {(f, _strip_qualifiers(g)) for f, g in b.aggregates}
+    oa = sorted((f, g) for f, g in set(a.aggregates) if (f, _strip_qualifiers(g)) not in b_keys)
+    ob = sorted((f, g) for f, g in set(b.aggregates) if (f, _strip_qualifiers(g)) not in a_keys)
     findings: list[DiffFinding] = []
     used_b: set[int] = set()
 
@@ -406,7 +408,7 @@ def _agg_findings(
         for j, (fb, gb) in enumerate(ob):
             if j in used_b:
                 continue
-            if _bare(ga) == _bare(gb) and fa != fb:
+            if _strip_qualifiers(ga) == _strip_qualifiers(gb) and fa != fb:
                 findings.append(DiffFinding(
                     clause=ClauseType.SELECT,
                     rule_id="AGG_FUNCTION_MISMATCH",
@@ -453,14 +455,14 @@ def _agg_findings(
         ))
 
     # 4) 매칭된 위치 기반(최신 1건) 집계 — 관용구 동치 간주, 확인 권장(WARNING 안내).
-    #    한정자 무시 교집합(`(func, _bare(arg))`)으로 접두사 차이에도 NULL정렬 캐비엇이 계속 발화되게
-    #    하고, A·B 표시 스니펫은 각 측 원문 인자로 따로 만든다.
-    b_pos = {(f, _bare(g)): (f, g) for f, g in b.aggregates if POSITIONAL_AGG_MARK in f}
+    #    한정자 무시 교집합(`(func, _strip_qualifiers(arg))`)으로 접두사 차이에도 NULL정렬 캐비엇이 계속
+    #    발화되게 하고, A·B 표시 스니펫은 각 측 원문 인자로 따로 만든다.
+    b_pos = {(f, _strip_qualifiers(g)): (f, g) for f, g in b.aggregates if POSITIONAL_AGG_MARK in f}
     shared_pos_a = sorted(
         (f, g) for f, g in a.aggregates
-        if POSITIONAL_AGG_MARK in f and (f, _bare(g)) in b_pos
+        if POSITIONAL_AGG_MARK in f and (f, _strip_qualifiers(g)) in b_pos
     )
-    shared_pos_b = [b_pos[(f, _bare(g))] for f, g in shared_pos_a]
+    shared_pos_b = [b_pos[(f, _strip_qualifiers(g))] for f, g in shared_pos_a]
     if shared_pos_a:
         findings.append(DiffFinding(
             clause=ClauseType.SELECT,

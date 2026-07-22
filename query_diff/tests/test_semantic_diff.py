@@ -125,6 +125,41 @@ class TestSemanticDivergent:
         aggs2 = next(d for d in r2.dimensions if d.dimension.value == "AGGREGATES")
         assert not aggs2.matched
 
+    def test_aggregate_case_expr_qualifier_noise_absorbed(self):
+        """집계 인자가 CASE 식이어도 테이블 한정자 noise 는 흡수(AST 기반 _strip_qualifiers).
+
+        `_bare` 는 공백/괄호 있으면 원문 반환이라 CASE 안의 `t1.amt`↔`t2.amt` 를 못 뗐다.
+        복합식 안 한정자까지 제거해 접두사만 다른 동일 집계는 matched 여야 한다.
+        """
+        a = "SELECT SUM(CASE WHEN amt != 0 THEN amt ELSE 0 END), COUNT(CASE WHEN amt != 0 THEN 1 ELSE 0 END) FROM t1"
+        b = "SELECT SUM(CASE WHEN amt != 0 THEN amt ELSE 0 END), COUNT(CASE WHEN amt != 0 THEN 1 ELSE 0 END) FROM t2"
+        r = compare_semantic(a, Dialect.ORACLE, b, Dialect.HIVE)
+        aggs = next(d for d in r.dimensions if d.dimension.value == "AGGREGATES")
+        assert aggs.matched, (aggs.only_in_a, aggs.only_in_b)
+        # CASE 식 안 진짜 컬럼 차이는 여전히 상이(회귀 가드)
+        a2 = "SELECT SUM(CASE WHEN amt != 0 THEN amt ELSE 0 END) FROM t1"
+        b2 = "SELECT SUM(CASE WHEN fee != 0 THEN fee ELSE 0 END) FROM t2"
+        r2 = compare_semantic(a2, Dialect.ORACLE, b2, Dialect.HIVE)
+        aggs2 = next(d for d in r2.dimensions if d.dimension.value == "AGGREGATES")
+        assert not aggs2.matched
+
+    def test_parameterized_filter_qualifier_noise_absorbed(self):
+        """B 필터가 바인드(${p})→플레이스홀더면, 테이블 한정자 갭(t1↔t2)에도 파라미터로 흡수.
+
+        `_absorb_parameterized` 의 shape 비교가 한정자를 포함해 못 흡수하던 것을 _strip_qualifiers 로 해소.
+        1차는 구조 비교 — 파라미터 값은 2차(실데이터) 소관.
+        """
+        a = "SELECT SUM(x) FROM t1 WHERE k = 'V'"
+        b = "SELECT SUM(x) FROM t2 WHERE k = '${p}'"
+        r = compare_semantic(a, Dialect.ORACLE, b, Dialect.HIVE)
+        preds = next(d for d in r.dimensions if d.dimension.value == "PREDICATES")
+        assert preds.matched, (preds.only_in_a, preds.only_in_b)
+        # 가드: 플레이스홀더 아닌 진짜 다른 리터럴은 여전히 상이
+        b2 = "SELECT SUM(x) FROM t2 WHERE k = 'W'"
+        r2 = compare_semantic(a, Dialect.ORACLE, b2, Dialect.HIVE)
+        preds2 = next(d for d in r2.dimensions if d.dimension.value == "PREDICATES")
+        assert not preds2.matched
+
     def test_different_join_type(self):
         a = "SELECT * FROM a LEFT JOIN b ON a.id = b.aid"
         b = "SELECT * FROM a INNER JOIN b ON a.id = b.aid"

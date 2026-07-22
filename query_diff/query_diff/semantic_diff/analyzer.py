@@ -52,6 +52,7 @@ from query_diff.semantic_diff.plan_compare import (
     _GROUPKEY_GRAIN_CAVEAT,
     _bare,
     _bare_cols,
+    _strip_qualifiers,
     _da,
     _DATE_RANGE_CAVEAT,
     _NULL_EMPTY_CAVEAT,
@@ -425,12 +426,13 @@ def _compare_aggregates(
     # (함수, 인자) → 표시 문자열 `FUNC(인자)`. 매칭은 projections·group_keys 와 **동일하게**
     # 테이블 한정자를 무시한다(`_bare` 를 **인자에만** 적용) — A=`ias_transaction.gm_tr_amt`,
     # B=`stlm_ods.gm_tr_amt` 처럼 컬럼(gm_tr_amt)은 같고 접두사만 다른 noise 를 흡수(테이블명 비번역 설계).
-    # `_bare` 는 `(`·공백이 있으면 원문 반환하므로 `FUNC(...)` 전체가 아닌 인자 g 에만 적용해야 한다.
-    # 키=한정자 제거본, 값=원문 한정자 유지(표시는 이후 `_da`·`_orig_text` 로 원문/대문자). planner 정렬 순서 보존.
+    # 인자 g 의 한정자만 제거해 키를 만든다(값=원문 유지, 표시는 이후 `_da`·`_orig_text`).
+    # `_strip_qualifiers` 는 AST 로 CASE·산술 등 **복합식 안의** 한정자까지 제거(단일 `table.col` 도
+    # 포섭) → A=`ias_transaction.x` ↔ B=`stlm_ods.x` 접두사 noise 흡수(테이블명 비번역 설계). planner 정렬 순서 보존.
     def _keymap(pairs: list[tuple[str, str]]) -> dict[str, str]:
         m: dict[str, str] = {}
         for f, g in pairs:
-            m.setdefault(f"{f}({_bare(g)})", f"{f}({g})")
+            m.setdefault(f"{f}({_strip_qualifiers(g)})", f"{f}({g})")
         return m
 
     ma, mb = _keymap(a.aggregates), _keymap(b.aggregates)

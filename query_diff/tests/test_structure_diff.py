@@ -159,6 +159,19 @@ class TestSelectRules:
         d = compare_structures(a, b)
         assert not [f for f in d.findings if f.rule_id.startswith("AGG_")]
 
+    def test_agg_case_expr_qualifier_noise_no_finding(self):
+        """집계 인자가 CASE 식(t1.amt↔t2.amt)이어도 접두사 noise 는 흡수 — AGG_* 미발화.
+        복합식 안 한정자까지 제거(_strip_qualifiers). 진짜 컬럼 차이는 여전히 발화."""
+        a = _qi("SELECT SUM(CASE WHEN amt != 0 THEN amt ELSE 0 END) FROM t1", Dialect.ORACLE)
+        b = _qi("SELECT SUM(CASE WHEN amt != 0 THEN amt ELSE 0 END) FROM t2", Dialect.HIVE)
+        d = compare_structures(a, b)
+        assert not [f for f in d.findings if f.rule_id.startswith("AGG_")]
+        # CASE 안 컬럼이 실제로 다르면 여전히 인자 불일치
+        a2 = _qi("SELECT SUM(CASE WHEN amt != 0 THEN amt ELSE 0 END) FROM t1", Dialect.ORACLE)
+        b2 = _qi("SELECT SUM(CASE WHEN fee != 0 THEN fee ELSE 0 END) FROM t2", Dialect.HIVE)
+        d2 = compare_structures(a2, b2)
+        assert any(f.rule_id.startswith("AGG_") for f in d2.findings)
+
     def test_projection_diff_info(self):
         a = _qi("SELECT a, b, SUM(x) FROM t GROUP BY a, b", Dialect.ORACLE)
         b = _qi("SELECT a, c, SUM(x) FROM t GROUP BY a, c", Dialect.HIVE)

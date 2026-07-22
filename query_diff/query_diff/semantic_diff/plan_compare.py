@@ -58,6 +58,31 @@ def _bare(s: str) -> str:
     return s.rsplit(".", 1)[-1]
 
 
+def _strip_qualifiers(expr: str) -> str:
+    """표현식에서 **테이블 한정자만** 제거(컬럼명·리터럴·구조 보존) — 집계 인자 매칭 키용.
+
+    `_bare` 는 단순 `table.col` 만 처리(공백/괄호 있으면 원문). `CASE WHEN t.a … END` 같은
+    복합식 안의 `ias_transaction.gm_tr_amt` ↔ `stlm_ods.gm_tr_amt` noise 는 못 뗀다(테이블명
+    비번역 설계 → A/B 접두사만 달라 오탐 상이). 여기서는 AST 로 파싱해 모든 Column 의
+    table/db/catalog 를 제거하고 재렌더한다(A·B 동일 경로 → 잔여 포맷도 정규화). AST 기반이라
+    따옴표 문자열·소수점 오손 없음. 파싱 실패 시 `_bare` 폴백(안전 — 과매칭 안 함)."""
+    try:
+        tree = sqlglot.parse_one(expr)
+    except Exception:
+        return _bare(expr)
+    if tree is None:
+        return _bare(expr)
+    for col in tree.find_all(exp.Column):
+        if col.table:
+            col.set("table", None)
+            col.set("db", None)
+            col.set("catalog", None)
+    try:
+        return tree.sql()
+    except Exception:
+        return _bare(expr)
+
+
 def _diff_sets_by_column(
     a: list[str], b: list[str]
 ) -> tuple[bool, list[str], list[str], list[str]]:
@@ -140,11 +165,14 @@ def _absorb_parameterized(
     used_b: set[int] = set()
     absorbed: list[tuple[str, str]] = []
     for x in list(rem_a):
-        sx = _shape(x)
+        # shape 는 **테이블 한정자 제거 후** 계산 — ODS 단일테이블 갭(A `ias_transaction.nr_no`
+        # vs B `stlm_ods.nr_no`)에서 컬럼은 같고 접두사만 달라도 파라미터(`${var}`) 흡수가 되게 한다.
+        # 플레이스홀더/날짜 판정은 **원문** 기준(가드 보존). (라운드5/9 와 동일 뿌리 — `_strip_qualifiers` 재사용)
+        sx = _shape(_strip_qualifiers(x))
         for j, y in enumerate(only_b):
             if j in used_b:
                 continue
-            if _shape(y) == sx and (
+            if _shape(_strip_qualifiers(y)) == sx and (
                 _has_placeholder(x) or _has_placeholder(y) or _diff_lits_all_datelike(x, y)
             ):
                 used_b.add(j)
