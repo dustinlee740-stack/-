@@ -104,19 +104,26 @@
   .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; width: 520px; max-width: 90vw; max-height: 88vh; padding: 20px 24px; display: flex; flex-direction: column; }
   .modal h3 { font-size: 16px; margin-bottom: 12px; flex-shrink: 0; }
   .modal > div:not(.modal-actions) { overflow-y: auto; flex: 1 1 auto; min-height: 0; padding-right: 4px; }
+  /* 결과 프레임은 세로만 스크롤 — 넓은 샘플 표의 가로 스크롤이 종합판정/요약/해석주의(프레임 전체)를 밀지 않게 한다. */
+  #resultContent { overflow-x: hidden; }
   .modal .result-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
   .modal .result-item:last-child { border-bottom: none; }
   .modal .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; flex-shrink: 0; }
 
   /* 결과 모달 2단 가로 레이아웃 (요약 | 상세) — 세로 스크롤 최소화 */
   .result-cols { display: grid; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
+  /* 긴 슬래시 토큰(BASE_TABLES/JOIN_GRAPH/…)이 좌측 열을 벗어나 잘리지 않도록 열 안에서 줄바꿈 + 그리드 오버플로우 가드.
+     overflow-wrap 은 상속 → 요약/캐비엇 텍스트 전체 적용. 우측 .sample-tbl 은 white-space:nowrap 이라 무영향. */
+  .result-cols > div { min-width: 0; overflow-wrap: anywhere; }
   .result-detail-col { max-height: 70vh; overflow-y: auto; padding-right: 4px; }
   @media (max-width: 820px) { .result-cols { grid-template-columns: 1fr; } .result-detail-col { max-height: none; } }
-  /* 2차 대조: A|B 샘플 데이터 좌/우 (result-cols 우측 열 안에서 상단 정렬) */
-  .sample-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  /* 2차 대조: A|B 샘플 데이터 좌/우 (result-cols 우측 열 안에서 상단 정렬).
+     .sample-cols 가 단일 스크롤러 — A·B 를 함께 담아 스크롤바 하나로 이동(개별 .sample-box 스크롤 아님).
+     1fr 1fr(=minmax(auto,1fr)): 좁으면 50/50, 넓으면 트랙이 표 min-content 로 확장 → 넘쳐서 단일 스크롤. */
+  .sample-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; overflow: auto; max-height: 60vh; }
   @media (max-width: 820px) { .sample-cols { grid-template-columns: 1fr; } }
   .sample-hd { font-size: 13px; font-weight: 600; color: #c0c0e0; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .sample-box { max-height: 60vh; overflow: auto; border: 1px solid #2a2a40; border-radius: 6px; background: #16161f; }
+  .sample-box { border: 1px solid #2a2a40; border-radius: 6px; background: #16161f; }
   .sample-tbl { border-collapse: collapse; font-size: 12px; font-family: monospace; width: 100%; }
   .sample-tbl th, .sample-tbl td { border: 1px solid #30304a; padding: 4px 8px; text-align: left; white-space: nowrap; }
   .sample-tbl th { background: #23233a; color: #c0c0e0; position: sticky; top: 0; }
