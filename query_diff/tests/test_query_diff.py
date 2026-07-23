@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 from query_diff.api import app
 from query_diff.models import Dialect, DiffMetric, QueryInput
 from query_diff.store import store
-from query_diff.validation_service import validate_sql, validate_query_input, _preprocess_sql
+from query_diff.validation_service import (
+    validate_sql,
+    validate_query_input,
+    _preprocess_sql,
+    _strip_sql_comments,
+)
 from query_diff.wiki_service import (
     extract_sql_blocks_from_html,
     extract_sql_from_url,
@@ -143,6 +148,45 @@ class TestValidation:
         sql = "SELECT /+full(it)/ * FROM ias.ias_transaction it"
         result = validate_sql(sql, Dialect.ORACLE)
         assert result.is_valid is True
+
+    def test_strip_line_comment(self):
+        """`--`로 주석 처리된 술어는 파싱 전 제거된다(비교에서 무시)."""
+        sql = ("SELECT 1 FROM t\nWHERE a = 1\n"
+               "--and nr_number = :nr_number\nAND b = 2")
+        out = _strip_sql_comments(sql)
+        assert "nr_number" not in out
+        assert "a = 1" in out and "b = 2" in out
+
+    def test_strip_inline_trailing_comment(self):
+        """식 뒤 인라인 `-- …` 주석 제거, 앞 술어는 보존."""
+        assert _strip_sql_comments("WHERE a=1 and b=2   -- and nr=:x").rstrip() == "WHERE a=1 and b=2"
+
+    def test_strip_block_comment(self):
+        """블록 주석/힌트는 공백으로 치환(토큰 접합 방지)."""
+        assert _strip_sql_comments("SELECT /*+ FULL(t) */ * FROM t") == "SELECT   * FROM t"
+        assert _strip_sql_comments("SELECT a, /* c1\n c2 */ b FROM t") == "SELECT a,   b FROM t"
+
+    def test_strip_preserves_string_literals(self):
+        """문자열 리터럴 안의 `--`·`/* */`·`''`이스케이프·시간형은 보존."""
+        assert _strip_sql_comments("WHERE note = 'a--b--c' and x=1") == "WHERE note = 'a--b--c' and x=1"
+        assert _strip_sql_comments("WHERE note = '/* not comment */'") == "WHERE note = '/* not comment */'"
+        assert _strip_sql_comments("WHERE s = 'it''s -- ok' and x=1") == "WHERE s = 'it''s -- ok' and x=1"
+        assert _strip_sql_comments("WHERE t = '12:34:56'") == "WHERE t = '12:34:56'"
+
+    def test_strip_leaves_broken_hint_for_regex(self):
+        """별표 없는 깨진 힌트 `/+…/` 는 스캐너가 건드리지 않음(_BROKEN_HINT_RE 소관)."""
+        assert _strip_sql_comments("SELECT /+full(it)/ * FROM t") == "SELECT /+full(it)/ * FROM t"
+
+    def test_preprocess_removes_comment_before_template(self):
+        """전처리: 주석 안 `${var}`·`:name` 도 주석과 함께 제거(치환 안 됨)."""
+        out = _preprocess_sql("SELECT 1 FROM t WHERE a=1\n--and nr = '${nr}'\nAND b=2")
+        assert "nr" not in out and "__PLACEHOLDER__" not in out
+        assert "a = 1" in out.replace("=", " = ").replace("  ", " ") or "a=1" in out
+
+    def test_en_dash_comment_fully_removed(self):
+        """en-dash 복구분(`–`→`--`)도 2)단계에서 주석으로 제거 → 활성 SQL 만 남음."""
+        out = _preprocess_sql("SELECT 1 FROM t WHERE x=1\n – 등록일시 기준\nAND y=2")
+        assert "등록일시" not in out
 
     def test_hive_korean_alias(self):
         """한글 alias를 따옴표 없이 사용한 HiveQL 파싱"""

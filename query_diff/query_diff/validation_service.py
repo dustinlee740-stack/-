@@ -51,16 +51,66 @@ _WRONG_DASH_COMMENT_RE = re.compile(r"(^|\s)[–—](\s)", re.MULTILINE)
 _BROKEN_HINT_RE = re.compile(r"/\+[^/\n]*/")
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """SQL 주석(`--…EOL`·`/* … */`)을 **파싱 전에** 제거한다.
+
+    주석 처리된 코드는 실행되지 않으므로 비교에서도 무시돼야 한다. 그러나 sqlglot 은 주석을
+    노드 `.comments` 에 보존하고 `.sql()`·토큰 슬라이스가 이를 재노출해 조인 ON 표시·복합식
+    표시 등으로 새어든다(실측). 모든 파싱 경로가 `_preprocess_sql` 을 통과하므로 여기서 한 번
+    제거하면 AST·텍스트 표시 경로까지 전 클래스가 소멸한다.
+
+    문자열 리터럴(`'…'`+`''`이스케이프·`"…"`·`` `…` ``) **밖**만 제거 — `'a--b'`·`'/* x */'`·
+    `'12:34:56'`·`x::text` 는 보존. 블록 주석은 공백 1개로 치환(토큰 접합 방지). 별표 없는 깨진
+    힌트 `/+…/` 는 건드리지 않아 `_BROKEN_HINT_RE` 가 계속 처리한다.
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    quote: str | None = None  # 활성 문자열/인용식별자 따옴표
+    while i < n:
+        c = sql[i]
+        if quote:
+            out.append(c)
+            if c == quote:
+                if quote == "'" and i + 1 < n and sql[i + 1] == "'":
+                    out.append(sql[i + 1])  # '' 이스케이프 — 문자열 유지
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"', "`"):
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":  # 라인 주석 → 개행 전까지 제거
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":  # 블록 주석 → 공백으로 치환
+            j = sql.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            out.append(" ")
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _preprocess_sql(sql: str) -> str:
     """sqlglot 파싱 전 전처리:
     1) en-dash/em-dash 주석 마커를 표준 '--'로 복구
-    2) 깨진 Oracle 힌트 제거
-    3) 템플릿 변수를 기본값 또는 플레이스홀더로 치환
+    2) 주석(`--`·`/* */`) 제거 — 주석 처리된 코드는 비교에서 무시(누출 방지)
+    3) 깨진 Oracle 힌트 제거
+    4) 템플릿 변수를 기본값 또는 플레이스홀더로 치환
     """
-    # 1) 잘못된 대시 주석 복구
+    # 1) 잘못된 대시 주석 복구 (Word 자동교정된 '–'/'—' → 표준 '--'로: 아래 2)에서 주석으로 제거)
     sql = _WRONG_DASH_COMMENT_RE.sub(r"\1--\2", sql)
 
-    # 2) 깨진 힌트 제거 (힌트는 optimizer 지시어라 구조 비교에 영향 없음)
+    # 2) 주석 제거 (주석 안 ${var}·:bind 도 함께 사라져 이후 치환/따옴표 패리티 오염 없음)
+    sql = _strip_sql_comments(sql)
+
+    # 3) 깨진 힌트 제거 (힌트는 optimizer 지시어라 구조 비교에 영향 없음)
     sql = _BROKEN_HINT_RE.sub(" ", sql)
 
     def _replace_var(m: re.Match) -> str:
@@ -113,6 +163,10 @@ def _apply_binds(sql: str, binds: dict[str, str] | None) -> str:
     binds = {str(k): str(v) for k, v in (binds or {}).items()}
     if not binds:
         return sql
+
+    # 주석 안 `${var}`/`:name` 에 값이 주입돼 새는 경로 차단 + 따옴표 패리티 정합
+    # (엔진 `_preprocess_sql` 도 주석을 제거하나, 치환 전 선제거로 활성 SQL 만 치환한다).
+    sql = _strip_sql_comments(sql)
 
     def _tmpl(m: re.Match) -> str:
         name = m.group(1)

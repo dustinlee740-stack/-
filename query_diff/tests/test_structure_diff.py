@@ -122,6 +122,15 @@ class TestWhereRules:
         assert len(lit) == 1
         assert lit[0].severity == Severity.CRITICAL
 
+    def test_commented_predicate_ignored(self):
+        """`--` 주석 처리된 술어는 구조 비교에서 무시 — WHERE 오탐 finding 없음."""
+        a = _qi("SELECT 1 FROM t WHERE x = 1\n--and nr_number = 'V'\nAND y = 2", Dialect.ORACLE)
+        b = _qi("SELECT 1 FROM t WHERE x = 1 AND y = 2", Dialect.HIVE)
+        d = compare_structures(a, b)
+        assert not any(f.rule_id.startswith("WHERE_") for f in d.findings), [
+            f.rule_id for f in d.findings
+        ]
+
 
 class TestGroupByHavingRules:
     def test_group_by_mismatch(self):

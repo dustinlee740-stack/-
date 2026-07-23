@@ -45,6 +45,7 @@ _DEFAULT_EFFORT = "medium"
 _SAMPLE_LIMIT = 1000            # B 유계 표본 LIMIT(컨텍스트 폭주 방지)
 _A_CSV_CAP = 20000              # A 샘플 CSV 임베드 총량 캡(문자)
 _COL_HINTS_CAP = 120            # op↔an 컬럼 힌트 줄 수 캡
+_BASE_DIFF_CAP = 8              # 1차 요약에서 불일치 차원의 A만/B만 항목 표시 캡
 
 # Kona-hue MCP 툴 화이트리스트(공백 구분 단일 인자).
 # (구 `_CLEAN_IDENT_RE` 는 accept-token 매칭으로 대체되어 제거됨)
@@ -311,10 +312,20 @@ def _format_base(base: dict | None) -> str:
     if reason:
         lines.append(f"요약: {reason.splitlines()[0]}")
     for d in base.get("dimensions") or []:
-        mark = "⚠제한" if d.get("limited") else ("✓일치" if d.get("matched") else "✗불일치")
+        matched = d.get("matched")
+        mark = "⚠제한" if d.get("limited") else ("✓일치" if matched else "✗불일치")
         exp = (d.get("explanation") or "").strip()
         lines.append(f"- {d.get('dimension')}: {mark}"
                      + (f" · {exp.splitlines()[0]}" if exp else ""))
+        # 불일치 차원은 **구체 항목(A만/B만)** 을 함께 노출 — LLM 이 A/B 의 실제 활성 필터 차이를
+        # 알아야 '동일 조건 대조' 라고 오서술하지 않는다(예: A만 mti/response_code · B만 nr_no).
+        if not matched:
+            oa = [str(x) for x in (d.get("only_in_a") or [])][:_BASE_DIFF_CAP]
+            ob = [str(x) for x in (d.get("only_in_b") or [])][:_BASE_DIFF_CAP]
+            if oa:
+                lines.append(f"    · A만: {', '.join(oa)}")
+            if ob:
+                lines.append(f"    · B만: {', '.join(ob)}")
     lims = base.get("limitations") or []
     if lims:
         lines.append("정규화 제한: " + "; ".join(str(x) for x in lims[:3]))
@@ -353,9 +364,26 @@ def _build_prompt(
 
         f"[B 쿼리 — 분석계 / {dialect_b}]\n{sql_b}\n\n",
 
-        "[바인드값] — 아래 값을 B쿼리의 `${{...}}` 자리(또는 해당 필터)에 **그대로 치환**해 "
-        "Impala 가 이해하는 완성 SQL 을 만든 뒤 실행하라. A샘플을 뽑은 조건과 동일해야 의미가 있다.\n"
+        "[바인드값] — 아래 값을 B쿼리에 **실제로 있는** `${{...}}` 자리에만 **그대로 치환**해 "
+        "Impala 가 이해하는 완성 SQL 을 만든 뒤 실행하라. **쿼리에 없는(주석 처리됐거나 삭제된) "
+        "조건은 임의로 추가하지 마라.** (바인드는 B쿼리를 사용자가 의도한 값으로 실행하기 위한 것이다.)\n"
         f"{bind_lines}\n\n",
+
+        "[A샘플 신뢰 전제 — 중요] 업로드된 A샘플은 **A쿼리(위 주석 반영)를 그대로 실행한 정상 결과**로 "
+        "**신뢰하라**. 업로드 데이터에는 실행 쿼리가 첨부되지 않으므로, '어떤 조건으로 뽑혔는지 확인되지 "
+        "않았다'거나 '이 샘플을 믿을 수 없다'는 식으로 **의심하지 마라** — 그렇게 하면 어떤 대조도 무의미해진다. "
+        "A샘플의 진위 점검은 아래 [컬럼 정합성](출력 컬럼 일치)까지이며, 그걸 통과하면 값은 A쿼리의 결과로 "
+        "확정 간주한다.\n\n",
+
+        "[조건 정합성 — 중요] 위 1차 요약에서 어떤 차원(특히 PREDICATES)이 '✗불일치'이고 A만/B만 필터가 "
+        "표시되면, **A쿼리와 B쿼리가 서로 다른 활성 조건으로 정의된 것이다(추측이 아니라 1차가 확인한 사실).** "
+        "예: A는 mti/response_code 로만 필터(nr 조건은 주석이라 없음), B는 nr_no 로 필터. 이때 A샘플은 "
+        "A쿼리(nr 없음)의 정상 결과이고 B는 B쿼리(nr 필터)의 결과다 — **둘 다 각자 정상 결과**지만 "
+        "**필터 조건이 다르다**. 따라서 표본 값이 우연히 같아도 **'동일 조건으로 대조했다'거나 '동치'라고 "
+        "서술하지 마라.** headline/final_reason 의 사유는 **'A샘플 조건이 확인되지 않았다'가 아니라 "
+        "'A와 B의 쿼리 조건이 다르다'** 로 쓰고(A만/B만 필터를 사실로 명시 — 예: 'A는 nr 필터 없음, B는 "
+        "nr_no 필터 → 서로 다른 조건이라 이 값 일치는 우연이며 동치 근거가 아님'), 추측성 '가능성' 표현 대신 "
+        "1차가 확인한 사실로 단정해 서술하라.\n\n",
 
         "[운영 op ↔ 분석 an 컬럼 힌트] — A(운영명) 컬럼을 B(분석명) 컬럼에 정렬할 때 참고.\n"
         f"{hint_lines}\n\n",
@@ -441,8 +469,17 @@ async def reconcile_via_cli(
     `base_semantic` 은 1차 결과의 compact dict(`cli_runner._compact`). `sql_a`/`dialect_a` 는 업로드
     A샘플이 A쿼리의 결과인지(컬럼) 검증하는 데 쓴다. 실패는 모두 UNVERIFIABLE 로 반환.
     """
+    # 주석(`--`·`/* */`) 처리된 코드는 실행/대조에서 제외한다 — 주석 속 필터·`${}`·바인드가 2차 Hue
+    # 실행에서 되살아나 오탐('표본 우연일치 → 동일')하던 것을 차단(라운드14). A측은 _preprocess_sql 로 이미 정화.
+    from query_diff.validation_service import _strip_sql_comments
+    sql_b = _strip_sql_comments(sql_b or "")
+
     base_final = _final_from_base(base_semantic)  # AI 불가 시 1차 승계용(종합 배너 비지 않게)
     resolved_binds = _resolve_binds(sql_b, binds)
+    # 활성 B쿼리에 실제 등장(`${name}`)하는 바인드만 유효 — 주석에만 있던 leftover(예: 주석 필터의 nr_no)는
+    # 프롬프트·실행·binds_used 에서 제외해 LLM 이 없는 필터를 되살리지 못하게 한다.
+    _referenced = {m.group(1) for m in _BIND_RE.finditer(sql_b)}
+    resolved_binds = {k: v for k, v in resolved_binds.items() if k in _referenced}
     dialect_a_s = dialect_a.value if dialect_a else ""
 
     # 결정적 컬럼 정합 게이트 — 업로드 A샘플이 A쿼리의 결과가 아니면(출력 컬럼명 불일치) 즉시 단락.

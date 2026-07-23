@@ -180,6 +180,28 @@ class TestSemanticDivergent:
         assert _shape("x::text = y") == "x::text = y"        # Postgres 캐스트 보존
         assert not _has_placeholder("status = 'A'")           # 리터럴은 파라미터 아님
 
+    def test_commented_predicate_ignored(self):
+        """`--` 주석 처리된 술어는 비교에서 완전히 무시된다(활성 술어만 대조)."""
+        a = ("SELECT SUM(x) FROM t WHERE a = 1 AND b = 2\n"
+             "--and nr_number = :nr_number")
+        b = "SELECT SUM(x) FROM t WHERE a = 1 AND b = 2"
+        r = compare_semantic(a, Dialect.ORACLE, b, Dialect.HIVE)
+        preds = next(d for d in r.dimensions if d.dimension.value == "PREDICATES")
+        assert preds.matched, (preds.only_in_a, preds.only_in_b)
+        blob = str(preds.only_in_a) + str(preds.only_in_b) + str(preds.shared)
+        assert "nr_number" not in blob.lower()
+
+    def test_commented_join_condition_not_leaked(self):
+        """JOIN ON 절 **사이에 낀** 주석이 조인 표시 라벨(원본 ON)로 새지 않는다(C1 회귀)."""
+        from query_diff.semantic_diff.optimizer import normalize_query
+        from query_diff.semantic_diff.plan_compare import _raw_on_map
+        sql = ("select a.id from t1 a join t2 b on a.id = b.id\n"
+               "--and a.secret = b.secret\nand a.k = b.k")
+        tree, _ = normalize_query(sql, "hive")
+        label = _raw_on_map(tree).get("t2", "")
+        assert "/*" not in label and "secret" not in label
+        assert "a.id = b.id" in label and "a.k = b.k" in label
+
     def test_different_join_type(self):
         a = "SELECT * FROM a LEFT JOIN b ON a.id = b.aid"
         b = "SELECT * FROM a INNER JOIN b ON a.id = b.aid"

@@ -148,6 +148,25 @@ def test_resolve_binds_prefers_nonempty_default_over_bare():
     assert _resolve_binds("no vars", {"x": "z"}) == {"x": "z"}
 
 
+def test_reconcile_ignores_commented_bind_filter(monkeypatch):
+    """주석 처리된 `${nr_no}` 필터는 2차 실행/바인드에서 제외(R14).
+
+    주석 코드는 실행되지 않으므로, 그 안의 바인드값이 되살아나 B를 필터링하면 안 된다.
+    """
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)  # 서브프로세스 없이 단락
+    b_commented = "select count(1) c from ods.stlm_ods where 1=1\n--and nr_no = '${nr_no}'"
+    r = asyncio.run(reconcile_via_cli(
+        b_commented, Dialect.HIVE, "c\n1\n", "a.csv", {"nr_no": "KMN0000424460824"},
+    ))
+    assert r.binds_used == {}                                    # 주석 leftover 제외
+    # 대비(회귀): 활성 필터면 바인드 그대로 적용
+    b_active = "select count(1) c from ods.stlm_ods where 1=1 and nr_no = '${nr_no}'"
+    r2 = asyncio.run(reconcile_via_cli(
+        b_active, Dialect.HIVE, "c\n1\n", "a.csv", {"nr_no": "KMN0000424460824"},
+    ))
+    assert r2.binds_used == {"nr_no": "KMN0000424460824"}
+
+
 def test_column_map_hints_filters_by_sql_and_renames_only():
     class _M:
         columns = {
@@ -327,6 +346,46 @@ def test_build_prompt_has_synthesis_rubric_and_base():
     assert "DIVERGENT" in p                     # base 요약 주입
     assert "INCONCLUSIVE" in p                  # 비대칭 루브릭(DIVERGENT+MATCH→INCONCLUSIVE)
     assert "attribution" in p
+
+
+def test_format_base_surfaces_diverging_filters():
+    """불일치 차원은 A만/B만 구체 필터를 노출 — LLM 이 '동일 조건 대조' 오서술 안 하도록(R15)."""
+    from query_diff.ai_diff.data_reconcile import _format_base
+    base = _format_base({
+        "verdict": "DIVERGENT",
+        "dimensions": [
+            {"dimension": "PREDICATES", "matched": False,
+             "only_in_a": ["IAS_TRANSACTION.MTI != '0120'"],
+             "only_in_b": ["STLM_ODS.NR_NO = 'KMN0000424460824'"]},
+            {"dimension": "AGGREGATES", "matched": True,
+             "only_in_a": [], "only_in_b": [], "shared": ["x"]},
+        ],
+    })
+    assert "A만: IAS_TRANSACTION.MTI != '0120'" in base
+    assert "B만: STLM_ODS.NR_NO = 'KMN0000424460824'" in base
+    # 일치 차원엔 A만/B만 안 붙음
+    assert base.count("A만:") == 1
+
+
+def test_build_prompt_condition_asymmetry_instruction():
+    """프롬프트에 활성 필터 비대칭 → '동일 조건 대조' 서술 금지 지시가 포함(R15)."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "c,v\n1,2", "a.csv", {"nr_no": "KMN"}, [], "/tmp/b.csv")
+    assert "조건 정합성" in p
+    assert "동일 조건으로 대조" in p          # 금지 문구
+    assert "동치 근거가 아님" in p
+
+
+def test_build_prompt_trusts_a_sample():
+    """업로드 A샘플을 A쿼리 결과로 신뢰하도록 지시 — provenance 의심 프레이밍 금지(R16)."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "c,v\n1,2", "a.csv", {"nr_no": "KMN"}, [], "/tmp/b.csv")
+    assert "A샘플 신뢰 전제" in p
+    assert "의심하지 마라" in p
+    # 불확정 사유는 '쿼리 조건이 다르다'로 서술(샘플 불신 아님)
+    assert "쿼리 조건이 다르다" in p
+    # 바인드블록이 'A샘플을 뽑은 조건과 동일해야'라는 의심 전제를 더는 심지 않음
+    assert "A샘플을 뽑은 조건과 동일해야" not in p
 
 
 # --- 컬럼 정합 검증(업로드 파일이 쿼리 결과인지) ---
