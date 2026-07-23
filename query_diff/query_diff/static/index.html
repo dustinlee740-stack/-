@@ -98,6 +98,10 @@
   .btn-sm { padding: 5px 12px; font-size: 12px; }
   .btn-danger { color: var(--red); border-color: var(--red); }
 
+  /* AI 비교 진행 스피너 (전체화면 오버레이) — 실행 중을 직관적으로 표시 */
+  @keyframes qd-spin { to { transform: rotate(360deg); } }
+  .spinner { width: 44px; height: 44px; border: 4px solid var(--surface2); border-top-color: var(--accent); border-radius: 50%; animation: qd-spin .9s linear infinite; }
+
   /* 검증 모달 */
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
   .modal-overlay.hidden { display: none; }
@@ -265,11 +269,11 @@
     <div style="flex:1;min-width:320px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
       <div>
         <label style="font-size:11px;color:#a0a0c0;display:block;margin-bottom:3px;">A쿼리(운영계) 바인드값 <span style="color:#8080a0;">· <code>:name</code> · 한 줄에 <code>이름=값</code></span></label>
-        <textarea id="sampleBindsA" rows="2" placeholder="nr_number=KMN0000424460824" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;"></textarea>
+        <textarea id="sampleBindsA" rows="5" placeholder="nr_number=KMN0000424460824" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;line-height:1.5;resize:vertical;"></textarea>
       </div>
       <div>
         <label style="font-size:11px;color:#a0a0c0;display:block;margin-bottom:3px;">B쿼리(분석계) 바인드값 <span style="color:#8080a0;">· <code>${name}</code> · 1차 치환 + 2차 실행</span></label>
-        <textarea id="sampleBindsB" rows="2" placeholder="nr_no=KMN0000424460824&#10;start_dt=20250501" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;"></textarea>
+        <textarea id="sampleBindsB" rows="5" placeholder="nr_no=KMN0000424460824&#10;start_dt=20250501" style="width:100%;box-sizing:border-box;background:#0e0e1c;color:#d0d0e0;border:1px solid #2a2a44;border-radius:4px;font-family:monospace;font-size:12px;padding:6px;line-height:1.5;resize:vertical;"></textarea>
       </div>
     </div>
   </div>
@@ -302,6 +306,15 @@
     <div class="modal-actions">
       <button class="btn btn-sm" id="btnCloseResultModal">닫기</button>
     </div>
+  </div>
+</div>
+
+<!-- AI 비교 진행 오버레이 (수십 초 소요되는 1차→2차 실행 중 표시) -->
+<div class="modal-overlay hidden" id="aiLoadingOverlay" style="z-index:200;flex-direction:column;gap:18px;">
+  <div class="spinner"></div>
+  <div style="text-align:center;">
+    <div style="font-size:16px;font-weight:600;color:var(--text);margin-bottom:6px;">🤖 AI 비교 진행 중…</div>
+    <div style="font-size:13px;color:var(--text-dim);line-height:1.6;">1차 정적 분석 → 2차 실데이터 대조(Hue 실행)<br>수십 초 소요됩니다. 잠시만 기다려 주세요.</div>
   </div>
 </div>
 
@@ -645,6 +658,7 @@ document.getElementById('btnExecuteAI').addEventListener('click', async () => {
   const orig = btn.textContent;
   btn.disabled = true;
   btn.textContent = '🤖 AI 비교 중… (1차→2차, 수십 초~)';
+  document.getElementById('aiLoadingOverlay').classList.remove('hidden');
   try {
     // 2차 대사 입력(운영 A 샘플 + 바인드값) 선반영.
     // 파일 입력(#sampleAFile)이 **단일 진실원천** — 클릭 시점에 거기서만 읽는다.
@@ -685,6 +699,7 @@ document.getElementById('btnExecuteAI').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = orig;
+    document.getElementById('aiLoadingOverlay').classList.add('hidden');
   }
 });
 
