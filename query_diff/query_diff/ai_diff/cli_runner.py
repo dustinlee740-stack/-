@@ -49,26 +49,43 @@ def _finalize_rollup(
       → 완전 해소 ODS 는 `/execute-ai` 출력이 `/execute`(결정적)와 동일 → 매 런 100% 동일.
       비-ODS 는 AI matched·프로즈 유지(base 가 못 잡는 판단 여지 보존).
     - **limitations**: `base.limitations`(실제 sqlglot 정규화 한계)로 덮음 → AI 자유서술 잡음 제거.
-    - **verdict·issues**: 고정된 플래그·limitations 로 `_decide_verdict` 재도출(뱃지 순수 함수·헤드라인 형식)."""
+    - **verdict·issues**: 고정된 플래그·limitations 로 `_decide_verdict` 재도출(뱃지 순수 함수·헤드라인 형식).
+    - **AI 퇴화 백필(결정적 안전망)**: base 는 항상 6차원(결정적·한국어)이므로 **base 를 기준으로 순회**한다.
+      AI 가 그 차원을 explanation 비어있지 않게 준 경우만(비-ODS) AI 프로즈를 채택하고, **누락·공란·ODS 이면
+      base 차원으로 백필**한다. → AI 가 빈 dimensions/공란 explanation("테스트" 류 퇴화)을 내도 화면이 비지
+      않고 정상 base(제한적·6차원)가 표시된다. AI 가 유효 차원을 하나도 못 주면 reason 도 파생값으로 고정."""
     base_by_dim = {d.dimension: d for d in base.dimensions}
-    for d in sd.dimensions:
-        bd = base_by_dim.get(d.dimension)
-        if bd is None:
-            continue
-        d.limited = bd.limited
-        if is_ods:
-            d.matched = bd.matched
-            d.only_in_a = list(bd.only_in_a)
-            d.only_in_b = list(bd.only_in_b)
-            d.shared = list(bd.shared)
-            d.explanation = bd.explanation
-            d.caveat = bd.caveat
+    ai_by_dim = {d.dimension: d for d in sd.dimensions}
+
+    if base.dimensions:
+        # base(결정적·항상 6차원) 기준 순회 → AI 퇴화(누락/공란) 시 base 로 백필. limited 는 항상 base.
+        new_dims = []
+        ai_contributed = False
+        for bd in base.dimensions:
+            ad = ai_by_dim.get(bd.dimension)
+            use_ai = (not is_ods) and ad is not None and bool((ad.explanation or "").strip())
+            if use_ai:
+                ad.limited = bd.limited
+                new_dims.append(ad)
+                ai_contributed = True
+            else:
+                new_dims.append(bd.model_copy(deep=True))  # ODS 전량 relay + 비-ODS 퇴화 백필
+        sd.dimensions = new_dims
+    else:
+        # base 자체가 비정상(정규화 ValueError 등, 차원 없음) → 기존처럼 AI 차원 유지(limited relay만).
+        for d in sd.dimensions:
+            bd = base_by_dim.get(d.dimension)
+            if bd is not None:
+                d.limited = bd.limited
+        ai_contributed = bool(sd.dimensions)
+
     sd.limitations = list(base.limitations)
     verdict, derived_reason, issues = _decide_verdict(sd.dimensions, sd.limitations)
     sd.verdict = verdict
     sd.issues = issues
-    if is_ods or not (sd.reason or "").strip():
-        sd.reason = derived_reason   # ODS: 결정적 reason(비결정성 차단). 비-ODS: 빈 값만 폴백.
+    # reason: ODS·AI 무기여(전부 백필/차원 0)·빈 reason → 결정적 파생. AI 정상 기여 시 AI reason 유지.
+    if is_ods or not ai_contributed or not (sd.reason or "").strip():
+        sd.reason = derived_reason
     return sd
 
 
@@ -174,6 +191,9 @@ def _build_prompt(
         "너는 운영계(A)↔분석계(B) SQL 마이그레이션의 **의미 비교 판정자**다. 아래는 파이썬 엔진이 "
         "op↔an 정적 매핑(meta3 파생)으로 A를 변환한 뒤 낸 base 비교 결과와 원본 쿼리다. "
         "**외부 조회 없이** 주어진 정보로만 판정하라.\n\n",
+        "[언어 — 필수] 모든 출력 텍스트 필드(reason·issues·dimensions[].explanation·dimensions[].caveat·"
+        "limitations)는 **반드시 한국어로 작성**하라. 영어 문장으로 쓰지 마라 — 단 컬럼명·테이블명·"
+        "식별자·SQL 키워드는 원문 그대로 유지해도 된다. 이 판정은 한국어 사용자에게 그대로 노출된다.\n\n",
         f"[A dialect] {dia_a}\n[B dialect] {dia_b}\n\n",
         "[BASE DIFF — 이미 op↔an 정규화됨] (JSON)\n"
         + json.dumps(compact, ensure_ascii=False, indent=2) + "\n\n",
@@ -291,6 +311,7 @@ def _build_prompt(
         "[기타]\n"
         "- base 는 이미 op↔an 정규화됨. 확신 없으면 DIVERGENT 로 단정하지 말고 그 차원 `limited=true` + "
         "`caveat` '확인 필요' 로 남기고 verdict 는 LIMITED. 근거 없는 추측 금지.\n"
+        "- **모든 텍스트 필드는 한국어로 작성**(위 [언어] 규칙). 영어 문장 금지.\n"
         "- 반드시 **AiSemanticDiff 구조화 출력(JSON)** 으로만 답하라. 설명·마크다운 코드블록 없이 "
         "**오직 JSON 객체 하나만** 출력하라."
     )

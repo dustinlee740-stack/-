@@ -957,12 +957,17 @@ function renderReconcileInto(body, dr, reqId) {
 
   // UNVERIFIABLE 는 '결과 없음'이 아니라 '대조를 못 한 상태' — 사유·조치를 또렷이 안내.
   if (dr.status === 'UNVERIFIABLE') {
-    summaryHtml += `<div style="margin-top:10px;padding:10px 12px;background:#23233a;border-left:3px solid #6060a0;border-radius:4px;font-size:12px;color:#c0c0d8;line-height:1.7;">
-      <div style="font-weight:600;margin-bottom:4px;">대조를 못 한 상태입니다 (결과 없음이 아님)</div>
-      위 헤드라인/오류에서 사유를 확인하세요. 흔한 경우:<br>
+    const gateBlockedU = dr.error === 'sample columns do not match query output columns';
+    const bodyU = gateBlockedU
+      ? `업로드한 운영(A) 샘플의 컬럼이 A쿼리 출력 컬럼과 달라 <b>A 데이터를 신뢰할 수 없어 B 쿼리를 실행하지 않았습니다</b>(B 실행 실패가 아니라 의도적 미실행).<br>
+      · 조치 → A쿼리 출력과 컬럼이 정확히 일치하는 <b>운영(A) 실행 결과</b> 파일을 올린 뒤 다시 🤖 AI로 비교`
+      : `위 헤드라인/오류에서 사유를 확인하세요. 흔한 경우:<br>
       · 운영(A) 결과 샘플 CSV 미첨부 → 하단 '운영(A) 결과 샘플'에 CSV 업로드 후 다시 🤖 AI로 비교<br>
       · B쿼리의 <code>\${변수}</code> 미해결 → '바인드값' 칸에 <code>이름=값</code> 입력<br>
-      · Hue 실행 오류 → B쿼리가 분석계에서 실행 가능한지 확인
+      · Hue 실행 오류 → B쿼리가 분석계에서 실행 가능한지 확인`;
+    summaryHtml += `<div style="margin-top:10px;padding:10px 12px;background:#23233a;border-left:3px solid #6060a0;border-radius:4px;font-size:12px;color:#c0c0d8;line-height:1.7;">
+      <div style="font-weight:600;margin-bottom:4px;">대조를 못 한 상태입니다 (결과 없음이 아님)</div>
+      ${bodyU}
     </div>`;
   }
 
@@ -998,15 +1003,22 @@ function renderReconcileInto(body, dr, reqId) {
   const fillSample = (elId, url, emptyMsg) => {
     const el = body.querySelector('#' + elId);
     if (!el) return;
-    fetch(url)
+    // no-store: B 샘플 경로가 comparisonId 별 고정 재사용이라 캐시된 옛 본문(스테일)을 막는다.
+    fetch(url, { cache: 'no-store' })
       .then(r => r.ok ? r.text() : Promise.reject(new Error(String(r.status))))
       .then(text => { if (el.isConnected) el.innerHTML = csvToTable(text); })
       .catch(() => { if (el.isConnected) el.innerHTML = `<div class="sample-empty">${emptyMsg}</div>`; });
   };
   fillSample('reconSampleA', `${API}/api/comparisons/${reqId}/sample-a.csv`,
              '운영(A) 샘플 없음 — 하단 업로더에서 CSV 를 첨부하세요.');
-  fillSample('reconSampleB', `${API}/api/comparisons/${reqId}/sample-b.csv`,
-             '분석계(B) 샘플 없음 — B 실행 실패·미다운로드(위 헤드라인/오류 참조).');
+  // B 미표시 사유를 구분: ①A샘플 컬럼불일치로 의도적 미실행 ②정상 실행 0건 ③실제 실행 실패/미다운로드.
+  const gateBlocked = dr.error === 'sample columns do not match query output columns';
+  const bEmptyMsg = gateBlocked
+    ? '분석계(B) 미실행 — A 샘플 컬럼이 A쿼리 출력과 달라 A 데이터를 신뢰할 수 없어 B를 실행하지 않았습니다(대조 불가).'
+    : (dr.row_count_b === 0)
+    ? '분석계(B) 결과 0건 — 해당 조건에 데이터가 없습니다(B 실행은 정상).'
+    : '분석계(B) 샘플 없음 — B 실행 실패·미다운로드(위 헤드라인/오류 참조).';
+  fillSample('reconSampleB', `${API}/api/comparisons/${reqId}/sample-b.csv`, bEmptyMsg);
 }
 
 // CSV 텍스트 → HTML 표(구분자 스니핑, 기본 따옴표 처리, cap 행). 표시 전용.

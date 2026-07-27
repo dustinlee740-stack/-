@@ -213,6 +213,16 @@ def test_build_prompt_condition_a_no_date_filter_branch():
     assert "QUERY" in p and "조건 차이" in p
 
 
+def test_build_prompt_pins_korean_output():
+    """2차 프롬프트도 출력 언어를 한국어로 고정(headline·final_reason·caveats 등 영어 누출 차단)."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", _A_CSV, "a.csv", {}, [], "/tmp/b.csv")
+    assert "[언어 — 필수]" in p
+    assert "한국어" in p
+    assert "영어" in p
+    assert "모든 텍스트 필드는 한국어로 작성" in p
+
+
 def test_reconcile_passes_condition_date_diff_to_prompt(monkeypatch, tmp_path):
     """reconcile 가 A(명시 날짜)와 B(바인드 치환) 날짜 차이를 탐지해 cond_diff(dict)로 프롬프트에 전달.
 
@@ -563,6 +573,10 @@ def test_reconcile_column_mismatch_short_circuits(monkeypatch):
     assert dr.final_verdict == FinalVerdict.INCONCLUSIVE     # 절대 SAME 아님
     assert dr.error == "sample columns do not match query output columns"
     assert "org_amt" in dr.final_reason and "tr_amt" in dr.final_reason
+    # 'B 실행 실패'가 아니라 A 신뢰 불가로 인한 '의도적 미실행'임을 명시(사용자 지시)
+    assert "실행하지 않았습니다" in dr.final_reason
+    assert "신뢰" in dr.final_reason
+    assert "B 미실행" in dr.headline
 
 
 def test_reconcile_column_match_proceeds_past_gate(monkeypatch):

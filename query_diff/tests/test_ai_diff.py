@@ -262,6 +262,22 @@ def test_build_prompt_has_decision_rubric():
     assert "재판정" in prompt             # base 매칭을 원본 SQL 로 재판정 금지
 
 
+def test_build_prompt_pins_korean_output():
+    """출력 언어 고정 회귀 가드: reason·explanation·caveat 등 자유 서술 필드를 한국어로 쓰라는
+    지시가 프롬프트에 있어야(비-ODS 에서 AI 프로즈가 영어로 새던 것 차단)."""
+    from query_diff.ai_diff.cli_runner import _build_prompt
+
+    compact = {
+        "verdict": "LIMITED", "reason": "", "issues": [], "limitations": [], "dimensions": [],
+    }
+    prompt = _build_prompt("SELECT 1", "SELECT 1", "oracle", "hive", compact, {}, False)
+    assert "[언어 — 필수]" in prompt
+    assert "한국어" in prompt
+    assert "영어" in prompt                # 영어 금지 명시
+    # 출력 규칙 근처에도 재확인 문구
+    assert "모든 텍스트 필드는 한국어로 작성" in prompt
+
+
 def test_build_prompt_gates_ods_rules_on_ods_defs():
     """ODS 전용 '고정 결과'(BASE_TABLES 조인 매칭률·증분 → ⚠)는 ods_defs 존재 시에만 프롬프트에 포함.
 
@@ -436,6 +452,52 @@ def test_finalize_rollup_divergent_and_reason_fallback():
     assert len(sd.issues) == 1 and sd.issues[0].startswith("✗")
     assert "A에만 상태 필터" in sd.issues[0]
     assert sd.reason                                        # 빈 reason → 파생 폴백
+
+
+def test_finalize_rollup_backfills_degenerate_ai():
+    """비-ODS 에서 AI 가 퇴화 출력(dimensions=[] · explanation 공란 · reason='테스트')을 내면 결정적
+    base 로 백필 → 화면이 비지 않고 정상 base(제한적·6차원·한국어) + 파생 reason 이 표시된다."""
+    from query_diff.ai_diff.cli_runner import _finalize_rollup
+    from query_diff.models import SemanticDiff
+
+    def _mkbase():
+        return SemanticDiff(
+            verdict=SemanticVerdict.LIMITED, limitations=[],
+            dimensions=[
+                _mk(DimensionName.BASE_TABLES, True, False, explanation="읽는 테이블 4개 모두 동일"),
+                _mk(DimensionName.JOIN_GRAPH, True, True, explanation="테이블 연결 모두 동일",
+                    caveat="NULL/'' 처리 차이(제한적)"),
+                _mk(DimensionName.PREDICATES, True, True, explanation="조회 조건 모두 동일"),
+                _mk(DimensionName.GROUP_KEYS, True, True, explanation="묶음 기준 모두 동일"),
+                _mk(DimensionName.AGGREGATES, True, False, explanation="집계식 모두 동일"),
+                _mk(DimensionName.PROJECTIONS, True, True, explanation="출력 컬럼 모두 동일"),
+            ],
+        )
+
+    # ① AI 완전 퇴화: dimensions 빈 목록 + 퇴화 reason '테스트' → 전 차원 base 백필, reason 파생
+    sd = SemanticDiff(verdict=SemanticVerdict.EQUIVALENT, reason="테스트", issues=[], dimensions=[])
+    _finalize_rollup(sd, _mkbase(), is_ods=False)
+    assert len(sd.dimensions) == 6                                   # 공란 아님 — 6차원 백필
+    d = {x.dimension: x for x in sd.dimensions}
+    assert d[DimensionName.BASE_TABLES].explanation == "읽는 테이블 4개 모두 동일"
+    assert d[DimensionName.JOIN_GRAPH].caveat == "NULL/'' 처리 차이(제한적)"
+    assert sd.verdict == SemanticVerdict.LIMITED
+    assert sd.reason and sd.reason != "테스트"                       # 퇴화 reason 차단 → 파생 한국어
+
+    # ② AI 부분 퇴화: 정상 차원은 AI 유지, explanation 공란 차원만 base 백필. AI 기여 있으니 AI reason 유지.
+    sd2 = SemanticDiff(
+        verdict=SemanticVerdict.EQUIVALENT, reason="AI 정상 서술", issues=[],
+        dimensions=[
+            _mk(DimensionName.BASE_TABLES, True, explanation="AI 읽는테이블 서술"),  # 정상 → 유지
+            _mk(DimensionName.JOIN_GRAPH, True, explanation=""),                      # 공란 → 백필
+        ],
+    )
+    _finalize_rollup(sd2, _mkbase(), is_ods=False)
+    d2 = {x.dimension: x for x in sd2.dimensions}
+    assert len(sd2.dimensions) == 6                                          # base 기준 6차원
+    assert d2[DimensionName.BASE_TABLES].explanation == "AI 읽는테이블 서술"  # AI 정상 유지
+    assert d2[DimensionName.JOIN_GRAPH].explanation == "테이블 연결 모두 동일"  # 공란 → base 백필
+    assert sd2.reason == "AI 정상 서술"                                      # AI 기여 → AI reason 유지
 
 
 def _setup_ready(sql_a, sql_b):

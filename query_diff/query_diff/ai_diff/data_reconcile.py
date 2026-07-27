@@ -484,6 +484,10 @@ def _build_prompt(
         "목표: 분석계 B쿼리를 Hue 에서 실제로 실행한 표본과, 사용자가 제공한 운영계 A쿼리 실행 샘플을 "
         "대조해 **관측 근거**를 만들고, 1차(정적)와 2차(실데이터)를 **종합한 단일 최종 판정**을 낸다.\n\n",
 
+        "[언어 — 필수] 모든 출력 텍스트(headline·final_reason·caveats·mismatches[].likely_cause 등)는 "
+        "**반드시 한국어로 작성**하라. 영어 문장으로 쓰지 마라 — 단 컬럼명·테이블명·식별자·SQL 키워드는 "
+        "원문 그대로 유지해도 된다. 이 판정은 한국어 사용자에게 그대로 노출된다.\n\n",
+
         f"[1차 정적 판정 요약]\n{base_summary}\n\n",
 
         f"[B 쿼리 — 분석계 / {dialect_b}]\n{sql_b}\n\n",
@@ -610,7 +614,8 @@ def _build_prompt(
         "(조건 다름 예: 'A는 20240101, B는 20240102 로 서로 다른 날짜 조건이라 결과가 다름 — 조건 차이(QUERY), "
         "바인드 정렬 후 재실행 권장'. 조건 동일 예: '동일 조건인데 BANK02 합계만 달라 원천 데이터 차이(DATA)로 판단').\n\n",
 
-        "[출력] 반드시 **AiDataReconcile 구조화 JSON 하나만** 출력하라. 설명·마크다운·코드펜스 금지.",
+        "[출력] 모든 텍스트 필드는 한국어로 작성(위 [언어] 규칙 — 영어 문장 금지). 반드시 "
+        "**AiDataReconcile 구조화 JSON 하나만** 출력하라. 설명·마크다운·코드펜스 금지.",
     ))
     return "".join(parts)
 
@@ -667,17 +672,19 @@ async def reconcile_via_cli(
             diff_s = " · ".join(diff_bits)
             return DataReconcileDiff(
                 status=ReconcileStatus.UNVERIFIABLE,
-                headline=f"샘플 컬럼 불일치 — {diff_s}",
+                headline=f"A 샘플 컬럼 불일치로 B 미실행(대조 불가) — {diff_s}",
                 final_verdict=FinalVerdict.INCONCLUSIVE,
                 final_confidence=Confidence.LOW,
                 final_reason=(
                     f"업로드한 운영(A) 샘플 컬럼[{', '.join(hcols)}]이 A쿼리 출력 컬럼"
-                    f"[{', '.join(qcols)}]과 정확히 일치하지 않습니다({diff_s}). 이 파일은 해당 쿼리의 "
-                    "결과가 아니므로(컬럼 집합이 다르면 서로 다른 데이터) 값이 우연히 같아도 동치로 볼 수 "
-                    "없습니다. A쿼리 출력과 컬럼이 정확히 일치하는 결과 파일을 업로드하세요."
+                    f"[{', '.join(qcols)}]과 일치하지 않습니다({diff_s}). 업로드 샘플이 A쿼리의 결과가 "
+                    "맞는지 확인되지 않아 **A 결과 데이터를 신뢰할 수 없으므로, B 쿼리를 실행하지 "
+                    "않았습니다(대조 불가)**. (B 실행 실패가 아니라 의도적 미실행입니다.) A쿼리 출력과 "
+                    "컬럼이 정확히 일치하는 결과 파일을 올리면 B를 실행해 대조합니다."
                 ),
                 attribution=Attribution.UNKNOWN,
                 caveats=[
+                    "A 샘플이 A쿼리 출력 컬럼과 불일치 → A 데이터 신뢰 불가 → B 미실행(의도적).",
                     "컬럼 집합이 다르면 서로 다른 데이터입니다 — 값 일치는 무의미합니다.",
                     "2차 대조가 유효하려면 업로드 샘플이 A쿼리의 출력 컬럼과 정확히 일치해야 합니다.",
                 ],
