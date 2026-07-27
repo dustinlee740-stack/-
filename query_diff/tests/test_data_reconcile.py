@@ -101,14 +101,163 @@ def test_reconcile_maps_structured_output_and_mcp_argv(monkeypatch, tmp_path):
 
 def test_reconcile_reports_b_csv_when_file_exists(monkeypatch, tmp_path):
     monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
-    # 서버 지정 경로에 파일이 실제로 존재하면 그 경로를 노출
-    (tmp_path / "b_sample.csv").write_text("bank_cd,tot\nBANK01,100\n", encoding="utf-8")
     stdout = json.dumps({"structured_output": _RECON}).encode("utf-8")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+
+    # 실제 LLM 처럼 서브프로세스가 실행 중 b_sample.csv 를 쓴다(진입부 스테일 삭제 후 프레시 생성).
+    # → 이번 실행이 실제로 쓴 파일만 경로로 노출됨을 검증.
+    async def _exec_writes(*argv, **kwargs):
+        (tmp_path / "b_sample.csv").write_text("bank_cd,tot\nBANK01,100\n", encoding="utf-8")
+        return _FakeProc(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec_writes)
     result = asyncio.run(reconcile_via_cli(
         _SQL_B, Dialect.HIVE, _A_CSV, "a.csv", None, op_an=None, out_dir=str(tmp_path),
     ))
     assert result.b_csv_path == str(tmp_path / "b_sample.csv")
+
+
+def test_reconcile_deletes_stale_b_csv_on_entry(monkeypatch, tmp_path):
+    """직전 실행이 남긴 b_sample.csv 는 진입 시 삭제 → 이번 실행이 안 쓰면 노출되지 않는다(스테일 방지).
+
+    재현: 20240101 실행이 남긴 옛 결과(2행)가 있는 상태에서 20240102 재실행(B 0건 → 미기록)이면,
+    옛 파일이 표에 스테일로 뜨던 버그. 진입 삭제로 파일 부재 → b_csv_path=None → 표는 '결과 0건'.
+    """
+    stale = tmp_path / "b_sample.csv"
+    stale.write_text("년월,은행코드,총건수\n202401,020,1\n202401,088,1\n", encoding="utf-8")
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)  # 서브프로세스 없이 단락(파일 미기록)
+    result = asyncio.run(reconcile_via_cli(
+        _SQL_B, Dialect.HIVE, _A_CSV, "a.csv", None, out_dir=str(tmp_path),
+    ))
+    assert not stale.exists()            # 진입부에서 스테일 파일 삭제됨
+    assert result.b_csv_path is None     # 이번 실행이 쓰지 않았으므로 노출 안 함
+    assert result.status == ReconcileStatus.UNVERIFIABLE
+
+
+def test_where_date_literals_extracts_dates_excludes_masks():
+    """WHERE 날짜 리터럴만 수집 — 포맷 마스크('yyyymmdd')·코드 상수('A0000')는 제외."""
+    from query_diff.ai_diff.data_reconcile import _where_date_literals
+    a = _where_date_literals(
+        "SELECT x FROM t WHERE dt BETWEEN to_date('20240101','yyyymmdd') "
+        "AND to_date('20240101','yyyymmdd') AND code = 'A0000'", "oracle")
+    assert a == {"20240101"}
+    b = _where_date_literals(
+        "SELECT x FROM t WHERE dt BETWEEN to_timestamp('20240102','yyyyMMdd') "
+        "AND to_timestamp('20240102','yyyyMMdd')", "hive")
+    assert b == {"20240102"}
+    assert _where_date_literals("!!! not sql", "hive") == set()      # 파싱 실패 → 빈 set
+
+
+def test_where_date_ranges_extracts_between_and_bounds():
+    """WHERE 날짜 술어를 컬럼별 범위 표시로(best-effort). to_date/to_timestamp 래퍼·포맷 마스크 무관."""
+    from query_diff.ai_diff.data_reconcile import _where_date_ranges
+    # BETWEEN — 하한==상한(단일일)
+    assert _where_date_ranges(
+        "SELECT x FROM t WHERE created_at BETWEEN to_date('20240101','yyyymmdd') "
+        "AND to_date('20240101','yyyymmdd')", "oracle") == ["created_at: 20240101~20240101"]
+    # BETWEEN — 범위(바인드 치환 후 형태)
+    assert _where_date_ranges(
+        "SELECT x FROM t WHERE sys_cre_dttm BETWEEN to_timestamp('20240101','yyyyMMdd') "
+        "AND to_timestamp('20240102','yyyyMMdd')", "hive") == ["sys_cre_dttm: 20240101~20240102"]
+    # >= / <= 경계쌍 → 하나의 범위로 묶임(한정자 제거)
+    assert _where_date_ranges(
+        "SELECT x FROM t a WHERE a.dt >= 20240101 AND a.dt <= 20240103", "hive") == \
+        ["dt: 20240101~20240103"]
+    # = (단일 날짜)
+    assert _where_date_ranges("SELECT x FROM t WHERE dt = '20240101'", "hive") == ["dt: 20240101"]
+    # 날짜 아닌 상수/파싱 실패 → 빈 리스트
+    assert _where_date_ranges("SELECT x FROM t WHERE code = 'A0000'", "hive") == []
+    assert _where_date_ranges("!!! not sql", "hive") == []
+
+
+def test_build_prompt_condition_date_diff_block():
+    """cond_diff(dict) 있으면 [조건 날짜 정합성] 블록 + QUERY(조건 차이) 지시 포함, 없으면 블록 미포함.
+
+    cond_diff = {"a_dates","b_dates","a_ranges","b_ranges"} (집합차 아님 — 전체 값+범위 무손실 전달)."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", _A_CSV, "a.csv", {}, [], "/tmp/b.csv",
+                      cond_diff={"a_dates": ["20240101"], "b_dates": ["20240102"],
+                                 "a_ranges": [], "b_ranges": []})
+    assert "A샘플과 B실행은 서로 다른 날짜" in p     # 조건 블록(조건차이 있을 때만)
+    assert "20240101" in p and "20240102" in p
+    assert "QUERY" in p and "조건 차이" in p
+    assert "없음/불명/미상/전체" in p               # A를 '없음/미상'으로 서술하지 말라는 금지 지시 고정
+    # cond_diff 없으면 조건 블록 미포함(단, 원인분류/예시에서 '[조건 날짜 정합성]' 명칭 언급은 상존).
+    p2 = _build_prompt("SELECT 1", "hive", _A_CSV, "a.csv", {}, [], "/tmp/b.csv")
+    assert "A샘플과 B실행은 서로 다른 날짜" not in p2
+
+
+def test_build_prompt_condition_date_subset_states_a_positively():
+    """부분집합(A ⊆ B) — 예전 결함 재현 방지: A를 '없음/미상'이 아니라 명시적 조건으로 양성 서술.
+
+    A={20240101} ⊆ B={20240101,20240102} 일 때 프롬프트가 'A만:(없음)'을 렌더하면 LLM 이 'A 조건 없음/
+    미상'으로 오서술하던 것을 회귀 단언으로 고정한다."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", _A_CSV, "a.csv", {}, [], "/tmp/b.csv",
+                      cond_diff={"a_dates": ["20240101"], "b_dates": ["20240101", "20240102"],
+                                 "a_ranges": ["created_at: 20240101~20240101"],
+                                 "b_ranges": ["sys_cre_dttm: 20240101~20240102"]})
+    assert "명시적 날짜 조건" in p
+    assert "부분집합" in p
+    assert "없음/불명/미상/전체" in p
+    assert "created_at: 20240101~20240101" in p     # A 범위를 그대로 노출(양성 서술)
+    assert "A만: (없음)" not in p                     # 회귀: A를 '(없음)'으로 렌더하지 않음
+
+
+def test_build_prompt_condition_a_no_date_filter_branch():
+    """A에 날짜 리터럴이 진짜 없고 B에만 있으면 'A: 날짜 미필터' 서술이 옳다(합법 무조건 케이스 보존)."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", _A_CSV, "a.csv", {}, [], "/tmp/b.csv",
+                      cond_diff={"a_dates": [], "b_dates": ["20240102"],
+                                 "a_ranges": [], "b_ranges": ["dt: 20240102~20240102"]})
+    assert "날짜 리터럴 조건이 없고" in p
+    assert "QUERY" in p and "조건 차이" in p
+
+
+def test_reconcile_passes_condition_date_diff_to_prompt(monkeypatch, tmp_path):
+    """reconcile 가 A(명시 날짜)와 B(바인드 치환) 날짜 차이를 탐지해 cond_diff(dict)로 프롬프트에 전달.
+
+    cond_diff = {"a_dates","b_dates","a_ranges","b_ranges"} — 집합차가 아니라 전체 값+범위(무손실).
+    같은 날짜 → None(DATA 귀속 허용). 부분집합(A ⊆ B)도 발화하며 a_dates 를 보존(예전 붕괴 결함 방지).
+    """
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    captured = {}
+    real_build = data_reconcile._build_prompt
+
+    def _spy(*a, **k):
+        captured["cond_diff"] = k.get("cond_diff")
+        return real_build(*a, **k)
+
+    monkeypatch.setattr(data_reconcile, "_build_prompt", _spy)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec(json.dumps({"structured_output": _RECON}).encode("utf-8")))
+    sql_a = ("SELECT bank_cd, SUM(amt) AS tot FROM t WHERE dt BETWEEN "
+             "to_date('20240101','yyyymmdd') AND to_date('20240101','yyyymmdd') GROUP BY bank_cd")
+    sql_b = ("SELECT bank_cd, SUM(amt) AS tot FROM t WHERE dt BETWEEN "
+             "to_timestamp('${sd}','yyyyMMdd') AND to_timestamp('${ed}','yyyyMMdd') GROUP BY bank_cd")
+    # 서로소: A=20240101, B=20240102
+    asyncio.run(reconcile_via_cli(sql_b, Dialect.HIVE, _A_CSV, "a.csv",
+                                  {"sd": "20240102", "ed": "20240102"},
+                                  op_an=None, out_dir=str(tmp_path),
+                                  sql_a=sql_a, dialect_a=Dialect.ORACLE))
+    assert captured["cond_diff"]["a_dates"] == ["20240101"]
+    assert captured["cond_diff"]["b_dates"] == ["20240102"]
+    assert captured["cond_diff"]["a_ranges"] == ["dt: 20240101~20240101"]
+    assert captured["cond_diff"]["b_ranges"] == ["dt: 20240102~20240102"]
+    # 부분집합(버그 재현): A=20240101 ⊆ B={20240101,20240102} — a_dates 붕괴 없이 보존
+    asyncio.run(reconcile_via_cli(sql_b, Dialect.HIVE, _A_CSV, "a.csv",
+                                  {"sd": "20240101", "ed": "20240102"},
+                                  op_an=None, out_dir=str(tmp_path),
+                                  sql_a=sql_a, dialect_a=Dialect.ORACLE))
+    assert captured["cond_diff"]["a_dates"] == ["20240101"]
+    assert captured["cond_diff"]["b_dates"] == ["20240101", "20240102"]
+    assert captured["cond_diff"]["a_ranges"] == ["dt: 20240101~20240101"]
+    assert captured["cond_diff"]["b_ranges"] == ["dt: 20240101~20240102"]
+    # 같은 날짜 → None(조건 차이 없음 → DATA 귀속 여지)
+    asyncio.run(reconcile_via_cli(sql_b, Dialect.HIVE, _A_CSV, "a.csv",
+                                  {"sd": "20240101", "ed": "20240101"},
+                                  op_an=None, out_dir=str(tmp_path),
+                                  sql_a=sql_a, dialect_a=Dialect.ORACLE))
+    assert captured["cond_diff"] is None
 
 
 def test_reconcile_missing_claude_unverifiable(monkeypatch):

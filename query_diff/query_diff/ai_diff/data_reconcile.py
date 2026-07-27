@@ -160,6 +160,126 @@ def _output_columns(sql: str, dialect: str) -> list[str] | None:
     return [disp for (_t, disp, _r) in projs] if projs else None
 
 
+# 날짜형 리터럴(yyyymm/yyyymmdd/yyyymmddhhmmss/ISO). 날짜 포맷 마스크('yyyymmdd')·비날짜 상수는 제외.
+_DATE_LIKE_RE = re.compile(
+    r"^(\d{6}|\d{8}|\d{14}|\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?)$"
+)
+
+
+def _where_date_literals(sql: str, dialect: str) -> set[str]:
+    """WHERE/HAVING 절의 **날짜형 리터럴 값** 집합 — A↔B 조건(날짜/바인드) 값 차이 탐지용.
+
+    값만 비교하므로 컬럼명·방언·op↔an 매핑과 무관하다(동일 필터 상수는 양쪽에 있어 상쇄).
+    1차가 흡수(date absorb)하는 것은 사실상 '서로 다른 날짜 값'뿐이라(비날짜 상수 차이는 1차가
+    DIVERGENT 로 잡음) 날짜형만 대상으로 한다 → 포맷 마스크('yyyymmdd')·코드 상수 노이즈 제외.
+    파싱 실패 시 빈 set(플래그 없음 — 안전). B 는 호출 전 바인드를 치환해 넘긴다.
+    """
+    from sqlglot import expressions as exp
+
+    from query_diff.validation_service import _preprocess_sql
+
+    try:
+        tree = sqlglot.parse_one(_preprocess_sql((sql or "").rstrip().rstrip(";")),
+                                 dialect=dialect or None)
+    except Exception:
+        return set()
+    if tree is None:
+        return set()
+    lits: set[str] = set()
+    for clause in tree.find_all(exp.Where, exp.Having):
+        for lit in clause.find_all(exp.Literal):
+            v = (lit.name or "").strip()
+            if v and _DATE_LIKE_RE.match(v):
+                lits.add(v)
+    return lits
+
+
+def _date_lit_in(node) -> str | None:
+    """서브트리에서 **첫 날짜형 리터럴 값**. `to_date('20240101','yyyymmdd')`·`to_timestamp(...)`·
+    캐스트 래퍼를 몰라도 값에 도달한다(포맷 마스크 'yyyymmdd' 는 비-datelike라 자동 제외)."""
+    from sqlglot import expressions as exp
+
+    if node is None:
+        return None
+    for lit in node.find_all(exp.Literal):
+        v = (lit.name or "").strip()
+        if v and _DATE_LIKE_RE.match(v):
+            return v
+    return None
+
+
+def _col_label(node) -> str:
+    """술어 LHS 표시 라벨 — 컬럼이면 한정자 없는 basename, 그 외는 정규화된 식 원문."""
+    from sqlglot import expressions as exp
+
+    if isinstance(node, exp.Column):
+        return _norm_col(node.name) or _norm_tok(node.sql())
+    return _norm_tok(node.sql()) if node is not None else "?"
+
+
+def _where_date_ranges(sql: str, dialect: str) -> list[str]:
+    """WHERE/HAVING 의 날짜 술어를 **컬럼별 사람이 읽는 범위 문자열**로(best-effort).
+
+    `[조건 날짜 정합성]` 프롬프트에서 A/B 조건을 범위로 보여주기 위한 표시용. **트리거·판정에는
+    쓰지 않는다**(그건 값-집합 `_where_date_literals` 담당). 파싱 실패·구조화 실패 시 `[]` → 호출부가
+    값목록으로 폴백하므로 수정의 정확성은 이 함수 성공에 의존하지 않는다.
+
+    - `col BETWEEN lo AND hi`  → `"col: lo~hi"`(양 경계 date-like 일 때)
+    - `col >= lo` / `col <= hi` → 컬럼별로 묶어 `"col: lo~hi"`(한쪽만 있으면 `"col: lo~"`/`"col: ~hi"`)
+    - `col = v`(date-like)      → `"col: v"`
+    B 는 호출 전 바인드를 치환해 넘긴다. 결과는 정렬(결정적)."""
+    from sqlglot import expressions as exp
+
+    from query_diff.validation_service import _preprocess_sql
+
+    try:
+        tree = sqlglot.parse_one(_preprocess_sql((sql or "").rstrip().rstrip(";")),
+                                 dialect=dialect or None)
+    except Exception:
+        return []
+    if tree is None:
+        return []
+
+    # 컬럼 라벨 → {"lo": v, "hi": v, "eq": v}. 등장 순서 보존용 order.
+    bounds: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+
+    def _slot(label: str) -> dict[str, str]:
+        if label not in bounds:
+            bounds[label] = {}
+            order.append(label)
+        return bounds[label]
+
+    for clause in tree.find_all(exp.Where, exp.Having):
+        for node in clause.find_all(exp.Between):
+            lo, hi = _date_lit_in(node.args.get("low")), _date_lit_in(node.args.get("high"))
+            if lo or hi:
+                s = _slot(_col_label(node.this))
+                s.setdefault("lo", lo or "")
+                s.setdefault("hi", hi or "")
+        for node in clause.find_all(exp.GTE, exp.GT):
+            v = _date_lit_in(node.expression)
+            if v:
+                _slot(_col_label(node.this)).setdefault("lo", v)
+        for node in clause.find_all(exp.LTE, exp.LT):
+            v = _date_lit_in(node.expression)
+            if v:
+                _slot(_col_label(node.this)).setdefault("hi", v)
+        for node in clause.find_all(exp.EQ):
+            v = _date_lit_in(node.expression)
+            if v:
+                _slot(_col_label(node.this)).setdefault("eq", v)
+
+    out: list[str] = []
+    for label in order:
+        b = bounds[label]
+        if "eq" in b and "lo" not in b and "hi" not in b:
+            out.append(f"{label}: {b['eq']}")
+        elif "lo" in b or "hi" in b:
+            out.append(f"{label}: {b.get('lo', '')}~{b.get('hi', '')}")
+    return sorted(out)
+
+
 def _sniff_delim(line: str) -> str:
     """헤더 줄에서 구분자 추정 — 필드 수가 가장 많은 것(콤마 우선)."""
     return max((",", ";", "\t"), key=lambda d: line.count(d))
@@ -343,7 +463,11 @@ def _build_prompt(
     base_summary: str = "",
     a_query_cols: list[str] | None = None,
     a_csv_cols: list[str] | None = None,
+    cond_diff: dict | None = None,
 ) -> str:
+    # cond_diff: {"a_dates":[...], "b_dates":[...], "a_ranges":[...], "b_ranges":[...]} 또는 None.
+    # a_dates/b_dates = WHERE 날짜 리터럴 값 전체(무손실). a_ranges/b_ranges = 컬럼별 범위 표시(best-effort,
+    # 비면 값목록 폴백). A 조건을 '없음/미상'으로 오서술하지 않으려면 a_dates 비공집합 여부로 분기한다.
     a_csv = (sample_a_csv or "").strip()
     a_truncated = len(a_csv) > _A_CSV_CAP
     if a_truncated:
@@ -389,6 +513,36 @@ def _build_prompt(
         f"{hint_lines}\n\n",
     ]
 
+    if cond_diff:
+        _a_dates = cond_diff.get("a_dates") or []
+        _b_dates = cond_diff.get("b_dates") or []
+        _a_disp = " · ".join(cond_diff.get("a_ranges") or []) or ", ".join(_a_dates)
+        _b_disp = " · ".join(cond_diff.get("b_ranges") or []) or ", ".join(_b_dates) or "(없음)"
+        if _a_dates:
+            # A에 명시적 날짜조건 있음 — 양성 서술 + '없음/미상' 서술 절대 금지(사용자 지적 결함 교정).
+            parts.append(
+                "[조건 날짜 정합성 — 중요] A쿼리(운영, 명시 리터럴)는 WHERE 절에 **명시적 날짜 조건**을 "
+                f"가진다 — A: {_a_disp}. B실행(분석, 바인드 치환): {_b_disp}. 두 조건의 날짜 범위가 달라 "
+                "**A샘플과 B실행은 서로 다른 날짜(조건)로 조회**된 것이다. "
+                f"**A의 날짜 조건을 '없음/불명/미상/전체'로 서술하지 마라 — A에는 명시적 날짜 조건({_a_disp})이 "
+                "분명히 존재한다(1차가 확인한 사실). A샘플은 '전체 혹은 미상의 데이터'가 아니라 이 날짜 "
+                "조건으로 조회된 정상 결과다.** A의 날짜 범위가 B의 **부분집합**이면(예: A ⊆ B) A는 B보다 더 "
+                "좁은/다른 **명시적 날짜 범위**를 조회한 것이지 '조건 없음'이 아니다. (1차 EQUIVALENT 는 쿼리 "
+                "구조가 같다는 뜻일 뿐 조건 값이 같다는 뜻이 아니다 — 1차는 날짜 값 차이를 흡수한다.) 따라서 "
+                "결과 불일치는 **원천 데이터 차이가 아니라 조건 차이(QUERY: 쿼리/바인드 차이)**로 귀속하고, "
+                f"final_reason 에 'A는 {_a_disp}, B는 {_b_disp}' 처럼 **A의 실제 날짜 범위를 그대로** 적어라. "
+                "단, 같은 날짜의 표기 차이(예: '2024-01-01' vs '20240101')뿐이면 조건 차이가 아니다.\n\n"
+            )
+        else:
+            # A에 날짜 리터럴이 진짜 없음(무조건) — 이 경우에 한해 'A: 날짜 미필터' 서술이 옳다.
+            parts.append(
+                "[조건 날짜 정합성 — 중요] A쿼리(운영)의 WHERE 절에는 **날짜 리터럴 조건이 없고**, "
+                f"B실행(분석, 바인드 치환)에는 날짜 조건({_b_disp})이 있다. 즉 A와 B는 서로 다른 날짜 "
+                "조건으로 조회된 것이다(A: 날짜 미필터 / B: 위 범위). 따라서 결과 불일치는 **원천 데이터 "
+                "차이가 아니라 조건 차이(QUERY: 쿼리/바인드 차이)**로 귀속하라. 단, 같은 날짜의 표기 "
+                "차이뿐이면 조건 차이가 아니다.\n\n"
+            )
+
     if has_a:
         parts.append(
             f"[운영 A 샘플 CSV{' (앞부분만·잘림)' if a_truncated else ''}"
@@ -421,8 +575,9 @@ def _build_prompt(
         "   - 필요하면 `hue_describe_table` 로 B 출력 테이블 컬럼/타입을 먼저 확인해도 된다.\n"
         "4) 컬럼 힌트로 A↔B 컬럼을 정렬하고, 키 컬럼(비측정·차원 컬럼)으로 행을 매칭한다.\n"
         "5) 3-way 로 분류: 값 일치 / A만 존재 / B만 존재 / 양쪽 존재·값 상이.\n"
-        "6) 값 불일치는 추정 원인을 분류: 집계 그레인 차이 · NULL/'' 처리 · 날짜 포맷/타입 · "
-        "반올림·정밀도 · 조인 카디널리티 · 순수 데이터 차이(분석계 미적재 등).\n\n",
+        "6) 값 불일치는 추정 원인을 분류: **조건/바인드 불일치(A 명시 날짜 vs B 바인드 날짜 등 — 위 "
+        "[조건 날짜 정합성] 참고)** · 집계 그레인 차이 · NULL/'' 처리 · 날짜 포맷/타입 · 반올림·정밀도 · "
+        "조인 카디널리티 · 순수 데이터 차이(분석계 미적재 등). '미적재'를 기본값처럼 단정하지 마라.\n\n",
 
         "[판정 status]\n"
         "- MATCH: 대응되는 모든 행·값이 일치.\n"
@@ -439,13 +594,21 @@ def _build_prompt(
         "비대칭 원칙(일치=약한 신호·불일치=강한 근거)을 지켜 final_verdict/final_confidence/attribution/final_reason 을 정한다.\n"
         "- 2차 MATCH(일치): 1차 EQUIVALENT→ SAME/HIGH. 1차 LIMITED→ SAME/MEDIUM(참고—우연 일치 가능). "
         "**1차 DIVERGENT→ INCONCLUSIVE/LOW**(구조 차이가 있으므로 이 표본 일치는 우연일 수 있음 — SAME 단정 금지).\n"
-        "- 2차 MISMATCH/PARTIAL(불일치): DIFFERENT/HIGH. attribution = 1차 DIVERGENT→ QUERY(쿼리 차이 기인) · "
-        "1차 EQUIVALENT→ DATA(원천 데이터 차이 기인) · 1차 LIMITED→ 근거로 판단.\n"
+        "- 2차 MISMATCH/PARTIAL(불일치): DIFFERENT/HIGH. attribution 은 다음 순서로 정한다: "
+        "**(0) 위 [조건 날짜 정합성]에서 A·B 조건(날짜/바인드)이 다르면 → QUERY(조건 차이). 1차 "
+        "EQUIVALENT 이어도 DATA 로 귀속하지 마라 — 1차 EQUIVALENT 는 구조 동치일 뿐 조건 값이 같다는 "
+        "뜻이 아니다(1차는 값 차이를 흡수).** (1) 그 외 1차 DIVERGENT→ QUERY(쿼리 차이 기인) · "
+        "**1차 EQUIVALENT→ DATA(원천 데이터 차이 기인) — 단 A·B 조건이 동일함이 확인될 때만** · "
+        "1차 LIMITED→ 근거로 판단. QUERY 로 귀속하면 final_reason 에 'A는 <A 실제 날짜범위>, B는 "
+        "<B 실제 날짜범위> — 서로 다른 조건(바인드를 A와 맞춰 재실행 권장)'을 명시하라. "
+        "**[조건 날짜 정합성]에 A 날짜값이 제시됐으면 그 값을 그대로 채우고, A의 날짜 조건을 "
+        "'미상/없음/불명/전체'로 쓰지 마라.**\n"
         "- 2차 UNVERIFIABLE(대조 불가): 1차 승계 — EQUIVALENT→SAME, DIVERGENT→DIFFERENT, LIMITED→INCONCLUSIVE. "
         "confidence LOW~MEDIUM. final_reason 에 '실데이터 미검증' 명시.\n"
         "- attribution 은 final_verdict=DIFFERENT 일 때만 QUERY/DATA, 그 외엔 UNKNOWN.\n"
-        "- final_reason: 1차 근거와 2차 관측을 한두 줄로 연결해 사람에게 설명"
-        "(예: '구조는 동치인데 BANK02 합계가 달라 원천 데이터 차이로 판단').\n\n",
+        "- final_reason: 1차 근거와 2차 관측을 한두 줄로 연결해 사람에게 설명 "
+        "(조건 다름 예: 'A는 20240101, B는 20240102 로 서로 다른 날짜 조건이라 결과가 다름 — 조건 차이(QUERY), "
+        "바인드 정렬 후 재실행 권장'. 조건 동일 예: '동일 조건인데 BANK02 합계만 달라 원천 데이터 차이(DATA)로 판단').\n\n",
 
         "[출력] 반드시 **AiDataReconcile 구조화 JSON 하나만** 출력하라. 설명·마크다운·코드펜스 금지.",
     ))
@@ -469,6 +632,14 @@ async def reconcile_via_cli(
     `base_semantic` 은 1차 결과의 compact dict(`cli_runner._compact`). `sql_a`/`dialect_a` 는 업로드
     A샘플이 A쿼리의 결과인지(컬럼) 검증하는 데 쓴다. 실패는 모두 UNVERIFIABLE 로 반환.
     """
+    # 이전 실행이 남긴 B 산출물을 먼저 제거한다 → 아래 exists() 게이트(:하단 dr.b_csv_path 결정)가
+    # '이번 실행이 실제로 쓴 파일'만 노출하게 만든다. out_dir 는 comparisonId 별 고정 경로라, 지우지 않으면
+    # 직전 실행의 b_sample.csv 가 스테일로 재노출된다(예: B 0건이라 새로 안 써도 옛 결과가 표에 뜸).
+    if out_dir:
+        try:
+            (Path(out_dir) / "b_sample.csv").unlink()
+        except OSError:
+            pass
     # 주석(`--`·`/* */`) 처리된 코드는 실행/대조에서 제외한다 — 주석 속 필터·`${}`·바인드가 2차 Hue
     # 실행에서 되살아나 오탐('표본 우연일치 → 동일')하던 것을 차단(라운드14). A측은 _preprocess_sql 로 이미 정화.
     from query_diff.validation_service import _strip_sql_comments
@@ -524,6 +695,23 @@ async def reconcile_via_cli(
     a_query_cols = _output_columns(sql_a, dialect_a_s) if sql_a else None
     a_csv_cols = _csv_header(sample_a_csv) if (sample_a_csv or "").strip() else None
 
+    # A(운영, 리터럴) vs B(분석, 바인드 치환)의 WHERE 날짜 조건 값 비교 — 다르면 서로 다른 조건으로
+    # 조회된 것. 1차는 날짜 값 차이를 흡수(EQUIVALENT)하므로, 이 결정적 신호를 프롬프트에 실어 2차가
+    # 불일치를 '원천 데이터 차이(DATA)'가 아니라 '조건 차이(QUERY)'로 귀속하게 한다.
+    # **집합차(only-in-A/B)가 아니라 전체 값 집합+범위(무손실)를 전달한다.** 예전 집합차 표현은 A 날짜값이
+    # B의 부분집합일 때(예: A={20240101}⊆B={20240101,20240102}) only-in-A 를 []로 붕괴시켜, 프롬프트가
+    # 'A만:(없음)' → LLM 이 'A는 날짜조건 없음/미상'으로 오서술하던 결함이 있었다(A는 명시적 조건 보유).
+    from query_diff.validation_service import _apply_binds
+    _b_bound = _apply_binds(sql_b, resolved_binds)
+    _a_dates = _where_date_literals(sql_a, dialect_a_s) if sql_a else set()
+    _b_dates = _where_date_literals(_b_bound, dialect_b.value)
+    cond_diff = ({
+        "a_dates": sorted(_a_dates),
+        "b_dates": sorted(_b_dates),
+        "a_ranges": _where_date_ranges(sql_a, dialect_a_s) if sql_a else [],
+        "b_ranges": _where_date_ranges(_b_bound, dialect_b.value),
+    } if _a_dates != _b_dates else None)
+
     art_dir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="qd_recon_art_"))
     try:
         art_dir.mkdir(parents=True, exist_ok=True)
@@ -534,7 +722,7 @@ async def reconcile_via_cli(
     prompt = _build_prompt(
         sql_b, dialect_b.value, sample_a_csv or "", sample_a_name,
         resolved_binds, col_hints, b_csv_path, _format_base(base_semantic),
-        a_query_cols, a_csv_cols,
+        a_query_cols, a_csv_cols, cond_diff=cond_diff,
     )
     schema_json = json.dumps(AI_DATA_RECONCILE_SCHEMA, ensure_ascii=False)
     argv = _build_argv(claude_path, schema_json)
