@@ -222,7 +222,10 @@ def download_sample_b(req_id: str):
     path = req.data_reconcile.b_csv_path
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="B 샘플 CSV 파일을 찾을 수 없습니다.")
-    return FileResponse(path, media_type="text/csv", filename="b_sample.csv")
+    # no-store: 경로가 comparisonId 별 고정 재사용이라, 재실행으로 내용이 바뀌어도 브라우저가 옛 본문을
+    # 서빙하지 않도록 캐시를 막는다(스테일 표시 방지).
+    return FileResponse(path, media_type="text/csv", filename="b_sample.csv",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/comparisons/{req_id}/sample-a.csv")
@@ -235,7 +238,7 @@ def download_sample_a(req_id: str):
     return Response(
         content=req.sample_a_csv,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{fn}"'},
+        headers={"Content-Disposition": f'attachment; filename="{fn}"', "Cache-Control": "no-store"},
     )
 
 
