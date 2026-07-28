@@ -75,22 +75,26 @@ def _norm_tok(s: str) -> str:
     return re.sub(r"\s+", "", (s or "").strip().strip('"').strip("'").strip("`")).lower()
 
 
-def _norm_ws_entity(s: str) -> str:
-    """HTML 엔티티 디코드 + 모든 공백(nbsp `\\xa0` 포함) 단일 공백 축약·trim.
+def _norm_display_value(s: str) -> str:
+    """표기 artifact 정규화: HTML 엔티티 디코드 + 모든 공백(nbsp `\\xa0` 포함) 단일 공백 축약 +
+    **선·후행 따옴표(`'"` `` ` ``) 제거** + trim.
 
-    B(분석계) Hue 미리보기가 텍스트 컬럼 공백을 `&nbsp;` 로 인코딩해 A(일반 공백)와 문자열만 달라
-    보이는 렌더링 artifact 를 정규화해 같은 값인지 판별하기 위한 것(값 자체는 b_sample.csv 에 실제 공백)."""
+    두 종류의 표기 artifact 를 흡수한다: ① B(분석계) Hue 미리보기가 공백을 `&nbsp;` 로 인코딩한 것
+    (값 자체는 b_sample.csv 에 실제 공백), ② A 업로드 CSV 값에 붙은 텍스트 가드 따옴표
+    (`000140000000000'` 등 Excel/추출 시 텍스트 강제·선행 0 보존). `_norm_col`/`_norm_tok` 의 따옴표
+    제거 패턴과 동일. **artifact 판별에만** 쓰고 표시 값은 원문 유지."""
     t = html.unescape(s or "").replace("\xa0", " ")
-    return re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.strip("'\"`").strip()
 
 
-def _is_ws_entity_artifact(a: str, b: str) -> bool:
-    """두 값이 **공백/HTML엔티티 인코딩만 다르고** 정규화하면 동일한가(=Hue 렌더링 artifact).
+def _is_display_artifact(a: str, b: str) -> bool:
+    """두 값이 **표기(공백/HTML엔티티/따옴표)만 다르고** 정규화하면 동일한가(=표기 artifact).
 
     원문이 다르되(`a != b`) 정규화 후 같을 때만 True → 실제 값 차이(예: 100 vs 200)는 정규화해도
     불일치라 False(보존). mismatch 를 artifact 로 걸러낼지 결정하는 데만 쓴다."""
     a, b = a or "", b or ""
-    return a != b and _norm_ws_entity(a) == _norm_ws_entity(b)
+    return a != b and _norm_display_value(a) == _norm_display_value(b)
 
 
 def _accept_tokens(s) -> tuple[set[str] | None, str, bool]:
@@ -863,11 +867,11 @@ def _build_prompt(
         f"다운로드와 같은 윈도우·행수). {_align_note}이미 집계되어 행이 적으면 그대로.\n"
         "   - 필요하면 `hue_describe_table` 로 B 출력 테이블 컬럼/타입을 먼저 확인해도 된다.\n"
         "5) 컬럼 힌트로 A↔B 컬럼을 정렬하고, 키 컬럼(비측정·차원 컬럼)으로 행을 매칭한다.\n"
-        "6) 3-way 로 분류: 값 일치 / A만 존재 / B만 존재 / 양쪽 존재·값 상이. **단, B `hue_run_query` "
-        "미리보기의 텍스트 컬럼 공백이 `&nbsp;`(또는 다른 HTML 엔티티)로 표기되는 것은 Hue 미리보기 렌더링 "
-        "artifact 일 뿐 데이터 차이가 아니다 — 공백/엔티티를 정규화해 같은 값으로 보고, mismatch·DATA 로 "
-        "분류하지 마라. 텍스트 컬럼 차이가 이런 인코딩뿐이면 그 컬럼은 일치로 간주하라(측정값이 전수 일치하면 "
-        "MATCH/SAME).**\n"
+        "6) 3-way 로 분류: 값 일치 / A만 존재 / B만 존재 / 양쪽 존재·값 상이. **단, 다음 표기 artifact 는 "
+        "데이터 차이가 아니니 정규화해 같은 값으로 보고 mismatch·DATA 로 분류하지 마라: ① B `hue_run_query` "
+        "미리보기의 텍스트 컬럼 공백이 `&nbsp;`(또는 다른 HTML 엔티티)로 표기되는 것(Hue 렌더링 특성), "
+        "② asp아이디 등 A 값 끝/앞의 CSV 텍스트 가드 따옴표(`000140000000000'` 등 `'`·`\"`)와 B 원본값의 "
+        "따옴표 유무 차이. 차이가 이런 표기뿐이면 일치로 간주하라(측정값이 전수 일치하면 MATCH/SAME).**\n"
         "7) 값 불일치는 추정 원인을 분류: **조건/바인드 불일치(A 명시 날짜 vs B 바인드 날짜 등 — 위 "
         "[조건 날짜 정합성] 참고)** · 집계 그레인 차이 · NULL/'' 처리 · 날짜 포맷/타입 · 반올림·정밀도 · "
         "조인 카디널리티 · 순수 데이터 차이(분석계 미적재 등). '미적재'를 기본값처럼 단정하지 마라.\n\n",
@@ -1155,23 +1159,24 @@ async def reconcile_via_cli(
         note = _sort_caveat(sort_mode, sort_key, a_csv_cols or a_query_cols)
         if note and note not in dr.caveats:
             dr.caveats = [*dr.caveats, note]
-        # (Fix B) 공백/HTML엔티티(&nbsp;)만 다른 텍스트 mismatch 는 Hue 렌더링 artifact → 서버가 결정적으로
-        # 걸러내고, 실제 차이가 그것뿐이면 SAME 으로 상향(매 런 일관). b_sample.csv 엔 실제 공백이라 값 차이 아님.
-        _real = [m for m in dr.mismatches if not _is_ws_entity_artifact(m.value_a, m.value_b)]
+        # (Fix B) 표기(공백/HTML엔티티/CSV 따옴표)만 다른 mismatch 는 표기 artifact → 서버가 결정적으로
+        # 걸러 불일치 카운트에서 제외. 실제 차이가 그것뿐이고 LLM 이 MISMATCH/PARTIAL 로 오판했으면 SAME 상향.
+        _real = [m for m in dr.mismatches if not _is_display_artifact(m.value_a, m.value_b)]
         _upgraded = False   # artifact→SAME 상향으로 headline/final_reason 을 서버가 이미 교체했는지
         if len(_real) != len(dr.mismatches):
             dr.mismatches = _real
             _art_note = (
-                "B(분석계) Hue 미리보기의 텍스트 컬럼 공백이 &nbsp; 등 HTML 엔티티로 인코딩돼 A(운영계, "
-                "일반 공백)와 문자열만 달라 보이지만, 이는 Hue 렌더링 특성일 뿐 실제 데이터 차이가 아니다"
-                "(b_sample.csv 에는 실제 공백으로 저장). 값 차이로 보지 않는다."
+                "A·B 표본에서 값이 표기(텍스트 공백 인코딩·CSV 따옴표 등)만 다른 행은 실제 데이터 차이가 "
+                "아니다 — 정규화하면 동일해 일치로 간주했다."
             )
             if _art_note not in dr.caveats:
                 dr.caveats = [*dr.caveats, _art_note]
-            # 실제 차이가 남지 않고 1차가 구조 동치/제한적이면 → 결정적으로 SAME 상향(우연 표본일치 오상향 방지:
-            # base DIVERGENT 는 제외). headline·final_reason 도 서버 고정 문구로 교체해 매 런 byte-동일.
+            # 표기 차이만 남고 1차가 구조 동치/제한적인데 **LLM 이 MATCH 로 판정하지 않았으면**(오판) →
+            # 결정적으로 SAME 상향. 이미 MATCH 면 상향하지 않아 후속7 값일치 headline·LLM final_reason 을 보존.
+            # (우연 표본일치 오상향 방지: base DIVERGENT 제외.) headline·final_reason 은 일반 문구로 교체.
             _base_v = (base_semantic or {}).get("verdict")
-            if (not _real and not dr.only_in_a and not dr.only_in_b
+            if (dr.status != ReconcileStatus.MATCH
+                    and not _real and not dr.only_in_a and not dr.only_in_b
                     and _base_v in ("EQUIVALENT", "LIMITED")):
                 dr.status = ReconcileStatus.MATCH
                 dr.final_verdict = FinalVerdict.SAME
@@ -1179,10 +1184,10 @@ async def reconcile_via_cli(
                     Confidence.HIGH if _base_v == "EQUIVALENT" else Confidence.MEDIUM
                 )
                 dr.attribution = Attribution.UNKNOWN
-                dr.headline = "측정값 표본 전수 일치 — 텍스트 공백 인코딩(&nbsp;) 차이만 있어 동치(SAME)"
+                dr.headline = "측정값 표본 전수 일치 — 표기상 차이(공백 인코딩·따옴표 등)만 있어 동치(SAME)"
                 dr.final_reason = (
-                    "지급액/회수액/소멸액 등 측정값이 표본 전수 일치했고, 텍스트 컬럼의 유일한 차이는 "
-                    "Hue 미리보기의 공백 인코딩(&nbsp;)뿐이라 실제 데이터 차이가 아니다. 1차 정적 판정과 "
+                    "지급액/회수액/소멸액 등 측정값이 표본 전수 일치했고, 유일한 차이는 표기상 차이"
+                    "(텍스트 공백 인코딩·CSV 따옴표 등)뿐이라 실제 데이터 차이가 아니다. 1차 정적 판정과 "
                     "함께 동치(SAME)로 판정한다."
                 )
                 _upgraded = True

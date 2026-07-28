@@ -792,14 +792,16 @@ def test_to_data_reconcile_carries_b_total():
     assert AiDataReconcile.model_validate(_RECON).to_data_reconcile().row_count_b_total is None
 
 
-def test_ws_entity_artifact_detection():
-    """공백/HTML엔티티만 다른 값은 artifact(True), 실제 값 차이는 False."""
-    from query_diff.ai_diff.data_reconcile import _is_ws_entity_artifact, _norm_ws_entity
-    assert _norm_ws_entity("경기도&nbsp;농어민") == "경기도 농어민"
-    assert _is_ws_entity_artifact("Bank One", "Bank&nbsp;One")      # nbsp 엔티티
-    assert _is_ws_entity_artifact("a b", "a\xa0b")                  # 실제 nbsp 문자
-    assert not _is_ws_entity_artifact("100", "200")                # 실제 값 차이
-    assert not _is_ws_entity_artifact("same", "same")              # 원문 동일 → artifact 아님
+def test_display_artifact_detection():
+    """표기(공백/HTML엔티티/CSV 따옴표)만 다른 값은 artifact(True), 실제 값 차이는 False."""
+    from query_diff.ai_diff.data_reconcile import _is_display_artifact, _norm_display_value
+    assert _norm_display_value("경기도&nbsp;농어민") == "경기도 농어민"
+    assert _norm_display_value("000140000000000'") == "000140000000000"   # 후행 CSV 따옴표 제거
+    assert _is_display_artifact("Bank One", "Bank&nbsp;One")               # nbsp 엔티티
+    assert _is_display_artifact("a b", "a\xa0b")                          # 실제 nbsp 문자
+    assert _is_display_artifact("000140000000000'", "000140000000000")    # CSV 텍스트 가드 따옴표
+    assert not _is_display_artifact("100", "200")                        # 실제 값 차이
+    assert not _is_display_artifact("same", "same")                      # 원문 동일 → artifact 아님
 
 
 def _recon_stdout(**over):
@@ -942,7 +944,8 @@ def test_reconcile_match_headline_server_authored(monkeypatch, tmp_path):
 
 
 def test_reconcile_upgrade_headline_kept(monkeypatch, tmp_path):
-    """artifact→SAME 상향 케이스는 자체 headline(&nbsp; 정당 언급) 유지 — MATCH 고정문구로 덮지 않는다."""
+    """LLM 오판(MISMATCH/PARTIAL)의 표기-artifact-only → SAME 상향 케이스는 상향 자체 문구(일반 표기 차이)
+    유지 — 값일치 MATCH 고정문구로 덮지 않는다."""
     monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
     stdout = _recon_stdout(
         status="PARTIAL", final_verdict="DIFFERENT", only_in_a=[], only_in_b=[],
@@ -956,7 +959,31 @@ def test_reconcile_upgrade_headline_kept(monkeypatch, tmp_path):
                                        out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE,
                                        base_semantic={"verdict": "EQUIVALENT"}))
     assert dr.status == ReconcileStatus.MATCH and dr.final_verdict == FinalVerdict.SAME
-    assert "&nbsp;" in dr.headline and "전 구간 일치" not in dr.headline   # 상향 자체 문구 유지
+    assert "표기상 차이" in dr.headline and "전 구간 일치" not in dr.headline   # 상향 자체 문구 유지(MATCH-headline 아님)
+
+
+def test_reconcile_quote_guard_not_counted(monkeypatch, tmp_path):
+    """LLM 이 MATCH 로 판정하고 asp아이디 CSV 따옴표 차이 1건만 mismatch 로 보고 → 서버가 표기 artifact 로
+    드롭해 불일치 0, 값일치 headline 유지, LLM final_reason 보존(서버 상향 문구로 덮지 않음)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        status="MATCH",
+        headline="무시됨 — 서버가 값일치 headline 로 교체",
+        final_reason="2차 대조에서 값이 일치했다. 다만 asp아이디 끝 홑따옴표는 표기 차이로 확인이 필요하다.",
+        mismatches=[{"key": "가평군", "column": "asp아이디", "value_a": "000140000000000'",
+                     "value_b": "000140000000000", "likely_cause": "CSV 텍스트 가드"}],
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nA,1\nB,2\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE,
+                                       base_semantic={"verdict": "EQUIVALENT"}))
+    assert dr.status == ReconcileStatus.MATCH
+    assert len(dr.mismatches) == 0                              # 따옴표 mismatch 드롭 → 불일치 0
+    assert "불일치 0" in dr.headline and "전 구간 일치" in dr.headline   # 값일치 headline(서버) 유지
+    assert "다만" in dr.final_reason and "확인이 필요하다" in dr.final_reason  # LLM final_reason 보존
+    assert any("따옴표" in c for c in dr.caveats)               # 일반 표기 artifact 캐비엇
 
 
 def test_reconcile_drops_rowcount_caveat(monkeypatch, tmp_path):
