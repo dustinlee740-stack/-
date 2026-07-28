@@ -145,6 +145,7 @@ class AiDataReconcile(BaseModel):
     headline: str = ""
     row_count_a: int = 0
     row_count_b: int = 0
+    row_count_b_total: int = 0    # B 전체 결과 행수(SELECT COUNT(*) 결과값) — 서버가 표본/전체 표기에 사용
     matched_keys: int = 0
     mismatches: list[AiRowMismatch] = Field(default_factory=list)
     only_in_a: list[str] = Field(default_factory=list)
@@ -170,6 +171,7 @@ class AiDataReconcile(BaseModel):
             headline=self.headline,
             row_count_a=self.row_count_a,
             row_count_b=self.row_count_b,
+            row_count_b_total=self.row_count_b_total or None,
             matched_keys=self.matched_keys,
             mismatches=[
                 RowMismatch(
@@ -216,6 +218,7 @@ AI_DATA_RECONCILE_SCHEMA = {
         "headline": {"type": "string"},
         "row_count_a": {"type": "integer"},
         "row_count_b": {"type": "integer"},
+        "row_count_b_total": {"type": "integer"},
         "matched_keys": {"type": "integer"},
         "mismatches": {"type": "array", "items": _ROW_MISMATCH_SCHEMA},
         "only_in_a": _str_array(),
@@ -233,6 +236,7 @@ AI_DATA_RECONCILE_SCHEMA = {
         "headline",
         "row_count_a",
         "row_count_b",
+        "row_count_b_total",
         "matched_keys",
         "mismatches",
         "only_in_a",

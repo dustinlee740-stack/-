@@ -285,13 +285,16 @@ class DataReconcileDiff(BaseModel):
     """
     status: ReconcileStatus
     headline: str = ""       # 좌측 헤드라인 한 줄
-    row_count_a: Optional[int] = None
-    row_count_b: Optional[int] = None
+    row_count_a: Optional[int] = None       # A 표본(절단 임베드) 행수 — LLM 카운트
+    row_count_a_total: Optional[int] = None  # A 업로드 CSV **전체** 행수(서버 권위) — 표본/전체 구분 표기용
+    row_count_b: Optional[int] = None        # B 대조 표본(상위 N행) 행수 — 서버가 캡 후 집계
+    row_count_b_total: Optional[int] = None   # B **전체** 결과 행수(COUNT(*) 기반) — 표본/전체 구분 표기용
     matched_keys: int = 0
     mismatches: list[RowMismatch] = Field(default_factory=list)
     only_in_a: list[str] = Field(default_factory=list)   # A(운영)에만 있는 키
     only_in_b: list[str] = Field(default_factory=list)   # B(분석)에만 있는 키
     caveats: list[str] = Field(default_factory=list)     # 우연일치·그레인·표본유계 등 주의
+    sort_key: list[int] = Field(default_factory=list)    # 대조에 부여한 공통 정렬 키(1-based 출력 위치) — A 표 표시 정렬용
     binds_used: dict[str, str] = Field(default_factory=dict)  # 실제 대입한 바인드값
     b_csv_path: Optional[str] = None       # 산출된 B 결과 CSV 경로(아티팩트)
     a_sample_name: Optional[str] = None    # 업로드된 A 샘플 파일명

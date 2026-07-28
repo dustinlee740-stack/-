@@ -560,6 +560,468 @@ def test_output_columns_and_csv_header():
     assert _csv_header("") is None
 
 
+# --- 정렬 정합(공통 ORDER BY) + 실제 A 행수 ---
+
+def test_resolve_sort_key():
+    """공통 정렬 키(1-based 출력 위치)와 mode(정렬 부여 경우) 결정."""
+    from query_diff.ai_diff.data_reconcile import _resolve_sort_key
+    a = "SELECT k1, k2, SUM(v) AS s FROM t GROUP BY k1, k2"
+    b = "SELECT k1, k2, SUM(v) AS s FROM t GROUP BY k1, k2"
+    # 둘 다 ORDER BY 없음 → 차원(비집계) 위치 1,2 (3=SUM 제외), mode=both
+    assert _resolve_sort_key(a, "oracle", b, "hive") == ([1, 2], "both")
+    # A 만 ORDER BY → 그 키를 공통으로, B 에 부여
+    a2 = "SELECT k1, k2, SUM(v) AS s FROM t GROUP BY k1, k2 ORDER BY k2, k1"
+    assert _resolve_sort_key(a2, "oracle", b, "hive") == ([2, 1], "b_from_a")
+    # B 만 ORDER BY → A 에 부여
+    assert _resolve_sort_key(a, "oracle", a2, "hive") == ([2, 1], "a_from_b")
+    # 둘 다 동일 ORDER BY → 부여 없음(mode="")
+    assert _resolve_sort_key(a2, "oracle", a2, "hive") == ([2, 1], "")
+    # 둘 다 있으나 상이 → A 기준(both_diff)
+    a3 = "SELECT k1, k2, SUM(v) AS s FROM t GROUP BY k1, k2 ORDER BY k1"
+    assert _resolve_sort_key(a2, "oracle", a3, "hive") == ([2, 1], "both_diff")
+
+
+def test_sort_caveat_wordings():
+    """정렬 부여 경우별 안내 문구 — 애매 표현 없이 케이스별로 구분."""
+    from query_diff.ai_diff.data_reconcile import _sort_caveat
+    assert _sort_caveat("", [1, 2]) == ""
+    assert _sort_caveat("both", []) == ""
+    both = _sort_caveat("both", [1, 2, 3])
+    assert "A·B 쿼리 모두 ORDER BY 가 없어" in both and "ORDER BY 1, 2, 3" in both
+    bfa = _sort_caveat("b_from_a", [2, 1])
+    assert "A쿼리에만 ORDER BY 가 있어" in bfa and "B(분석계 실행)에도" in bfa
+    afb = _sort_caveat("a_from_b", [1])
+    assert "B쿼리에만 ORDER BY 가 있어" in afb and "A(업로드 샘플)에도" in afb
+    diff = _sort_caveat("both_diff", [1, 2])
+    assert "서로 달라" in diff and "A 기준" in diff
+    # '(또는 한쪽만 있어)' 같은 애매 표현은 어떤 케이스에도 없음
+    for m in ("both", "b_from_a", "a_from_b", "both_diff"):
+        assert "또는 한쪽만" not in _sort_caveat(m, [1])
+    # col_names 주어지면 위치 대신 컬럼명, 매핑 없는 위치는 번호 폴백
+    named = _sort_caveat("both", [1, 2, 5], ["asp아이디", "캐시부담주체", "캐시관리명"])
+    assert "ORDER BY asp아이디, 캐시부담주체, 5" in named       # 5는 이름 없어 번호 폴백
+    assert "출력 컬럼 위치" not in named                        # 이름 안내 시 '위치' 문구 제거
+    # 평서체(존댓말 '습니다' 없이 '…다.' 로 종결) — 다른 캐비엇과 어미 통일
+    for m in ("both", "b_from_a", "a_from_b", "both_diff"):
+        c = _sort_caveat(m, [1, 2])
+        assert "습니다" not in c and c.rstrip().endswith("다.")
+
+
+def test_sort_csv_by_positions_and_row_count():
+    from query_diff.ai_diff.data_reconcile import _sort_csv_by_positions, _csv_row_count
+    csv_text = "k,v\nB,2\nA,1\nC,3\n"
+    assert _sort_csv_by_positions(csv_text, [1]).splitlines() == ["k,v", "A,1", "B,2", "C,3"]
+    # limit → 정렬 후 상위 N행만(B LIMIT 정합)
+    assert _sort_csv_by_positions(csv_text, [1], limit=2).splitlines() == ["k,v", "A,1", "B,2"]
+    assert _sort_csv_by_positions(csv_text, []) == csv_text          # 키 없으면 원본
+    assert _sort_csv_by_positions("k,v\nA,1\n", [1]) == "k,v\nA,1\n"  # 데이터 1행 → 원본
+    assert _sort_csv_by_positions("", [1]) == ""                     # 빈 → 원본
+    # 행수(헤더 제외, 서버 권위)
+    assert _csv_row_count(csv_text) == 3
+    assert _csv_row_count("k,v\n") == 0                              # 헤더만
+    assert _csv_row_count("") is None
+    assert _csv_row_count("﻿k,v\nA,1\n") == 1                        # BOM 처리
+
+
+def test_build_prompt_includes_common_order_by_no_dup_caveat():
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "k,v\n1,2", "a.csv", {}, [], "/tmp/b.csv",
+                      sort_key=[1, 2])
+    assert "ORDER BY 1, 2" in p                    # B 에 명시적 공통 정렬 실행 지시(mechanism)
+    assert "[사용자 안내 필수]" not in p           # LLM 에 caveat 쓰라는 지시 제거(중복 방지)
+    assert "중복 작성하지 마라" in p               # LLM 이 정렬 caveat 를 중복 쓰지 않도록
+
+
+def test_build_prompt_suppresses_estimate_and_file_caveats():
+    """서버 정확 행수(a_row_count) 명시 + 행수/바이트/파일읽기 추정 caveat 억제 지시."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "k,v\n1,2\n3,4", "a.csv", {}, [], "/tmp/b.csv",
+                      sort_key=[1], a_row_count=712)
+    assert "정확히 **712행**" in p or "정확히 712행" in p.replace("**", "")  # 서버 정확 행수 명시
+    assert "다시 세지" in p                          # 행수 재집계 금지
+    assert "b_sample.csv" in p and "열어볼 필요 없" in p  # 파일 안 읽어도 됨
+    assert "행수·바이트" in p                        # 추정 caveat 억제
+
+
+def test_reconcile_sets_true_a_count_and_sort_caveat(monkeypatch, tmp_path):
+    """reconcile 가 실제 A 행수(서버 권위)를 row_count_a_total 로 세팅하고, 경우별 정렬 안내를 결정적 1건 주입."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec(json.dumps({"structured_output": _RECON}).encode("utf-8")))
+    a_csv = "bank_cd,tot\nB,2\nA,1\nC,3\n"        # 3행(무정렬)
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(
+        q, Dialect.HIVE, a_csv, "a.csv", None,
+        out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE,
+    ))
+    assert dr.row_count_a_total == 3                                   # 전체 행수(표본 아님)
+    assert dr.sort_key == [1]                                          # 프런트 A 표 표시 정렬용(bank_cd)
+    # 양쪽 ORDER BY 없음 → 'both' 문구 1건만 주입
+    sort_caveats = [c for c in dr.caveats if "ORDER BY" in c and "부여" in c]
+    assert len(sort_caveats) == 1
+    assert "A·B 쿼리 모두 ORDER BY 가 없어" in sort_caveats[0]
+
+
+def test_fit_csv_rows():
+    """문자 예산 내 whole-row 로만 자르고 실제 행수 반환(부분행 깨짐 방지)."""
+    from query_diff.ai_diff.data_reconcile import _fit_csv_rows
+    csv = "k,v\nA,1\nB,2\nC,3\n"
+    t, n = _fit_csv_rows(csv, 1000)                     # 예산 충분 → 원본·전체 행수
+    assert n == 3 and t == csv
+    t2, n2 = _fit_csv_rows(csv, 14)                     # 예산 빠듯 → 헤더+일부 whole-row
+    assert n2 == 2 and "C,3" not in t2                 # 3번째 행은 예산 초과로 제외
+    assert all(line.count(",") == 1 for line in t2.strip().splitlines())  # 부분행 없음
+
+
+def test_reconcile_dynamic_b_limit_matches_a_embed(monkeypatch, tmp_path):
+    """A 임베드가 문자 예산에 걸려 줄면 B LIMIT 도 같은 n_embed 로 내려가 A·B 표본 행수 동일."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(data_reconcile, "_A_CSV_CAP", 20)   # 아주 좁게 → whole-row 몇 줄만 임베드
+    captured = {}
+    real_build = data_reconcile._build_prompt
+
+    def _spy(*a, **k):
+        captured["b_limit"] = k.get("b_limit")
+        return real_build(*a, **k)
+
+    monkeypatch.setattr(data_reconcile, "_build_prompt", _spy)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec(json.dumps({"structured_output": _RECON}).encode("utf-8")))
+    a_csv = "bank_cd,tot\nA,1\nB,2\nC,3\nD,4\n"          # 4행
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert captured["b_limit"] is not None and captured["b_limit"] < 4   # 예산 탓 n_embed<4 → B LIMIT 도 축소
+    assert dr.sort_key == [1]
+
+
+def test_cap_csv_rows():
+    """CSV 를 상위 N 데이터행으로만 캡(헤더 보존), 이하면 원본."""
+    from query_diff.ai_diff.data_reconcile import _cap_csv_rows
+    csv = "k,v\nA,1\nB,2\nC,3\nD,4\n"
+    assert _cap_csv_rows(csv, 2).splitlines() == ["k,v", "A,1", "B,2"]   # 상위 2행
+    assert _cap_csv_rows(csv, 10) == csv                                 # 이하면 원본 그대로
+    assert _cap_csv_rows("k,v\n", 2) == "k,v\n"                          # 헤더만
+    assert _cap_csv_rows("", 2) == ""                                    # 빈
+
+
+def test_reconcile_server_caps_b_sample_and_names_sort_caveat(monkeypatch, tmp_path):
+    """B 다운로드본이 A 임베드 윈도우(n_embed)보다 크면 서버가 상위 N행으로 캡·재작성하고(파일·행수 일치),
+    B 전체행수는 별도 표기(COUNT 없으면 다운로드 원본 폴백) + 정렬 안내는 컬럼명."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = json.dumps({"structured_output": _RECON}).encode("utf-8")   # COUNT 미제공
+
+    async def _exec_writes(*argv, **kwargs):
+        (tmp_path / "b_sample.csv").write_text(
+            "bank_cd,tot\nA,1\nB,2\nC,3\nD,4\nE,5\n", encoding="utf-8")  # B 다운로드본 5행
+        return _FakeProc(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec_writes)
+    a_csv = "bank_cd,tot\nA,1\nB,2\nC,3\n"                                   # A 3행 → n_embed=3=_b_cap
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert dr.row_count_a == 3          # 서버 n_embed(임베드 행수)
+    assert dr.row_count_a_total == 3    # A 전량
+    assert dr.row_count_b == 3          # B 다운로드본(5) → 상위 3행으로 서버 캡
+    assert dr.row_count_b_total == 5    # COUNT 없어 다운로드 원본(5)으로 B 전체 폴백
+    assert dr.sample_bounded is True    # 전체(5) > 표본(3) → 유계
+    # 파일도 상위 3행으로 재작성(다운로드 링크·B표 일치) — 정렬 후 A,B,C, E 없음
+    written = (tmp_path / "b_sample.csv").read_text(encoding="utf-8")
+    assert data_reconcile._csv_row_count(written) == 3 and "E,5" not in written
+    # 정렬 안내가 위치번호가 아니라 컬럼명(bank_cd)
+    sc = next(c for c in dr.caveats if "ORDER BY" in c and "부여" in c)
+    assert "bank_cd" in sc and "ORDER BY 1" not in sc
+
+
+def test_reconcile_uses_count_for_b_total(monkeypatch, tmp_path):
+    """캡보다 큰 다운로드본 → 표본은 캡, B 전체는 LLM COUNT(*) 값(다운로드 원본보다 우선)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    recon = {**_RECON, "row_count_b_total": 42}      # LLM COUNT(*) 결과
+    stdout = json.dumps({"structured_output": recon}).encode("utf-8")
+
+    async def _exec_writes(*argv, **kwargs):
+        (tmp_path / "b_sample.csv").write_text(
+            "bank_cd,tot\nA,1\nB,2\nC,3\nD,4\nE,5\n", encoding="utf-8")  # 5행
+        return _FakeProc(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec_writes)
+    a_csv = "bank_cd,tot\nA,1\nB,2\nC,3\n"                                   # n_embed=3
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert dr.row_count_b == 3           # 서버 캡
+    assert dr.row_count_b_total == 42    # COUNT(*)(다운로드 원본 5보다 우선)
+    assert dr.sample_bounded is True     # 42 > 3
+
+
+def test_reconcile_b_under_limit_not_bounded(monkeypatch, tmp_path):
+    """다운로드본이 A 윈도우 이하면 캡 없음 · 전체=표본 → row_count_b_total None · sample_bounded False."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = json.dumps({"structured_output": _RECON}).encode("utf-8")   # COUNT 없음
+
+    async def _exec_writes(*argv, **kwargs):
+        (tmp_path / "b_sample.csv").write_text("bank_cd,tot\nA,1\nB,2\n", encoding="utf-8")  # 2행
+        return _FakeProc(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec_writes)
+    a_csv = "bank_cd,tot\nA,1\nB,2\nC,3\n"                               # n_embed=3, _b_cap=3
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert dr.row_count_b == 2           # 2 ≤ 3 → 캡 없음
+    assert dr.row_count_b_total is None  # 전체=표본 → 별도 표기 없음
+    assert dr.sample_bounded is False
+
+
+def test_build_prompt_downloads_limited_sample_and_counts_total():
+    """download 는 상위 N행만(전량 금지) + COUNT(*)로 B 전체행수를 row_count_b_total 에."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "k,v\n1,2\n3,4", "a.csv", {}, [], "/tmp/b.csv",
+                      sort_key=[1], b_limit=1000, a_row_count=1000)
+    assert "LIMIT 1000" in p                        # 다운로드·표본 상위 N행
+    assert "전량을 내려받지 마라" in p              # B 전량 다운로드 금지(사용자 지적)
+    assert "B 전량을 로컬 CSV 로 저장" not in p     # 구 지시 제거
+    assert "COUNT(*)" in p and "row_count_b_total" in p   # B 전체행수 COUNT 절차
+
+
+def test_to_data_reconcile_carries_b_total():
+    """AiDataReconcile.row_count_b_total → DataReconcileDiff 로 전달(0 은 None 으로)."""
+    ai = AiDataReconcile.model_validate({**_RECON, "row_count_b_total": 1104})
+    assert ai.to_data_reconcile().row_count_b_total == 1104
+    assert AiDataReconcile.model_validate(_RECON).to_data_reconcile().row_count_b_total is None
+
+
+def test_ws_entity_artifact_detection():
+    """공백/HTML엔티티만 다른 값은 artifact(True), 실제 값 차이는 False."""
+    from query_diff.ai_diff.data_reconcile import _is_ws_entity_artifact, _norm_ws_entity
+    assert _norm_ws_entity("경기도&nbsp;농어민") == "경기도 농어민"
+    assert _is_ws_entity_artifact("Bank One", "Bank&nbsp;One")      # nbsp 엔티티
+    assert _is_ws_entity_artifact("a b", "a\xa0b")                  # 실제 nbsp 문자
+    assert not _is_ws_entity_artifact("100", "200")                # 실제 값 차이
+    assert not _is_ws_entity_artifact("same", "same")              # 원문 동일 → artifact 아님
+
+
+def _recon_stdout(**over):
+    base = {**_RECON}
+    base.update(over)
+    return json.dumps({"structured_output": base}).encode("utf-8")
+
+
+def test_reconcile_nbsp_artifact_forces_same(monkeypatch, tmp_path):
+    """텍스트 mismatch 가 &nbsp; 공백 인코딩뿐이고 1차 EQUIVALENT → 서버가 결정적으로 SAME 상향."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        status="PARTIAL", final_verdict="DIFFERENT", final_confidence="HIGH", attribution="DATA",
+        headline="텍스트 값 다름", final_reason="공백 차이로 다름",
+        only_in_a=[], only_in_b=[], matched_keys=1000,
+        mismatches=[{"key": "BANK01", "column": "name", "value_a": "Bank One",
+                     "value_b": "Bank&nbsp;One", "likely_cause": "인코딩"}],
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nA,1\nB,2\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE,
+                                       base_semantic={"verdict": "EQUIVALENT"}))
+    assert dr.mismatches == []                              # artifact mismatch 제거
+    assert dr.status == ReconcileStatus.MATCH
+    assert dr.final_verdict == FinalVerdict.SAME
+    assert dr.final_confidence == Confidence.HIGH           # base EQUIVALENT → HIGH
+    assert dr.attribution == Attribution.UNKNOWN
+    assert any("실제 데이터 차이가 아니다" in c for c in dr.caveats)   # artifact 캐비엇(평서체)
+    assert "동치(SAME)" in dr.final_reason
+
+
+def test_reconcile_real_mismatch_not_upgraded(monkeypatch, tmp_path):
+    """실제 값 차이가 섞이면 artifact 만 제거하고 SAME 상향은 안 한다(DIFFERENT 유지)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        status="PARTIAL", final_verdict="DIFFERENT", attribution="DATA",
+        only_in_a=[], only_in_b=[],
+        mismatches=[
+            {"key": "BANK01", "column": "name", "value_a": "Bank One",
+             "value_b": "Bank&nbsp;One", "likely_cause": "인코딩"},        # artifact
+            {"key": "BANK02", "column": "tot", "value_a": "200", "value_b": "180",
+             "likely_cause": "집계"},                                       # 실제 차이
+        ],
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nA,1\nB,2\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE,
+                                       base_semantic={"verdict": "EQUIVALENT"}))
+    assert len(dr.mismatches) == 1 and dr.mismatches[0].key == "BANK02"  # 실제 차이만 남음
+    assert dr.final_verdict == FinalVerdict.DIFFERENT                     # 상향 안 함
+    assert dr.status == ReconcileStatus.PARTIAL
+
+
+def test_reconcile_drops_positional_order_by_caveat(monkeypatch, tmp_path):
+    """LLM 이 위치번호로 쓴 'ORDER BY 1,2,3' 캐비엇은 제거되고, 서버 컬럼명 캐비엇만 남는다."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(caveats=[
+        "두 표본 모두 ORDER BY 1,2,3 LIMIT 1000 으로 동일 정렬·윈도우 하에 대조",
+        "샘플 일치는 두 쿼리의 동치를 증명하지 않는다",
+    ])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nB,2\nA,1\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert not any("ORDER BY 1" in c for c in dr.caveats)            # 위치번호 캐비엇 제거
+    sc = next(c for c in dr.caveats if "ORDER BY" in c and "부여" in c)
+    assert "bank_cd" in sc                                           # 서버 컬럼명 캐비엇 유지
+
+
+def test_build_prompt_nbsp_and_order_by_directives():
+    """프롬프트에 &nbsp;/엔티티 정규화 지시 + ORDER BY 위치번호 금지 지시."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "k,v\n1,2", "a.csv", {}, [], "/tmp/b.csv", sort_key=[1])
+    assert "&nbsp;" in p and "artifact" in p                 # nbsp 정규화 지시
+    assert "위치번호" in p and "ORDER BY 1,2,3" in p         # ORDER BY 위치번호 금지 지시
+
+
+def test_order_key_label():
+    """정렬 위치 → 컬럼명(매핑 없는 자리는 번호 폴백)."""
+    from query_diff.ai_diff.data_reconcile import _order_key_label
+    assert _order_key_label([1, 3], ["a", "b", "c"]) == "a, c"
+    assert _order_key_label([1, 5], ["a", "b"]) == "a, 5"       # 미매핑 위치는 번호
+    assert _order_key_label([], ["a"]) == ""
+
+
+def test_reconcile_scrubs_positional_order_by_in_prose(monkeypatch, tmp_path):
+    """LLM headline·final_reason 의 위치번호 ORDER BY 를 서버가 컬럼명으로 치환(LIMIT 문맥 유지)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        headline="2차 대조(ORDER BY 1,2 LIMIT 1000 표본)에서 일치",
+        final_reason="ORDER BY 1~9 LIMIT 1000 표본 전 구간 일치로 동치",
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nB,2\nA,1\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"   # sort_key=[1] → bank_cd
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert "ORDER BY 1" not in dr.headline and "ORDER BY bank_cd" in dr.headline
+    assert "LIMIT 1000" in dr.headline                          # LIMIT 문맥은 보존
+    assert "ORDER BY 1~9" not in dr.final_reason and "ORDER BY bank_cd" in dr.final_reason
+
+
+def test_reconcile_drops_nbsp_ai_caveat(monkeypatch, tmp_path):
+    """서버 artifact 드롭이 없으면(표에 &nbsp; 없음) LLM 이 자발적으로 쓴 &nbsp; 캐비엇은 제거된다."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        mismatches=[],                       # 서버가 드롭할 artifact 없음
+        caveats=["B 미리보기의 공백이 &nbsp; 로 표기되나 렌더링 아티팩트라 동일 값으로 간주",
+                 "샘플 일치는 동치를 증명하지 않는다"],
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nB,2\nA,1\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert not any("nbsp" in c.lower() for c in dr.caveats)          # LLM &nbsp; 캐비엇 제거
+    assert any("동치를 증명하지 않는다" in c for c in dr.caveats)     # 다른 캐비엇은 유지
+
+
+def test_reconcile_match_headline_server_authored(monkeypatch, tmp_path):
+    """LLM MATCH(비-artifact) → 2차 headline 을 서버 고정문구로 교체(&nbsp;·ORDER BY·행수 노이즈 제거)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        status="MATCH", mismatches=[],
+        headline="A샘플과 B 표본이 값까지 완전히 일치하며, 공백 표기(&nbsp;)만 렌더링 차이(ORDER BY 1,2,3)",
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nA,1\nB,2\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert dr.status == ReconcileStatus.MATCH
+    assert "전 구간 일치" in dr.headline and "불일치 0" in dr.headline
+    assert "nbsp" not in dr.headline.lower() and "ORDER BY 1" not in dr.headline
+
+
+def test_reconcile_upgrade_headline_kept(monkeypatch, tmp_path):
+    """artifact→SAME 상향 케이스는 자체 headline(&nbsp; 정당 언급) 유지 — MATCH 고정문구로 덮지 않는다."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(
+        status="PARTIAL", final_verdict="DIFFERENT", only_in_a=[], only_in_b=[],
+        mismatches=[{"key": "K", "column": "name", "value_a": "A B",
+                     "value_b": "A&nbsp;B", "likely_cause": "인코딩"}],
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nA,1\nB,2\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE,
+                                       base_semantic={"verdict": "EQUIVALENT"}))
+    assert dr.status == ReconcileStatus.MATCH and dr.final_verdict == FinalVerdict.SAME
+    assert "&nbsp;" in dr.headline and "전 구간 일치" not in dr.headline   # 상향 자체 문구 유지
+
+
+def test_reconcile_drops_rowcount_caveat(monkeypatch, tmp_path):
+    """행수·전량 restatement 캐비엇은 제거(행수 블록이 표시), 일반 캐비엇은 유지."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(caveats=[
+        "본 표본은 asp_id 그레인이며 A 1000행 전량과 B 상위 1000행 표본을 대조했다",
+        "B 전체 결과는 1104행이며 대조 표본은 상위 1000행이다",
+        "샘플 일치는 동치를 증명하지 않는다",
+    ])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nB,2\nA,1\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    assert not any("1000행" in c or "1104행" in c or "전량" in c for c in dr.caveats)  # 행수 캐비엇 제거
+    assert any("동치를 증명하지 않는다" in c for c in dr.caveats)                       # 일반 캐비엇 유지
+
+
+def test_reconcile_final_reason_sentence_split(monkeypatch, tmp_path):
+    """리터럴 \\n·개행 무관하게 서버가 마침표 기준으로 문장 단위 줄바꿈(각 줄 완결·중간 절단 없음)."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    # LLM 이 JSON 이중 이스케이프로 리터럴 백슬래시-n 을 보낸 상황 재현(파이썬 '\\n' = 백슬래시+n)
+    stdout = _recon_stdout(
+        status="MISMATCH",
+        final_reason=("1차 정적 분석에서는 구조가 동치로 판정했다.\\n2차 데이터 대조에서는 값이 일치함을 "
+                      "확인했다.\\n따라서 최종 판단은 동일 결과이다."),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nB,2\nA,1\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    lines = dr.final_reason.split("\n")
+    assert len(lines) == 3                                    # 문장당 한 줄
+    assert all(l.endswith(".") for l in lines)               # 각 줄 완결(마침표 끝)
+    assert lines[0].startswith("1차") and lines[1].startswith("2차") and lines[2].startswith("따라서")
+    assert "\\n" not in dr.final_reason                       # 리터럴 백슬래시-n 미노출
+
+
+def test_final_reason_no_split_on_decimal_or_slash(monkeypatch, tmp_path):
+    """마침표 뒤 공백이 없는 소수(0.5)·슬래시 측정값은 문장 분할되지 않는다."""
+    monkeypatch.setattr(data_reconcile, "_find_claude", lambda: "/usr/bin/claude")
+    stdout = _recon_stdout(status="MISMATCH",
+                           final_reason="값 -70000/0/-51163358 과 0.5 가 일치했다. 따라서 동일하다.")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec(stdout))
+    a_csv = "bank_cd,tot\nB,2\nA,1\n"
+    q = "SELECT bank_cd, SUM(amt) AS tot FROM t GROUP BY bank_cd"
+    dr = asyncio.run(reconcile_via_cli(q, Dialect.HIVE, a_csv, "a.csv", None,
+                                       out_dir=str(tmp_path), sql_a=q, dialect_a=Dialect.ORACLE))
+    lines = dr.final_reason.split("\n")
+    assert len(lines) == 2                                    # "0.5" 는 미분할, 문장 2개만
+    assert "0.5" in lines[0] and "-51163358" in lines[0]
+
+
+def test_build_prompt_final_reason_sentences_and_grain_only():
+    """프롬프트: final_reason 완결 문장 지시(줄바꿈 서버 담당) + 그레인-only(행수 수치 금지) 캐비엇 지시."""
+    from query_diff.ai_diff.data_reconcile import _build_prompt
+    p = _build_prompt("SELECT 1", "hive", "k,v\n1,2", "a.csv", {}, [], "/tmp/b.csv", sort_key=[1])
+    assert "완결된 한국어 문장" in p                              # 완결 문장
+    assert "줄바꿈 문자" in p and "직접 넣지 마라" in p           # \n 직접 삽입 금지
+    assert "집계 그레인이 정합되었는지만" in p                    # 그레인-only
+    assert "행수·표본·전량" in p                                  # 행수 수치 금지
+
+
 def test_reconcile_column_mismatch_short_circuits(monkeypatch):
     """A쿼리는 org_amt 산출, 업로드 CSV는 tr_amt → 결정적 단락: UNVERIFIABLE + INCONCLUSIVE(SAME 아님)."""
     monkeypatch.setattr(data_reconcile, "_find_claude", lambda: None)  # 게이트가 먼저 단락돼야

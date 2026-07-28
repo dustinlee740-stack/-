@@ -17,6 +17,7 @@ Hue 에서 실제 실행해, 사용자 제공 A(운영계) 샘플 CSV 와 대조
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -42,8 +43,8 @@ from query_diff.models import (
 _DEFAULT_TIMEOUT = 420          # 초 — 라이브 쿼리 + 도구 오케스트레이션(QD_RECON_TIMEOUT)
 _DEFAULT_MODEL = "claude-sonnet-5"
 _DEFAULT_EFFORT = "medium"
-_SAMPLE_LIMIT = 1000            # B 유계 표본 LIMIT(컨텍스트 폭주 방지)
-_A_CSV_CAP = 20000              # A 샘플 CSV 임베드 총량 캡(문자)
+_SAMPLE_LIMIT = 1000            # A·B 표본 크기(B=LIMIT, A=정렬 후 상위 N행) — 양쪽 동일하게 정합
+_A_CSV_CAP = 400000            # A 임베드 문자 안전 상한(넓은 행에도 1000행 수용) — 행 캡(_SAMPLE_LIMIT)이 병목되게
 _COL_HINTS_CAP = 120            # op↔an 컬럼 힌트 줄 수 캡
 _BASE_DIFF_CAP = 8              # 1차 요약에서 불일치 차원의 A만/B만 항목 표시 캡
 
@@ -72,6 +73,24 @@ def _norm_tok(s: str) -> str:
     보존하므로 표현식 원문 비교에는 이쪽을 쓴다.
     """
     return re.sub(r"\s+", "", (s or "").strip().strip('"').strip("'").strip("`")).lower()
+
+
+def _norm_ws_entity(s: str) -> str:
+    """HTML 엔티티 디코드 + 모든 공백(nbsp `\\xa0` 포함) 단일 공백 축약·trim.
+
+    B(분석계) Hue 미리보기가 텍스트 컬럼 공백을 `&nbsp;` 로 인코딩해 A(일반 공백)와 문자열만 달라
+    보이는 렌더링 artifact 를 정규화해 같은 값인지 판별하기 위한 것(값 자체는 b_sample.csv 에 실제 공백)."""
+    t = html.unescape(s or "").replace("\xa0", " ")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _is_ws_entity_artifact(a: str, b: str) -> bool:
+    """두 값이 **공백/HTML엔티티 인코딩만 다르고** 정규화하면 동일한가(=Hue 렌더링 artifact).
+
+    원문이 다르되(`a != b`) 정규화 후 같을 때만 True → 실제 값 차이(예: 100 vs 200)는 정규화해도
+    불일치라 False(보존). mismatch 를 artifact 로 걸러낼지 결정하는 데만 쓴다."""
+    a, b = a or "", b or ""
+    return a != b and _norm_ws_entity(a) == _norm_ws_entity(b)
 
 
 def _accept_tokens(s) -> tuple[set[str] | None, str, bool]:
@@ -158,6 +177,138 @@ def _output_columns(sql: str, dialect: str) -> list[str] | None:
     확정 불가(bare `*`/파싱 실패) 시 None."""
     projs = _output_projections(sql, dialect)
     return [disp for (_t, disp, _r) in projs] if projs else None
+
+
+def _parse_final_select(sql: str, dialect: str):
+    """최종 SELECT projection 노드 목록. 확정 불가(bare `*`/파싱 실패) 시 None."""
+    from sqlglot import expressions as exp
+
+    from query_diff.validation_service import _preprocess_sql
+
+    try:
+        tree = sqlglot.parse_one(_preprocess_sql((sql or "").rstrip().rstrip(";")),
+                                 dialect=dialect or None)
+    except Exception:
+        return None
+    if tree is None:
+        return None
+    try:
+        selects = list(tree.selects)
+    except Exception:
+        return None
+    if not selects:
+        return None
+    if any(isinstance(s, exp.Star) or (isinstance(s, exp.Column) and (s.alias_or_name or "") == "*")
+           for s in selects):
+        return None                                  # bare star → 출력 위치 확정 불가
+    return tree, selects
+
+
+def _dimension_positions(sql: str, dialect: str) -> list[int] | None:
+    """**비집계(차원) 출력 컬럼의 1-based 위치** — 정렬 공통 키 후보. 집계 프로젝션(SUM/COUNT…)은 제외.
+    확정 불가(bare `*`/파싱 실패) 시 None."""
+    from sqlglot import expressions as exp
+
+    parsed = _parse_final_select(sql, dialect)
+    if not parsed:
+        return None
+    _tree, selects = parsed
+    pos = [i + 1 for i, s in enumerate(selects) if s.find(exp.AggFunc) is None]
+    return pos or None
+
+
+def _resolve_sort_key(
+    sql_a: str, dialect_a: str, sql_b: str, dialect_b: str
+) -> tuple[list[int], str]:
+    """A·B 대조 표본을 **같은 순서**로 맞추기 위한 공통 정렬 키(1-based 출력 위치)와 `mode`(도구가 어떤
+    식으로 정렬을 부여했는지) 반환. 출력 스키마가 A·B 동일 순서라 위치 기반이면 양쪽에 그대로 적용.
+
+    mode(사용자 결정 — 경우별 안내):
+      · ""         : 부여 없음(양쪽 동일 ORDER BY / 확정 불가)
+      · "both"     : 양쪽 다 ORDER BY 없음 → 양쪽에 공통 정렬 부여
+      · "b_from_a" : A만 ORDER BY → B에 그 키 부여
+      · "a_from_b" : B만 ORDER BY → A에 그 키 부여
+      · "both_diff": 양쪽 상이 → A 기준으로 B 재정렬
+    """
+    from sqlglot import expressions as exp
+
+    def _order_positions(sql, dialect):
+        parsed = _parse_final_select(sql, dialect)
+        if not parsed:
+            # 파싱은 됐지만 bare * 등 → ORDER BY 유무만 별도 확인
+            from query_diff.validation_service import _preprocess_sql
+            try:
+                tree = sqlglot.parse_one(_preprocess_sql((sql or "").rstrip().rstrip(";")),
+                                         dialect=dialect or None)
+            except Exception:
+                return None, False
+            return None, bool(tree is not None and tree.find(exp.Order) is not None)
+        tree, selects = parsed
+        order = tree.find(exp.Order)
+        if order is None:
+            return None, False
+        alias_pos: dict[str, int] = {}
+        for i, s in enumerate(selects):
+            nm = (s.alias_or_name or "").strip().lower()
+            alias_pos.setdefault(nm, i + 1) if nm else None
+        positions: list[int] = []
+        for o in order.expressions:            # exp.Ordered
+            e = o.this
+            if isinstance(e, exp.Literal) and e.is_int:
+                positions.append(int(e.name))
+            elif isinstance(e, exp.Column) and (e.name or "").strip().lower() in alias_pos:
+                positions.append(alias_pos[(e.name or "").strip().lower()])
+            else:
+                return None, True              # 식 기반/미매핑 ORDER BY → 위치 매핑 불가
+        return (positions or None), True
+
+    pa, has_a = _order_positions(sql_a, dialect_a)
+    pb, has_b = _order_positions(sql_b, dialect_b)
+    if pa and pb:
+        return (pa, "") if pa == pb else (pa, "both_diff")   # 같으면 부여없음, 다르면 A 기준 정합
+    if pa and not has_b:
+        return pa, "b_from_a"                  # A만 ORDER BY → B에 부여
+    if pb and not has_a:
+        return pb, "a_from_b"                  # B만 ORDER BY → A에 부여
+    dim = _dimension_positions(sql_a, dialect_a) or _dimension_positions(sql_b, dialect_b)
+    if dim:
+        return dim, "both"                     # 둘 다 없음/미매핑 → 임의 공통 키(차원 위치) 부여
+    return [], ""                              # 확정 불가 → 정렬 생략
+
+
+def _order_key_label(positions: list[int], col_names: list[str] | None = None) -> str:
+    """정렬 위치(1-based)를 **컬럼명** 문자열("asp아이디, 캐시부담주체, …")로. 매핑 불가 자리는 번호 폴백.
+
+    `_sort_caveat` 와 prose(headline·final_reason)의 위치번호 ORDER BY 치환이 공유한다."""
+    cn = col_names or []
+
+    def _label(p: int) -> str:
+        return cn[p - 1] if 1 <= p <= len(cn) and (cn[p - 1] or "").strip() else str(p)
+
+    return ", ".join(_label(p) for p in (positions or []))
+
+
+def _sort_caveat(mode: str, positions: list[int], col_names: list[str] | None = None) -> str:
+    """정렬 부여 경우(mode)별 사용자 안내 문구(평서체). mode="" 면 빈 문자열.
+
+    `col_names`(출력 컬럼 표시명)가 있으면 위치 대신 **컬럼명**으로 안내(사용자가 쿼리를 다시
+    확인하지 않게). 위치→이름 매핑 불가한 자리만 번호로 폴백."""
+    key = _order_key_label(positions, col_names)
+    if not mode or not key:
+        return ""
+    if mode == "both":
+        return (f"A·B 쿼리 모두 ORDER BY 가 없어, 대조 정합을 위해 양쪽에 공통 정렬"
+                f"(ORDER BY {key})을 부여해 비교했다.")
+    if mode == "b_from_a":
+        return (f"A쿼리에만 ORDER BY 가 있어, 대조 정합을 위해 B(분석계 실행)에도 동일 정렬"
+                f"(ORDER BY {key})을 적용해 비교했다.")
+    if mode == "a_from_b":
+        return (f"B쿼리에만 ORDER BY 가 있어, 대조 정합을 위해 A(업로드 샘플)에도 동일 정렬"
+                f"(ORDER BY {key})을 적용해 비교했다.")
+    if mode == "both_diff":
+        return (f"A·B 쿼리의 ORDER BY 가 서로 달라, 대조 정합을 위해 A 기준 정렬"
+                f"(ORDER BY {key})로 B를 재정렬해 비교했다.")
+    return ""
 
 
 # 날짜형 리터럴(yyyymm/yyyymmdd/yyyymmddhhmmss/ISO). 날짜 포맷 마스크('yyyymmdd')·비날짜 상수는 제외.
@@ -294,6 +445,115 @@ def _csv_header(csv_text: str) -> list[str] | None:
     cols = [_norm_col(c) for c in first.split(_sniff_delim(first))]
     cols = [c for c in cols if c]
     return cols or None
+
+
+def _csv_rows(csv_text: str) -> tuple[list[str], list[list[str]], str] | None:
+    """CSV → (헤더행, 데이터행들, 구분자). 빈 행 제외. 비거나 파싱 실패 시 None."""
+    import csv as _csv
+    import io
+
+    text = (csv_text or "").lstrip("﻿")
+    if not text.strip():
+        return None
+    delim = _sniff_delim(text.strip().splitlines()[0])
+    try:
+        rows = list(_csv.reader(io.StringIO(text), delimiter=delim))
+    except Exception:
+        return None
+    rows = [r for r in rows if any((c or "").strip() for c in r)]   # 빈 행 제거
+    if not rows:
+        return None
+    return rows[0], rows[1:], delim
+
+
+def _csv_row_count(csv_text: str) -> int | None:
+    """CSV 데이터행 수(헤더 제외). 파싱 실패/빈 파일 → None."""
+    parsed = _csv_rows(csv_text)
+    return len(parsed[1]) if parsed else None
+
+
+def _sort_csv_by_positions(csv_text: str, positions: list[int], limit: int | None = None) -> str:
+    """CSV 데이터행을 지정 위치(1-based) 컬럼 기준으로 **안정 정렬**(헤더 보존, 원 구분자 유지) 후,
+    `limit` 이 주어지면 **상위 limit 행**만 남긴다.
+
+    A 표본을 B의 `ORDER BY … LIMIT N` 과 **같은 키·같은 행수**로 맞춰, 임베드된 상위 프리픽스가 B의
+    표본 윈도우와 정합되게 한다(대칭 표본). 파싱 실패·무효 위치·행 부족 시 원본 그대로(무해)."""
+    import csv as _csv
+    import io
+
+    if not positions:
+        return csv_text
+    parsed = _csv_rows(csv_text)
+    if not parsed:
+        return csv_text
+    header, data, delim = parsed
+    if len(data) <= 1:
+        return csv_text                                # 정렬 불필요
+    idx = [p - 1 for p in positions if p >= 1]
+
+    def _key(r: list[str]):
+        return tuple((r[i] if i < len(r) else "") for i in idx)
+
+    rows_sorted = sorted(data, key=_key)               # sorted 는 안정 정렬
+    if limit is not None and limit >= 0:
+        rows_sorted = rows_sorted[:limit]              # B LIMIT 와 동일 행수로 정합
+    out = io.StringIO()
+    w = _csv.writer(out, delimiter=delim, lineterminator="\n")
+    w.writerow(header)
+    for r in rows_sorted:
+        w.writerow(r)
+    return out.getvalue()
+
+
+def _cap_csv_rows(csv_text: str, limit: int) -> str:
+    """CSV 데이터행을 **상위 limit 행**으로만 자른다(헤더 보존, 원 구분자·순서 유지).
+
+    `_sort_csv_by_positions` 는 정렬 위치가 있을 때만 캡하므로, 공통 정렬키가 없어도(파일 순서 그대로)
+    B 표본을 표본 크기로 강제 절단하기 위한 무정렬 캡. 행수가 이미 limit 이하면 원본 그대로(무해)."""
+    import csv as _csv
+    import io
+
+    if limit is None or limit < 0:
+        return csv_text
+    parsed = _csv_rows(csv_text)
+    if not parsed:
+        return csv_text
+    header, data, delim = parsed
+    if len(data) <= limit:
+        return csv_text                                # 캡 불필요
+    out = io.StringIO()
+    w = _csv.writer(out, delimiter=delim, lineterminator="\n")
+    w.writerow(header)
+    for r in data[:limit]:
+        w.writerow(r)
+    return out.getvalue()
+
+
+def _fit_csv_rows(csv_text: str, max_chars: int) -> tuple[str, int]:
+    """CSV 를 문자 예산(max_chars) 안에서 **whole-row(줄 단위)** 로만 잘라 (텍스트, 데이터행수) 반환.
+
+    문자 캡이 행 중간을 잘라 깨진 부분행이 임베드되는 것을 막고, **실제 임베드된 행수**를 돌려줘
+    B LIMIT 을 같은 값으로 맞출 수 있게 한다(A·B 표본 행수 동일 보장). 예산 내면 원본 그대로."""
+    text = csv_text or ""
+    if len(text) <= max_chars:
+        # 잘림 없음 — 데이터행수는 헤더 제외 비어있지 않은 줄 수
+        n = _csv_row_count(text) or 0
+        return text, n
+    lines = text.splitlines()
+    if not lines:
+        return "", 0
+    kept = [lines[0]]                                  # 헤더
+    total = len(lines[0]) + 1
+    n = 0
+    for ln in lines[1:]:
+        add = len(ln) + 1
+        if total + add > max_chars:
+            break
+        kept.append(ln)
+        total += add
+        if ln.strip():
+            n += 1
+    return "\n".join(kept) + "\n", n
 
 
 def _column_provenance_mismatch(
@@ -464,14 +724,18 @@ def _build_prompt(
     a_query_cols: list[str] | None = None,
     a_csv_cols: list[str] | None = None,
     cond_diff: dict | None = None,
+    sort_key: list[int] | None = None,
+    b_limit: int = _SAMPLE_LIMIT,
+    a_row_count: int | None = None,
 ) -> str:
+    # sort_key: B `hue_run_query`/`hue_download_query` 에 적용할 공통 ORDER BY 위치(1-based). A 표본은
+    # 서버가 이미 같은 키로 정렬하고 **b_limit 과 같은 행수**로 잘라(whole-row) 넘긴다. (정렬 부여 안내는
+    # 서버가 caveats 에 결정적 주입.)
     # cond_diff: {"a_dates":[...], "b_dates":[...], "a_ranges":[...], "b_ranges":[...]} 또는 None.
     # a_dates/b_dates = WHERE 날짜 리터럴 값 전체(무손실). a_ranges/b_ranges = 컬럼별 범위 표시(best-effort,
     # 비면 값목록 폴백). A 조건을 '없음/미상'으로 오서술하지 않으려면 a_dates 비공집합 여부로 분기한다.
-    a_csv = (sample_a_csv or "").strip()
-    a_truncated = len(a_csv) > _A_CSV_CAP
-    if a_truncated:
-        a_csv = a_csv[:_A_CSV_CAP]
+    a_csv = (sample_a_csv or "").strip()   # 서버가 이미 정렬·행수 정합·whole-row 절단해 넘김(추가 절단 안 함)
+    a_truncated = False
     has_a = bool(a_csv)
 
     bind_lines = "\n".join(f"  - {k} = {v!r}" for k, v in binds.items()) or "  (없음)"
@@ -548,9 +812,15 @@ def _build_prompt(
             )
 
     if has_a:
+        _a_cnt_note = (
+            f" — 이 표본은 서버가 정확히 **{a_row_count}행**(헤더 제외)으로 집계했다. **다시 세지 말고 "
+            f"이 {a_row_count}행 전부를 키로 B와 대조**하라. row_count_a·row_count_b(표본 행수)는 서버가 "
+            "정확히 덮어쓰니 네 추정치는 무시된다 — 행수를 세지 말고 값 일치/불일치에 집중하라. "
+            "**단 row_count_b_total(B 전체 행수)만은 아래 절차의 `COUNT(*)` 쿼리가 돌려준 숫자로 채워라.**"
+            if a_row_count else ""
+        )
         parts.append(
-            f"[운영 A 샘플 CSV{' (앞부분만·잘림)' if a_truncated else ''}"
-            f"{(' · ' + a_sample_name) if a_sample_name else ''}]\n{a_csv}\n\n"
+            f"[운영 A 샘플 CSV{(' · ' + a_sample_name) if a_sample_name else ''}]{_a_cnt_note}\n{a_csv}\n\n"
         )
     else:
         parts.append(
@@ -569,17 +839,36 @@ def _build_prompt(
         "(op↔an 은 A↔B 정렬용일 뿐, A샘플↔A쿼리 정합과는 무관하다.)\n\n"
     )
 
+    _ob = ", ".join(str(p) for p in (sort_key or []))
+    order_by_sql = f"ORDER BY {_ob}" if _ob else ""
+    # A 표본은 서버가 같은 키·행수로 정렬해 넘겼다 → B도 동일 ORDER BY 로 실행해 표본 윈도우를 맞춘다.
+    # (정렬을 부여했다는 '사용자 안내'는 서버가 결정적으로 caveats 에 넣으므로, 여기서 LLM 에 caveat 를
+    #  쓰라고 지시하지 않는다 — 중복 방지.)
+    _align_note = (
+        f"**B는 반드시 `{order_by_sql}`(출력 컬럼 위치) 로 실행**해 A 표본과 같은 윈도우를 덮게 하라. "
+        if order_by_sql else ""
+    )
+    _dl_clause = f"{order_by_sql} LIMIT {b_limit}".strip()   # 다운로드·표본 공통 절(무정렬 시 "LIMIT N")
     parts.extend((
         "[절차]\n"
-        "1) 바인드 치환한 완성 SQL 을 준비한다.\n"
-        f"2) `hue_download_query`(dialect=impala, format=csv, outputPath=\"{b_csv_path}\") 로 B 전량을 "
-        "로컬 CSV 로 저장한다(아티팩트). 성공하면 그 경로를 b_csv_path 에 echo 한다.\n"
-        f"3) 컨텍스트 대조용으로 `hue_run_query`(dialect=impala) 로 **키 정렬 + LIMIT {_SAMPLE_LIMIT}** "
-        "표본을 받는다. 이미 집계되어 행이 적으면 그대로. LIMIT 로 잘릴 수 있으면 sample_bounded=true.\n"
+        "1) 바인드 치환한 완성 SQL 을 준비한다(주석 처리된 조건은 제외).\n"
+        "2) `hue_run_query`(dialect=impala) 로 `SELECT COUNT(*) FROM ( <ORDER BY·LIMIT 을 뺀 완성 B SQL> ) t` "
+        "를 실행해 **B 전체 결과 행수**를 구하고, 그 숫자를 **row_count_b_total** 에 넣어라. 이 쿼리는 카운트 "
+        "1행만 반환하므로 행 데이터를 가져오지 않는다('표본만 조회' 제약과 무관). 직접 세지 말고 쿼리가 "
+        "돌려준 숫자를 그대로 쓴다.\n"
+        f"3) `hue_download_query`(dialect=impala, format=csv, outputPath=\"{b_csv_path}\") 로 B를 "
+        f"**`{_dl_clause}`**(상위 {b_limit}행 표본)로 로컬 CSV 에 저장한다. **B 전량을 내려받지 마라 — "
+        f"상위 {b_limit}행 표본만 저장한다(A 표본과 같은 행수).** 성공하면 그 경로를 b_csv_path 에 echo 한다.\n"
+        f"4) 컨텍스트 대조용으로 `hue_run_query`(dialect=impala) 로 **`{_dl_clause}`** 표본을 받는다(위 "
+        f"다운로드와 같은 윈도우·행수). {_align_note}이미 집계되어 행이 적으면 그대로.\n"
         "   - 필요하면 `hue_describe_table` 로 B 출력 테이블 컬럼/타입을 먼저 확인해도 된다.\n"
-        "4) 컬럼 힌트로 A↔B 컬럼을 정렬하고, 키 컬럼(비측정·차원 컬럼)으로 행을 매칭한다.\n"
-        "5) 3-way 로 분류: 값 일치 / A만 존재 / B만 존재 / 양쪽 존재·값 상이.\n"
-        "6) 값 불일치는 추정 원인을 분류: **조건/바인드 불일치(A 명시 날짜 vs B 바인드 날짜 등 — 위 "
+        "5) 컬럼 힌트로 A↔B 컬럼을 정렬하고, 키 컬럼(비측정·차원 컬럼)으로 행을 매칭한다.\n"
+        "6) 3-way 로 분류: 값 일치 / A만 존재 / B만 존재 / 양쪽 존재·값 상이. **단, B `hue_run_query` "
+        "미리보기의 텍스트 컬럼 공백이 `&nbsp;`(또는 다른 HTML 엔티티)로 표기되는 것은 Hue 미리보기 렌더링 "
+        "artifact 일 뿐 데이터 차이가 아니다 — 공백/엔티티를 정규화해 같은 값으로 보고, mismatch·DATA 로 "
+        "분류하지 마라. 텍스트 컬럼 차이가 이런 인코딩뿐이면 그 컬럼은 일치로 간주하라(측정값이 전수 일치하면 "
+        "MATCH/SAME).**\n"
+        "7) 값 불일치는 추정 원인을 분류: **조건/바인드 불일치(A 명시 날짜 vs B 바인드 날짜 등 — 위 "
         "[조건 날짜 정합성] 참고)** · 집계 그레인 차이 · NULL/'' 처리 · 날짜 포맷/타입 · 반올림·정밀도 · "
         "조인 카디널리티 · 순수 데이터 차이(분석계 미적재 등). '미적재'를 기본값처럼 단정하지 마라.\n\n",
 
@@ -592,7 +881,20 @@ def _build_prompt(
         "[필수 캐비엇 — caveats 에 반드시 포함(비대칭)]\n"
         "- '샘플 일치는 두 쿼리의 동치를 증명하지 않는다(표본 우연 일치 가능).'\n"
         "- '샘플 불일치는 실제 결과 차이의 강한 근거다.'\n"
-        "- 표본이 LIMIT 로 유계인지, 집계 그레인이 정합되었는지 명시.\n\n",
+        "- **집계 그레인이 정합되었는지만 간단히** 명시. **행수·표본·전량·LIMIT 유계 등 수치는 caveat 로 쓰지 "
+        "마라** — 서버가 행수 블록으로 정확히 표시한다(A도 상위 표본이라 'A 전량'은 오서술).\n"
+        "  (정렬 부여 안내 caveat 는 서버가 자동으로 넣으니 **중복 작성하지 마라**. 특히 **ORDER BY(정렬)는 "
+        "언급하지 말고, 위치번호(ORDER BY 1,2,3)로도 쓰지 마라** — 서버가 컬럼명으로 안내한다.)\n\n",
+
+        "[쓰지 말아야 할 caveat — 혼선 방지]\n"
+        "- **행수·바이트·수동/구간 집계 추정** 관련 caveat 를 쓰지 마라. A·B 행수는 **서버가 정확히 집계**해 "
+        "표시하므로 네 추정치·불확실성 언급은 불필요·혼란이다.\n"
+        "- **b_sample.csv 는 사용자 다운로드용 아티팩트**다 — 열어볼 필요 없고, 서버가 읽어 B 행수를 집계한다. "
+        "'파일을 못 읽었다/권한 제한' 류 caveat 를 쓰지 마라. 대조는 `hue_run_query` 표본으로 한다.\n"
+        "- **`&nbsp;`/공백 인코딩 차이는 caveat 로도 쓰지 마라** — 서버가 실제 발생 시에만 결정적으로 넣는다. "
+        "정규화해 같은 값으로 보고 넘어가라(위 [절차]6).\n"
+        "- **정렬(ORDER BY)·LIMIT 같은 서버 정렬/윈도우 메커니즘도 caveat·headline·final_reason 에 쓰지 마라** "
+        "— 서버가 컬럼명으로 caveat 에 설명한다. 굳이 언급하면 위치번호(1,2,3)가 아니라 컬럼명으로.\n\n",
 
         "[종합 판정(final_*) — 1차(정적)+2차(실데이터)를 함께 추론해 단일 결론]\n"
         "비대칭 원칙(일치=약한 신호·불일치=강한 근거)을 지켜 final_verdict/final_confidence/attribution/final_reason 을 정한다.\n"
@@ -610,9 +912,13 @@ def _build_prompt(
         "- 2차 UNVERIFIABLE(대조 불가): 1차 승계 — EQUIVALENT→SAME, DIVERGENT→DIFFERENT, LIMITED→INCONCLUSIVE. "
         "confidence LOW~MEDIUM. final_reason 에 '실데이터 미검증' 명시.\n"
         "- attribution 은 final_verdict=DIFFERENT 일 때만 QUERY/DATA, 그 외엔 UNKNOWN.\n"
-        "- final_reason: 1차 근거와 2차 관측을 한두 줄로 연결해 사람에게 설명 "
-        "(조건 다름 예: 'A는 20240101, B는 20240102 로 서로 다른 날짜 조건이라 결과가 다름 — 조건 차이(QUERY), "
-        "바인드 정렬 후 재실행 권장'. 조건 동일 예: '동일 조건인데 BANK02 합계만 달라 원천 데이터 차이(DATA)로 판단').\n\n",
+        "- final_reason: **완결된 한국어 문장들**로 쓰되 각 문장을 마침표(.)로 끝맺어라. 순서: "
+        "①'1차 정적 분석에서는 …를 근거로 …를 확인했고 …로 판정했다.' ②'2차 데이터 대조에서는 …를 근거로 "
+        "…를 확인했고 …로 판정했다.' ③'따라서 최종 판단은 …이다.' ④(필요 시)'다만, 추가 확인이 필요한 사항은 "
+        "…이다.' **줄바꿈 문자(`\\n`)를 직접 넣지 마라 — 서버가 문장 단위로 줄을 나눈다.** 각 문장은 독립적으로 "
+        "완결되게(중간에 끊지 말 것). 조건 다름 예: '2차 데이터 대조에서는 A가 20240101, B가 20240102 로 서로 "
+        "다른 날짜 조건임을 확인했다.' → '따라서 최종 판단은 조건 차이(QUERY)에 의한 결과 상이이며, 바인드 정렬 후 "
+        "재실행을 권장한다.'\n\n",
 
         "[출력] 모든 텍스트 필드는 한국어로 작성(위 [언어] 규칙 — 영어 문장 금지). 반드시 "
         "**AiDataReconcile 구조화 JSON 하나만** 출력하라. 설명·마크다운·코드펜스 금지.",
@@ -702,6 +1008,20 @@ async def reconcile_via_cli(
     a_query_cols = _output_columns(sql_a, dialect_a_s) if sql_a else None
     a_csv_cols = _csv_header(sample_a_csv) if (sample_a_csv or "").strip() else None
 
+    # 정렬 정합(사용자 결정): A·B 표본을 같은 공통 키(출력 위치)로 정렬해 절단/LIMIT 윈도우를 맞춘다.
+    # 비교 자체는 LLM 유지. A 는 절단 전에 서버가 정렬하고, B 는 프롬프트가 동일 ORDER BY 를 지시한다.
+    sort_key, sort_mode = (
+        _resolve_sort_key(sql_a, dialect_a_s, sql_b, dialect_b.value) if sql_a else ([], "")
+    )
+    _a_sorted = (
+        _sort_csv_by_positions(sample_a_csv or "", sort_key, limit=_SAMPLE_LIMIT)
+        if sort_key else (sample_a_csv or "")
+    )
+    # 문자 예산 내 whole-row 로만 잘라 실제 임베드 행수(n_embed) 산출 → B LIMIT 을 같은 값으로 맞춘다.
+    a_csv_for_prompt, n_embed = _fit_csv_rows(_a_sorted, _A_CSV_CAP)
+    # 실제 A 행수(전량 CSV, 서버 권위) — 표본 임베드 카운트(LLM row_count_a)와 구분해 표기.
+    a_row_total = _csv_row_count(sample_a_csv) if (sample_a_csv or "").strip() else None
+
     # A(운영, 리터럴) vs B(분석, 바인드 치환)의 WHERE 날짜 조건 값 비교 — 다르면 서로 다른 조건으로
     # 조회된 것. 1차는 날짜 값 차이를 흡수(EQUIVALENT)하므로, 이 결정적 신호를 프롬프트에 실어 2차가
     # 불일치를 '원천 데이터 차이(DATA)'가 아니라 '조건 차이(QUERY)'로 귀속하게 한다.
@@ -727,9 +1047,10 @@ async def reconcile_via_cli(
     b_csv_path = str(art_dir / "b_sample.csv")
 
     prompt = _build_prompt(
-        sql_b, dialect_b.value, sample_a_csv or "", sample_a_name,
+        sql_b, dialect_b.value, a_csv_for_prompt, sample_a_name,
         resolved_binds, col_hints, b_csv_path, _format_base(base_semantic),
         a_query_cols, a_csv_cols, cond_diff=cond_diff,
+        sort_key=sort_key, b_limit=(n_embed or _SAMPLE_LIMIT), a_row_count=n_embed,
     )
     schema_json = json.dumps(AI_DATA_RECONCILE_SCHEMA, ensure_ascii=False)
     argv = _build_argv(claude_path, schema_json)
@@ -791,6 +1112,108 @@ async def reconcile_via_cli(
         # B CSV 다운로드 링크는 **서버가 지정한 경로에 실제로 파일이 생성된 경우에만** 노출.
         # (AI 가 프롬프트에 echo 한 경로는 신뢰하지 않는다 — 헛경로/누락 방지.)
         dr.b_csv_path = b_csv_path if Path(b_csv_path).exists() else None
+        # 행수는 **서버가 정확히 집계**해 LLM 육안 추정치를 덮어쓴다. A: 임베드 행수 n_embed, A 전체: 업로드 CSV 전량.
+        dr.row_count_a = n_embed if n_embed else dr.row_count_a
+        dr.row_count_a_total = a_row_total
+        # B 표본은 서버가 **상위 N행으로 강제 캡**한다(결정적 권위) — LLM 이 download LIMIT 을 어겨 전량(1104)을
+        # 받아도, 서버가 공통 정렬키로 정렬(없으면 파일순)해 상위 N행만 남기고 파일을 다시 쓴다 → 다운로드·B표·
+        # 행수 전부 ≤N행으로 일치(run_query LIMIT N 과 같은 윈도우). B 전체 행수는 LLM COUNT(*) 결과로 표기.
+        _b_cap = n_embed or _SAMPLE_LIMIT
+        _ai_btotal = dr.row_count_b_total          # LLM COUNT(*) 결과(없으면 None)
+        dr.row_count_b_total = None
+        if dr.b_csv_path:
+            try:
+                _btext = Path(dr.b_csv_path).read_text(encoding="utf-8")
+                _b_orig = _csv_row_count(_btext)   # 다운로드 원본 데이터행수(캡 전)
+                _capped = (_sort_csv_by_positions(_btext, sort_key, limit=_b_cap)
+                           if sort_key else _cap_csv_rows(_btext, _b_cap))
+                if _capped != _btext:              # 정렬·캡으로 달라지면 파일 재작성(표·다운로드·행수 일치)
+                    Path(dr.b_csv_path).write_text(_capped, encoding="utf-8")
+                _bn = _csv_row_count(_capped)      # 캡 후 표본 행수(서버 결정적)
+                if _bn is not None:
+                    dr.row_count_b = _bn
+                # B 전체(전체>표본일 때만 표기): LLM COUNT 우선, 없으면 다운로드 원본 카운트로 폴백.
+                _sample_n = _bn if _bn is not None else 0
+                _btotal = (_ai_btotal if (_ai_btotal and _ai_btotal >= _sample_n)
+                           else (_b_orig if (_b_orig and _b_orig > _sample_n) else None))
+                dr.row_count_b_total = _btotal
+                dr.sample_bounded = bool((_btotal and _btotal > _sample_n)
+                                         or (_bn is not None and _bn >= _b_cap))
+            except OSError:
+                pass
+        dr.sort_key = list(sort_key)   # 프런트가 A 샘플 표를 같은 정렬로 표시하도록
+        # LLM 이 쓴 노이즈 caveat 제거(서버가 결정적으로 대체): ① 위치번호 정렬('… ORDER BY 1,2,3 …')
+        # — 서버가 컬럼명으로 넣음, ② &nbsp;/공백 인코딩 설명 — 서버가 실제 artifact 를 드롭했을 때만 넣음
+        # (표에 &nbsp; 없는데 LLM 이 자발적으로 쓰던 혼란 문구 차단), ③ 행수 restatement('1000행'·'1104행'·
+        # '전량' 등) — 행수 블록+부분대조 ⚠ 가 이미 정확히 표시(A도 표본이라 '전량'은 오서술). 서버 caveat 는
+        # 이 뒤에 추가돼 안전(컬럼명 정렬·artifact 문구는 이 패턴들에 안 걸림).
+        dr.caveats = [c for c in (dr.caveats or [])
+                      if not re.search(r"ORDER\s+BY\s+\d", c, re.I)
+                      and "nbsp" not in c.lower()
+                      and not re.search(r"\d{3,}\s*행", c) and "전량" not in c]
+        # 정렬 부여 안내(경우별·컬럼명) — LLM 은 안 쓰게 했으므로 서버가 결정적으로 1건만 주입.
+        note = _sort_caveat(sort_mode, sort_key, a_csv_cols or a_query_cols)
+        if note and note not in dr.caveats:
+            dr.caveats = [*dr.caveats, note]
+        # (Fix B) 공백/HTML엔티티(&nbsp;)만 다른 텍스트 mismatch 는 Hue 렌더링 artifact → 서버가 결정적으로
+        # 걸러내고, 실제 차이가 그것뿐이면 SAME 으로 상향(매 런 일관). b_sample.csv 엔 실제 공백이라 값 차이 아님.
+        _real = [m for m in dr.mismatches if not _is_ws_entity_artifact(m.value_a, m.value_b)]
+        _upgraded = False   # artifact→SAME 상향으로 headline/final_reason 을 서버가 이미 교체했는지
+        if len(_real) != len(dr.mismatches):
+            dr.mismatches = _real
+            _art_note = (
+                "B(분석계) Hue 미리보기의 텍스트 컬럼 공백이 &nbsp; 등 HTML 엔티티로 인코딩돼 A(운영계, "
+                "일반 공백)와 문자열만 달라 보이지만, 이는 Hue 렌더링 특성일 뿐 실제 데이터 차이가 아니다"
+                "(b_sample.csv 에는 실제 공백으로 저장). 값 차이로 보지 않는다."
+            )
+            if _art_note not in dr.caveats:
+                dr.caveats = [*dr.caveats, _art_note]
+            # 실제 차이가 남지 않고 1차가 구조 동치/제한적이면 → 결정적으로 SAME 상향(우연 표본일치 오상향 방지:
+            # base DIVERGENT 는 제외). headline·final_reason 도 서버 고정 문구로 교체해 매 런 byte-동일.
+            _base_v = (base_semantic or {}).get("verdict")
+            if (not _real and not dr.only_in_a and not dr.only_in_b
+                    and _base_v in ("EQUIVALENT", "LIMITED")):
+                dr.status = ReconcileStatus.MATCH
+                dr.final_verdict = FinalVerdict.SAME
+                dr.final_confidence = (
+                    Confidence.HIGH if _base_v == "EQUIVALENT" else Confidence.MEDIUM
+                )
+                dr.attribution = Attribution.UNKNOWN
+                dr.headline = "측정값 표본 전수 일치 — 텍스트 공백 인코딩(&nbsp;) 차이만 있어 동치(SAME)"
+                dr.final_reason = (
+                    "지급액/회수액/소멸액 등 측정값이 표본 전수 일치했고, 텍스트 컬럼의 유일한 차이는 "
+                    "Hue 미리보기의 공백 인코딩(&nbsp;)뿐이라 실제 데이터 차이가 아니다. 1차 정적 판정과 "
+                    "함께 동치(SAME)로 판정한다."
+                )
+                _upgraded = True
+        # (Fix 5) LLM prose(headline·final_reason)의 위치번호 ORDER BY 를 컬럼명으로 치환 — 사용자가
+        # 위치번호 대신 컬럼명으로 읽게(서버 정렬 캐비엇과 동일 기준). 서버가 교체한 문구는 위치번호가
+        # 없어 무영향, 컬럼명 문구는 \d 로 시작 안 해 미매칭(안전).
+        if sort_key:
+            _ob_cols = _order_key_label(sort_key, a_csv_cols or a_query_cols)
+            if _ob_cols:
+                _ob_re = re.compile(r"(ORDER\s+BY\s+)(\d+(?:\s*[,~]\s*\d+)*)", re.I)
+                if dr.headline:
+                    dr.headline = _ob_re.sub(lambda m: m.group(1) + _ob_cols, dr.headline)
+                if dr.final_reason:
+                    dr.final_reason = _ob_re.sub(lambda m: m.group(1) + _ob_cols, dr.final_reason)
+        # (후속7 Fix 1) 값 일치(MATCH·비-상향) 2차 요약은 서버가 결정적으로 작성 — LLM prose 의 &nbsp;·
+        # 정렬·행수 잔여 노이즈 원천 차단. MISMATCH/PARTIAL 은 LLM 의 구체 서술 유지, 상향 케이스는 자체 문구.
+        if dr.status == ReconcileStatus.MATCH and not _upgraded:
+            dr.headline = (
+                "1차 정적 판정에 이어 2차 실데이터 대조에서도 A·B 표본 값이 전 구간 "
+                f"일치했다(불일치 {len(dr.mismatches)})."
+            )
+        # (후속8) 종합 사유를 **문장 단위**로 줄바꿈 — LLM 의 `\n` 처리에 의존하지 않는다. LLM 이 JSON 에
+        # `\\n` 으로 이중 이스케이프해 리터럴 백슬래시-n 을 보내거나(개행 안 됨), 마커 폴백이 문장 중간을
+        # 끊던 문제를 근원 제거: 모든 공백/리터럴 `\n` 을 흡수해 한 줄로 만든 뒤 **마침표 뒤에서만** 개행
+        # → 각 줄이 완결 문장. 슬래시/소수(마침표 뒤 공백 없음)는 미분할(안전). 프런트는 white-space:pre-line.
+        if dr.final_reason:
+            _fr = dr.final_reason.replace("\\n", " ")
+            _fr = re.sub(r"\s+", " ", _fr).strip()
+            dr.final_reason = re.sub(r"(?<=[.。])\s+", "\n", _fr)
+        if dr.headline:   # headline 은 한 줄(escapeHtml) — 리터럴 백슬래시-n 만 공백으로 정리
+            dr.headline = dr.headline.replace("\\n", " ").strip()
         return dr
     except Exception as e:
         return _unverifiable("2차 대조 중 예기치 못한 오류가 발생했습니다.", str(e),
